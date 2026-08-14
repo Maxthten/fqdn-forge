@@ -1,0 +1,7 @@
+expected_requests: 3
+expected_unmatched_requests: 3
+endpoint_requests:
+  missing-key: 1
+  wrong-key: 1
+  denied-key: 1
+expected_rejected_egress_attempts: 0

@@ -1,0 +1,7 @@
+expected_fqdns: [page-one.acme.test, page-two.acme.test]
+expected_observations:
+  page-one.acme.test: { source_names: [pages] }
+  page-two.acme.test: { source_names: [pages] }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { pages: success }

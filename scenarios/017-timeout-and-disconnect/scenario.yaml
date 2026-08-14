@@ -1,0 +1,21 @@
+id: 017-timeout-and-disconnect
+name: timeout and disconnect
+description: Handle synthetic timeout and truncated body safely.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+runner: { timeout_ms: 50, max_response_bytes: 2097152 }
+endpoints:
+  - id: working
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/working, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]
+  - id: timeout
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/timeout, query: { domain: { equals: $ROOT_DOMAIN } } }
+    replies: [{ status: 200, delay_ms: 150, body_file: fixtures/data.json }]
+  - id: disconnect
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/disconnect, query: { domain: { equals: $ROOT_DOMAIN } } }
+    replies: [{ status: 200, disconnect: true, body_file: fixtures/data.json }]

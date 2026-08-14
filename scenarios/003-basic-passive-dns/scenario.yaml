@@ -1,0 +1,12 @@
+id: 003-basic-passive-dns
+name: passive DNS history
+description: Preserve synthetic historical observations.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: passive-dns
+    source_kind: passive_dns
+    match: { method: GET, path: /dns/v1/history, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: records, candidate_field: name, timestamp_field: last_seen }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

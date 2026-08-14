@@ -1,0 +1,6 @@
+expected_requests: 1
+endpoint_requests:
+  working: 1
+  must-not-run: 0
+forbidden_paths: [/generic/v1/must-not-run]
+expected_rejected_egress_attempts: 0

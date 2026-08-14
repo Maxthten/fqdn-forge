@@ -1,0 +1,5 @@
+expected_fqdns: [rate.acme.test]
+expected_observations: { rate.acme.test: { source_names: [key-search], source_kinds: [key_api] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { key-search: success }

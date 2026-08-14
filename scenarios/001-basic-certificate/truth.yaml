@@ -1,0 +1,8 @@
+expected_fqdns: [api.acme.test, login.acme.test]
+forbidden_fqdns: [evil-acme.test]
+expected_observations:
+  api.acme.test: { source_names: [certificate-search], source_kinds: [certificate], requires_time: true }
+  login.acme.test: { source_names: [certificate-search], source_kinds: [certificate], requires_time: true }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { certificate-search: success }

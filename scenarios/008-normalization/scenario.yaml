@@ -1,0 +1,12 @@
+id: 008-normalization
+name: normalization
+description: Normalize casing, trailing dots and a Unicode/Punycode pair.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: generic-search
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

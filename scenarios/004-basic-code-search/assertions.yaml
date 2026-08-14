@@ -1,0 +1,4 @@
+expected_requests: 1
+endpoint_requests:
+  code-search: 1
+expected_rejected_egress_attempts: 0

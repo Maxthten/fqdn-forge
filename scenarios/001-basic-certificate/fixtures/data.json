@@ -1,0 +1,1 @@
+{"records":[{"id":"cert-1","name":"api.acme.test","observed_at":"2026-08-01T00:00:00Z"},{"id":"cert-2","name":"login.acme.test","observed_at":"2026-08-02T00:00:00Z"}]}

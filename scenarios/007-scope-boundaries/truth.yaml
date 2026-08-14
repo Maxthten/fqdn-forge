@@ -1,0 +1,6 @@
+expected_fqdns: [safe.acme.test]
+forbidden_fqdns: [evil-acme.test, acme.test.evil.example]
+expected_observations: { safe.acme.test: { source_names: [generic-search] } }
+expected_filter_reasons: [{ value: evil-acme.test, reason: out_of_scope }, { value: acme.test.evil.example, reason: out_of_scope }]
+expected_run_status: success
+expected_source_status: { generic-search: success }

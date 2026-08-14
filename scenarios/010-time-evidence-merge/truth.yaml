@@ -1,0 +1,5 @@
+expected_fqdns: [history.acme.test]
+expected_observations: { history.acme.test: { min_count: 2, source_names: [certificate-search, passive-dns], requires_time: true } }
+expected_filter_reasons: [{ value: history.acme.test, reason: duplicate }]
+expected_run_status: success
+expected_source_status: { certificate-search: success, passive-dns: success }

@@ -1,0 +1,6 @@
+expected_fqdns: [www.acme.test]
+forbidden_fqdns: [acme.test, '*.acme.test']
+expected_observations: { www.acme.test: { source_names: [certificate-search] } }
+expected_filter_reasons: [{ value: '*.acme.test', reason: wildcard }, { value: acme.test, reason: root_excluded }]
+expected_run_status: success
+expected_source_status: { certificate-search: success }

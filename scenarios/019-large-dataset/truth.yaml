@@ -1,0 +1,10 @@
+expected_fqdns: [bulk-1.acme.test, bulk-2.acme.test, bulk-3.acme.test, bulk-4.acme.test, bulk-5.acme.test]
+expected_observations:
+  bulk-1.acme.test: { source_names: [generic-search], min_count: 1 }
+  bulk-2.acme.test: { source_names: [generic-search], min_count: 1 }
+  bulk-3.acme.test: { source_names: [generic-search], min_count: 1 }
+  bulk-4.acme.test: { source_names: [generic-search], min_count: 1 }
+  bulk-5.acme.test: { source_names: [generic-search], min_count: 1 }
+expected_filter_reasons: [{ value: bulk-1.acme.test, reason: duplicate }]
+expected_run_status: success
+expected_source_status: { generic-search: success }

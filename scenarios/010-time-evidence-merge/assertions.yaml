@@ -1,0 +1,5 @@
+expected_requests: 2
+endpoint_requests:
+  certificate-search: 1
+  passive-dns: 1
+expected_rejected_egress_attempts: 0

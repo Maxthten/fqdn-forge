@@ -1,0 +1,8 @@
+expected_requests: 2
+endpoint_requests:
+  key-search: 2
+request_sequence:
+  - { endpoint: key-search, response_index: 0 }
+  - { endpoint: key-search, response_index: 1 }
+timing: { min_virtual_wait_ms: 1000, max_virtual_wait_ms: 2000 }
+expected_rejected_egress_attempts: 0

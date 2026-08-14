@@ -1,0 +1,18 @@
+id: 020-cancellation-and-egress-guard
+name: cancellation and egress guard
+description: Stop further requests after cancellation and remain localhost-only.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+runner: { cancel_after_requests: 1 }
+endpoints:
+  - id: working
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/working, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]
+  - id: must-not-run
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/must-not-run, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

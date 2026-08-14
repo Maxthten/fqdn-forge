@@ -1,0 +1,25 @@
+id: 014-authentication-errors
+name: authentication errors
+description: Classify missing, wrong and denied API keys using real header matching.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: missing-key
+    source_kind: key_api
+    mismatch_status: 401
+    omit_headers: [x-api-key]
+    match: { method: GET, path: /key/v1/missing, query: { domain: { equals: $ROOT_DOMAIN } }, headers: { x-api-key: { equals: lab-demo-key } } }
+    replies: [{ status: 200, body_file: fixtures/error.json }]
+  - id: wrong-key
+    source_kind: key_api
+    mismatch_status: 401
+    request_headers: { x-api-key: wrong-lab-key }
+    match: { method: GET, path: /key/v1/wrong, query: { domain: { equals: $ROOT_DOMAIN } }, headers: { x-api-key: { equals: lab-demo-key } } }
+    replies: [{ status: 200, body_file: fixtures/error.json }]
+  - id: denied-key
+    source_kind: key_api
+    mismatch_status: 403
+    request_headers: { x-api-key: denied-lab-key }
+    match: { method: GET, path: /key/v1/denied, query: { domain: { equals: $ROOT_DOMAIN } }, headers: { x-api-key: { equals: lab-demo-key } } }
+    replies: [{ status: 200, body_file: fixtures/error.json }]

@@ -1,0 +1,12 @@
+id: 004-basic-code-search
+name: code search
+description: Extract domain-like tokens from snippets.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: code-search
+    source_kind: code_search
+    match: { method: GET, path: /code/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: matches, candidate_field: snippet, kind: tokens }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

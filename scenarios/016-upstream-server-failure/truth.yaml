@@ -1,0 +1,5 @@
+expected_fqdns: [healthy.acme.test]
+expected_observations: { healthy.acme.test: { source_names: [working] } }
+expected_filter_reasons: []
+expected_run_status: partial_success
+expected_source_status: { working: success, server-500: failed, server-503: failed }

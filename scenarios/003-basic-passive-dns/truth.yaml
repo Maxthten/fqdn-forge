@@ -1,0 +1,7 @@
+expected_fqdns: [old.acme.test, mail.acme.test]
+expected_observations:
+  old.acme.test: { source_names: [passive-dns], source_kinds: [passive_dns], requires_time: true }
+  mail.acme.test: { source_names: [passive-dns], source_kinds: [passive_dns], requires_time: true }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { passive-dns: success }

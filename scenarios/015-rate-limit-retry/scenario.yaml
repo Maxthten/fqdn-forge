@@ -1,0 +1,15 @@
+id: 015-rate-limit-retry
+name: rate limit retry
+description: Retry a synthetic 429 using virtual time.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: key-search
+    source_kind: key_api
+    allow_retry: true
+    match: { method: GET, path: /key/v1/search, query: { domain: { equals: $ROOT_DOMAIN } }, headers: { x-api-key: { equals: lab-demo-key } } }
+    extract: { items_field: items, candidate_field: host }
+    replies:
+      - { status: 429, headers: { retry-after: "1" }, body_file: fixtures/error.json }
+      - { status: 200, body_file: fixtures/data.json }

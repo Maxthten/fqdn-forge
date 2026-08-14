@@ -1,0 +1,5 @@
+expected_fqdns: []
+expected_observations: {}
+expected_filter_reasons: []
+expected_run_status: failure
+expected_source_status: { missing-key: auth_failed, wrong-key: auth_failed, denied-key: auth_failed }

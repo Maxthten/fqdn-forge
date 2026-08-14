@@ -1,0 +1,6 @@
+expected_fqdns: [shared.acme.test]
+expected_observations:
+  shared.acme.test: { min_count: 2, source_names: [certificate-search, passive-dns], source_kinds: [certificate, passive_dns], requires_time: true }
+expected_filter_reasons: [{ value: shared.acme.test, reason: duplicate }]
+expected_run_status: success
+expected_source_status: { certificate-search: success, passive-dns: success }

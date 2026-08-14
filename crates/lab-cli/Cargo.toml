@@ -1,0 +1,15 @@
+[package]
+name = "lab-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lab-core = { path = "../lab-core" }
+lab-server = { path = "../lab-server" }
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true

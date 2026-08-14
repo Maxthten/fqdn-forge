@@ -1,0 +1,8 @@
+expected_fqdns: [archive.acme.test, static.acme.test]
+forbidden_fqdns: [outsider.test]
+expected_observations:
+  archive.acme.test: { source_names: [archive-search], source_kinds: [archive], requires_time: true }
+  static.acme.test: { source_names: [archive-search], source_kinds: [archive], requires_time: true }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { archive-search: success }

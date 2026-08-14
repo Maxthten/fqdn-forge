@@ -1,0 +1,15 @@
+id: 012-pagination-success
+name: pagination success
+description: Follow a finite cursor and deduplicate output.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: pages
+    source_kind: generic_json
+    match: { method: GET, path: /pages/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: cursor, parameter: cursor, next_cursor_field: next_cursor }
+    extract: { items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/page-1.json }
+      - { status: 200, body_file: fixtures/page-2.json }

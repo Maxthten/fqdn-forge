@@ -1,0 +1,7 @@
+expected_fqdns: [api.acme.test, xn--bcher-kva.acme.test]
+expected_observations:
+  api.acme.test: { source_names: [generic-search] }
+  xn--bcher-kva.acme.test: { source_names: [generic-search], min_count: 2 }
+expected_filter_reasons: [{ value: xn--bcher-kva.acme.test, reason: duplicate }]
+expected_run_status: success
+expected_source_status: { generic-search: success }

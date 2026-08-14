@@ -1,0 +1,12 @@
+id: 011-empty-success
+name: empty success
+description: A 200 empty list remains successful.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: user-import
+    source_kind: user_import
+    match: { method: GET, path: /import/v1/items, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

@@ -1,0 +1,6 @@
+expected_requests: 3
+endpoint_requests:
+  working: 1
+  server-500: 1
+  server-503: 1
+expected_rejected_egress_attempts: 0

@@ -1,0 +1,5 @@
+expected_requests: 2
+endpoint_requests:
+  malformed: 1
+  working: 1
+expected_rejected_egress_attempts: 0

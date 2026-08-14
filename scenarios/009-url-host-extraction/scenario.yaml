@@ -1,0 +1,12 @@
+id: 009-url-host-extraction
+name: URL host extraction
+description: Parse URL hosts without leaking user information.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: archive-search
+    source_kind: archive
+    match: { method: GET, path: /archive/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: captures, candidate_field: url, kind: url }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

@@ -1,0 +1,8 @@
+expected_fqdns: [code.acme.test, api.acme.test]
+forbidden_fqdns: [evil.example]
+expected_observations:
+  code.acme.test: { source_names: [code-search], source_kinds: [code_search] }
+  api.acme.test: { source_names: [code-search], source_kinds: [code_search] }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { code-search: success }

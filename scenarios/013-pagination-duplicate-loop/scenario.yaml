@@ -1,0 +1,20 @@
+id: 013-pagination-duplicate-loop
+name: pagination duplicate loop
+description: Stop safely on a repeated cursor.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: pages
+    source_kind: generic_json
+    match: { method: GET, path: /pages/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: cursor, parameter: cursor, next_cursor_field: next_cursor }
+    extract: { items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/page-1.json }
+      - { status: 200, body_file: fixtures/page-2.json }
+  - id: code-search
+    source_kind: code_search
+    match: { method: GET, path: /code/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: matches, candidate_field: snippet, kind: tokens }
+    replies: [{ status: 200, body_file: fixtures/code.json }]

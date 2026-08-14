@@ -1,0 +1,17 @@
+id: 010-time-evidence-merge
+name: time evidence merge
+description: Merge observations without losing source timestamps.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: certificate-search
+    source_kind: certificate
+    match: { method: GET, path: /ct/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: records, candidate_field: name, timestamp_field: observed_at }
+    replies: [{ status: 200, body_file: fixtures/certificate.json }]
+  - id: passive-dns
+    source_kind: passive_dns
+    match: { method: GET, path: /dns/v1/history, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: records, candidate_field: name, timestamp_field: last_seen }
+    replies: [{ status: 200, body_file: fixtures/dns.json }]

@@ -1,0 +1,5 @@
+expected_fqdns: [api.acme.test]
+expected_observations: { api.acme.test: { source_names: [archive-search] } }
+expected_filter_reasons: [{ value: not a URL, reason: invalid_url }]
+expected_run_status: success
+expected_source_status: { archive-search: success }

@@ -1,0 +1,5 @@
+expected_fqdns: [resilient.acme.test]
+expected_observations: { resilient.acme.test: { source_names: [working] } }
+expected_filter_reasons: []
+expected_run_status: partial_success
+expected_source_status: { malformed: failed, working: success }

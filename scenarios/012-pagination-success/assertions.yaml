@@ -1,0 +1,8 @@
+expected_requests: 2
+endpoint_requests:
+  pages: 2
+required_paths: [/pages/v1/search]
+request_sequence:
+  - { endpoint: pages, response_index: 0 }
+  - { endpoint: pages, response_index: 1 }
+expected_rejected_egress_attempts: 0

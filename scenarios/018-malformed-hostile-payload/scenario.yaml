@@ -1,0 +1,17 @@
+id: 018-malformed-hostile-payload
+name: malformed payload
+description: Malformed JSON is a source failure, not a crash.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: malformed
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/malformed, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/malformed.json }]
+  - id: working
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/working, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

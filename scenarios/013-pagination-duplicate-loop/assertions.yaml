@@ -1,0 +1,9 @@
+expected_requests: 3
+endpoint_requests:
+  pages: 2
+  code-search: 1
+request_sequence:
+  - { endpoint: pages, response_index: 0 }
+  - { endpoint: pages, response_index: 1 }
+  - { endpoint: code-search, response_index: 0 }
+expected_rejected_egress_attempts: 0

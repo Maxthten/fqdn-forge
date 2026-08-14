@@ -1,0 +1,5 @@
+expected_fqdns: []
+expected_observations: {}
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { user-import: success }

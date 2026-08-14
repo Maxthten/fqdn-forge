@@ -1,0 +1,20 @@
+id: 016-upstream-server-failure
+name: upstream failures
+description: Preserve partial success when other sources fail.
+root_domain: acme.test
+seed: 20260814
+include_root: false
+endpoints:
+  - id: working
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/working, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]
+  - id: server-500
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/server-500, query: { domain: { equals: $ROOT_DOMAIN } } }
+    replies: [{ status: 500, body_file: fixtures/error.json }]
+  - id: server-503
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/server-503, query: { domain: { equals: $ROOT_DOMAIN } } }
+    replies: [{ status: 503, body_file: fixtures/error.json }]
