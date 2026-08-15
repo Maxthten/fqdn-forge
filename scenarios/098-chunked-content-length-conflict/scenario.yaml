@@ -1,0 +1,17 @@
+id: 098-chunked-content-length-conflict
+name: Chunked content-length conflict
+description: Static framing-conflict regression that remains local and auditable.
+version: "1.4.0"
+root_domain: s098.v14.test
+seed: 98
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [none], transport: [malformed], fault_class: [resource], execution_style: [single], assertion_focus: [finding, audit, resource] }
+composition: { fault_stages: [response_transport], event_order: [{ before: framing_checked, after: run_cleanup }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/098, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s098, host: api.s098.v14.test }] } }]

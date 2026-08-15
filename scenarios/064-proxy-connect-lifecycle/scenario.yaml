@@ -2,6 +2,17 @@ id: 064-proxy-connect-lifecycle
 name: CONNECT lifecycle
 description: A numeric loopback CONNECT negotiation is accepted by the local proxy.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [proxy_auth]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [connect_proxy]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 root_domain: target-64.acme.test
 seed: 64
 include_root: false

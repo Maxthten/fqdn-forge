@@ -7,6 +7,7 @@ mod model;
 mod repository;
 mod runner;
 mod state;
+mod v14;
 
 pub use domain::{
     CandidateError, accept_candidate, domainish_tokens, host_from_url, normalize_domain,
@@ -14,7 +15,7 @@ pub use domain::{
 pub use egress::{EgressGuard, EgressViolation};
 pub use judge::{
     JudgeInput, compression_from_audit, findings_from_collector, judge_run,
-    refresh_semantic_fingerprint, semantic_difference, semantic_fingerprint,
+    refresh_semantic_fingerprint, semantic_difference, semantic_fingerprint, semantic_projection,
 };
 pub use model::*;
 pub use repository::{LoadedScenario, ScenarioRepository, ValidationIssue};
@@ -22,6 +23,14 @@ pub use runner::{ReferenceRunner, RunnerError};
 pub use state::{
     LabState, QuotaDecision, RejectedRequestAudit, ResponseMetrics, RunSession, RunSessionStatus,
     RunStateError,
+};
+pub use v14::{
+    Baseline, BaselineComparison, CampaignDefinition, CampaignManifest, CampaignReport,
+    CoverageException, CoverageReport, DifferenceSummary, SoakAction, SoakPreset, SoakReport,
+    V14_SCHEMA_VERSION, baseline_from_reports, campaign_definition, campaign_definitions,
+    campaign_manifest, compare_baseline, coverage_check, coverage_markdown, coverage_report,
+    diagnostics_for, enrich_report, fixture_digest, provenance_for, report_differences, run_soak,
+    scenario_revision_digest, stable_digest, validate_v14_scenario,
 };
 
 pub fn report_json(report: &RunReport) -> Result<String, serde_json::Error> {

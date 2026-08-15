@@ -2,6 +2,17 @@ id: 074-gzip-corrupt-stream
 name: Corrupt gzip stream
 description: A gzip CRC fault must fail this source without producing an empty successful result.
 version: "1.2.1"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [gzip]
 root_domain: target-$SEED.acme.test
 seed: 74
 include_root: false

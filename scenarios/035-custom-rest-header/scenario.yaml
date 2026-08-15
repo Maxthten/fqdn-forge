@@ -2,6 +2,17 @@ id: 035-custom-rest-header
 name: Custom REST header contract
 description: A custom source validates a synthetic header and keeps it redacted in audit.
 version: "1.2"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 allow_duplicates: false
 allow_concurrent: true
 root_domain: acme.test

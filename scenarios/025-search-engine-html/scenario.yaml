@@ -2,6 +2,17 @@ id: 025-search-engine-html
 name: Search Engine HTML
 description: Search-result HTML is treated as local untrusted text.
 version: "1.2"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [html]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [identity]
 allow_duplicates: false
 allow_concurrent: true
 root_domain: acme.test

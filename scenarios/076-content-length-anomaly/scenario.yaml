@@ -2,6 +2,17 @@ id: 076-content-length-anomaly
 name: Content-Length anomaly
 description: An inconsistent Content-Length must fail parsing safely and not contaminate another run.
 version: "1.2.1"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [identity]
 root_domain: target-$SEED.acme.test
 seed: 76
 include_root: false

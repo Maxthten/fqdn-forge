@@ -2,6 +2,17 @@ id: 042-cursor-loop
 name: Cursor rollback and loop
 description: A repeated cursor is reported as a pagination-loop failure.
 version: "1.2"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [cursor]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 allow_duplicates: false
 allow_concurrent: true
 root_domain: acme.test

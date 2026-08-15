@@ -2,6 +2,17 @@ id: 081-deflate-corrupt-stream
 name: Corrupt deflate stream
 description: A corrupted local deflate stream fails safely without producing findings.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [deflate]
 root_domain: target-81.acme.test
 seed: 81
 include_root: false

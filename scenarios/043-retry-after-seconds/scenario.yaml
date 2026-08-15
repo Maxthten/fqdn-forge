@@ -2,6 +2,17 @@ id: 043-retry-after-seconds
 name: Retry-After seconds
 description: A retryable 429 uses virtual rather than wall-clock waiting.
 version: "1.2"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 allow_duplicates: false
 allow_concurrent: true
 root_domain: acme.test

@@ -1,0 +1,17 @@
+id: 106-concurrent-cross-run-lifecycle
+name: Concurrent cross-run lifecycle
+description: Static lifecycle isolation sample for concurrent local run actions.
+version: "1.4.0"
+root_domain: s106.v14.test
+seed: 106
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [global_run], transport: [identity], fault_class: [lifecycle], execution_style: [concurrent], assertion_focus: [audit, isolation, resource] }
+composition: { fault_stages: [lifecycle], event_order: [{ before: run_a_quota, after: run_b_isolation }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/106, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s106, host: api.s106.v14.test }] } }]

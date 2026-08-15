@@ -2,6 +2,17 @@ id: 069-external-submission-out-of-scope
 name: External submission scope baseline
 description: Baseline data for out-of-scope and similar-domain submission rejection.
 version: "1.2.1"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [identity]
 root_domain: target-$SEED.acme.test
 seed: 69
 include_root: false

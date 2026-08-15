@@ -1,0 +1,6 @@
+expected_fqdns: [api.s113.v14.test]
+forbidden_fqdns: [outside.s113.v14.test]
+expected_observations: { api.s113.v14.test: { source_names: [source], source_kinds: [generic_json], record_ids: [s113] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { source: success }

@@ -2,6 +2,17 @@ id: 034-generic-html-noise
 name: Generic HTML comments and fake domains
 description: Comments and external pseudo-domains stay out of the result set.
 version: "1.2"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [html]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 allow_duplicates: false
 allow_concurrent: true
 root_domain: acme.test

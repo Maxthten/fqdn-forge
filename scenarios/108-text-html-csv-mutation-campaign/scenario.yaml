@@ -1,0 +1,17 @@
+id: 108-text-html-csv-mutation-campaign
+name: Text HTML CSV mutation campaign
+description: Fixed campaign base scenario for bounded textual shape mutations.
+version: "1.4.0"
+root_domain: s108.v14.test
+seed: 10801
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [mixed], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [none], transport: [identity], fault_class: [none], execution_style: [campaign], assertion_focus: [finding, filter, audit, determinism] }
+composition: { fault_stages: [source_request], event_order: [{ before: mutation_loaded, after: out_of_scope_filtered }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/108, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s108, host: api.s108.v14.test }] } }]

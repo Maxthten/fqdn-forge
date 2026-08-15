@@ -2,6 +2,17 @@ id: 083-chunked-success
 name: Chunked response success
 description: A multi-chunk local response is consumed and parsed completely.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [chunked]
 root_domain: target-83.acme.test
 seed: 83
 include_root: false

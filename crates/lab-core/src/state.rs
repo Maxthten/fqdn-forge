@@ -9,8 +9,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    AuditRecord, CollectorSubmission, LoadedScenario, QuotaProfile, QuotaScope, RunReport,
-    ScenarioRepository,
+    AuditRecord, CollectorSubmission, LoadedScenario, QuotaProfile, QuotaScope, ResourceSummary,
+    RunReport, ScenarioRepository,
 };
 
 #[derive(Clone, Debug)]
@@ -27,6 +27,7 @@ struct MutableLabState {
     base_url: Option<String>,
     proxy_url: Option<String>,
     submitted_payloads: BTreeMap<String, String>,
+    deleted_runs: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -410,9 +411,16 @@ impl LabState {
     }
 
     pub fn reset(&self, run_id: &str) -> std::result::Result<(), RunStateError> {
+        self.reset_and_rotate(run_id).map(|_| ())
+    }
+
+    /// A reset creates a fresh capability epoch.  Callers that need to continue
+    /// through the public control API can use the returned token; stale run and
+    /// proxy capabilities are deliberately no longer accepted.
+    pub fn reset_and_rotate(&self, run_id: &str) -> std::result::Result<RunSession, RunStateError> {
         validate_run_id(run_id)?;
         let mut inner = self.inner.lock().expect("lab state lock poisoned");
-        let digest = {
+        let (digest, updated) = {
             let run = inner
                 .runs
                 .get_mut(run_id)
@@ -426,14 +434,15 @@ impl LabState {
             run.quota_counts.clear();
             run.latest_report = None;
             run.submission = None;
+            run.access_token = Uuid::new_v4().to_string();
             run.last_activity_at = Utc::now();
             run.status = RunSessionStatus::Reset;
-            digest
+            (digest, run.clone())
         };
         if let Some(digest) = digest {
             inner.submitted_payloads.remove(&digest);
         }
-        Ok(())
+        Ok(updated)
     }
 
     pub fn set_report(
@@ -526,6 +535,7 @@ impl LabState {
         if inner.developer_run_id.as_deref() == Some(run_id) {
             inner.developer_run_id = None;
         }
+        inner.deleted_runs += 1;
         Ok(())
     }
 
@@ -559,6 +569,42 @@ impl LabState {
             .expect("lab state lock poisoned")
             .unscoped_audit
             .clone()
+    }
+
+    #[must_use]
+    pub fn resource_summary(&self) -> ResourceSummary {
+        let inner = self.inner.lock().expect("lab state lock poisoned");
+        let active_runs = inner
+            .runs
+            .values()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    RunSessionStatus::Active
+                        | RunSessionStatus::Submitted
+                        | RunSessionStatus::Completed
+                )
+            })
+            .count();
+        ResourceSummary {
+            active_runs,
+            reset_runs: inner
+                .runs
+                .values()
+                .filter(|run| run.status == RunSessionStatus::Reset)
+                .count(),
+            deleted_runs: inner.deleted_runs,
+            active_proxy_connections: 0,
+            audit_records: inner.runs.values().map(|run| run.audit.len()).sum(),
+            quota_state_entries: inner.runs.values().map(|run| run.quota_counts.len()).sum(),
+            report_count: inner
+                .runs
+                .values()
+                .filter(|run| run.latest_report.is_some())
+                .count(),
+            fixture_bytes: 0,
+            rejection_count: inner.unscoped_audit.len(),
+        }
     }
 }
 

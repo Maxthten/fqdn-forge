@@ -2,6 +2,17 @@ id: 087-quota-global-run
 name: Global run quota
 description: A single run budget is shared by independent local sources.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [rate_limit]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [global_run]
+  source_shape: [generic]
+  transport: [identity]
 root_domain: target-87.acme.test
 seed: 87
 include_root: false

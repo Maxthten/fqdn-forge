@@ -2,6 +2,17 @@ id: 066-proxy-egress-and-cross-run-denied
 name: Proxy egress denied
 description: The proxy denies the request locally and never forwards it to a source endpoint.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [proxy_auth]
+  execution_style: [concurrent]
+  fault_class: [disconnect]
+  network_profile: [http_proxy]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 root_domain: target-66.acme.test
 seed: 66
 include_root: false

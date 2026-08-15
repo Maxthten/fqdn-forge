@@ -2,6 +2,17 @@ id: 067-external-submission-pass
 name: External collector submission passes
 description: A black-box collector reads the manifest, queries a local source and submits one evidenced finding.
 version: "1.2.1"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [identity]
 root_domain: target-$SEED.acme.test
 seed: 67
 include_root: false

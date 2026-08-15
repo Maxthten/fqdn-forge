@@ -1,0 +1,17 @@
+id: 096-connect-tunnel-truncated-payload
+name: CONNECT tunnel truncated payload
+description: Local tunnel transport boundary regression with no external socket target.
+version: "1.4.0"
+root_domain: s096.v14.test
+seed: 96
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [connect_proxy], quota_scope: [none], transport: [truncated], fault_class: [disconnect], execution_style: [single], assertion_focus: [finding, audit, resource] }
+composition: { fault_stages: [proxy_connection, response_transport], event_order: [{ before: tunnel_open, after: tunnel_close }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/096, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s096, host: api.s096.v14.test }] } }]

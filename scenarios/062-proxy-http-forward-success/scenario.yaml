@@ -2,6 +2,17 @@ id: 062-proxy-http-forward-success
 name: Forward proxy success
 description: Absolute-form HTTP traffic must traverse the run-local forward proxy.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [proxy_auth]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [http_proxy]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 root_domain: target-62.acme.test
 seed: 62
 include_root: false

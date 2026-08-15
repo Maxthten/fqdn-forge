@@ -2,6 +2,17 @@ id: 063-proxy-auth-and-redaction
 name: Proxy authentication redaction
 description: Valid synthetic proxy credentials pass without being copied into audit or reports.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [proxy_auth]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [http_proxy]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 root_domain: target-63.acme.test
 seed: 63
 include_root: false

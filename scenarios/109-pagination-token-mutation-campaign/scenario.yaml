@@ -1,0 +1,17 @@
+id: 109-pagination-token-mutation-campaign
+name: Pagination token mutation campaign
+description: Fixed campaign base scenario for deterministic cursor and token variants.
+version: "1.4.0"
+root_domain: s109.v14.test
+seed: 10901
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [cursor], authentication: [none], network_profile: [direct], quota_scope: [per_source], transport: [identity], fault_class: [rate_limit], execution_style: [campaign], assertion_focus: [finding, audit, determinism, resource] }
+composition: { fault_stages: [source_request, retry_recovery], event_order: [{ before: cursor_seen, after: loop_rejected }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/109, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s109, host: api.s109.v14.test }] } }]

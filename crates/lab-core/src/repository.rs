@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     Assertions, NetworkMode, PaginationMode, ProxyFault, Scenario, SourceKind, Truth,
-    normalize_domain,
+    V14_SCHEMA_VERSION, normalize_domain, validate_v14_scenario,
 };
 
 #[derive(Clone, Debug)]
@@ -102,13 +102,16 @@ impl ScenarioRepository {
             .iter()
             .flat_map(validate_loaded)
             .collect::<Vec<_>>();
-        if self.scenarios.len() != 90 {
+        if self.scenarios.len() != 114 {
             issues.push(issue_at(
                 "repository",
                 "scenarios",
                 "count",
-                format!("V1.3 requires exactly 90 scenarios; found {}", self.scenarios.len()),
-                "add the 061-066 and 079-090 V1.3 scenario directories without removing baseline scenarios",
+                format!(
+                    "V1.4 requires exactly 114 scenarios; found {}",
+                    self.scenarios.len()
+                ),
+                "add the 091-114 V1.4 scenario directories without removing baseline scenarios",
             ));
         }
         issues
@@ -118,16 +121,19 @@ impl ScenarioRepository {
 fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
     let id = &loaded.scenario.id;
     let mut issues = Vec::new();
-    if !matches!(loaded.scenario.version.as_str(), "1.2" | "1.2.1" | "1.3.0") {
+    if !matches!(
+        loaded.scenario.version.as_str(),
+        "1.2" | "1.2.1" | "1.3.0" | V14_SCHEMA_VERSION
+    ) {
         issues.push(issue_at(
             id,
             "scenario.yaml",
             "version",
             format!(
-                "scenario version {} is unsupported for the V1.3 repository",
+                "scenario version {} is unsupported for the V1.4 repository",
                 loaded.scenario.version
             ),
-            "set version to 1.2, 1.2.1 or 1.3.0",
+            "set version to 1.2, 1.2.1, 1.3.0 or 1.4.0",
         ));
     }
     let limits = &loaded.scenario.submission;
@@ -559,6 +565,15 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
             "lower expected_unmatched_requests or raise expected_requests",
         ));
     }
+    for problem in validate_v14_scenario(loaded) {
+        issues.push(issue_at(
+            id,
+            "scenario.yaml",
+            "coverage_tags/composition",
+            problem,
+            "use only controlled V1.4 coverage labels and bounded declarative composition metadata",
+        ));
+    }
     if let Some(number) = id
         .split('-')
         .next()
@@ -623,6 +638,55 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
                 "assertions",
                 "each V1.3 scenario needs at least eight observable assertions",
                 "add source, proxy, quota, transport, wait, egress or request assertions",
+            ));
+        }
+    }
+    if let Some(number) = id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        && (91..=114).contains(&number)
+    {
+        if loaded.scenario.version != V14_SCHEMA_VERSION {
+            issues.push(issue_at(
+                id,
+                "scenario.yaml",
+                "version",
+                "V1.4 scenarios must use version 1.4.0",
+                "set version to 1.4.0",
+            ));
+        }
+        let assertion_count = 1
+            + loaded.assertions.endpoint_requests.len()
+            + loaded.assertions.required_paths.len()
+            + loaded.assertions.forbidden_paths.len()
+            + loaded.assertions.request_sequence.len()
+            + usize::from(loaded.assertions.timing.min_virtual_wait_ms.is_some())
+            + usize::from(loaded.assertions.timing.max_virtual_wait_ms.is_some())
+            + usize::from(loaded.assertions.expected_proxy_requests.is_some())
+            + usize::from(loaded.assertions.expected_quota_decisions.is_some())
+            + usize::from(loaded.assertions.require_proxy.is_some())
+            + usize::from(loaded.assertions.forbid_direct_source)
+            + usize::from(loaded.assertions.require_quota_rate_limited)
+            + usize::from(loaded.assertions.required_content_encoding.is_some())
+            + usize::from(loaded.assertions.required_transfer_mode.is_some())
+            + usize::from(loaded.assertions.required_transport_fault.is_some())
+            + loaded.truth.expected_fqdns.len()
+            + loaded.truth.forbidden_fqdns.len()
+            + loaded.truth.expected_source_status.len()
+            + loaded.truth.expected_filter_reasons.len();
+        let required_assertions = if (107..=114).contains(&number) {
+            12
+        } else {
+            10
+        };
+        if assertion_count < required_assertions {
+            issues.push(issue_at(
+                id,
+                "assertions.yaml",
+                "assertions",
+                format!("each V1.4 scenario needs at least {required_assertions} meaningful observable assertions; found {assertion_count}"),
+                "add independent finding, audit, isolation, resource, diagnostic or determinism assertions",
             ));
         }
     }

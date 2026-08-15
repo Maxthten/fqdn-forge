@@ -1,0 +1,17 @@
+id: 094-proxy-auth-then-source-rate-limit
+name: Proxy authentication then source rate limit
+description: Local compositional regression record for proxy, source and quota ordering.
+version: "1.4.0"
+root_domain: s094.v14.test
+seed: 94
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [http_proxy], quota_scope: [per_source], transport: [identity], fault_class: [rate_limit], execution_style: [single], assertion_focus: [finding, audit, redaction] }
+composition: { fault_stages: [proxy_connection, source_request, retry_recovery], event_order: [{ before: proxy_authenticated, after: source_request }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/094, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s094, host: api.s094.v14.test }] } }]

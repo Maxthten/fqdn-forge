@@ -2,6 +2,17 @@ id: 088-quota-recovery-http-date
 name: Quota recovery with HTTP date
 description: The server records a quota 429 with HTTP-date Retry-After then permits a virtual-time recovery.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [rate_limit]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [per_source]
+  source_shape: [generic]
+  transport: [identity]
 root_domain: target-88.acme.test
 seed: 88
 include_root: false

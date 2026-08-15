@@ -2,6 +2,17 @@ id: 039-post-cursor-pagination
 name: POST body cursor pagination
 description: Cursor progression in a POST JSON body is validated without consuming mismatches.
 version: "1.2"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [cursor]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [identity]
 allow_duplicates: false
 allow_concurrent: true
 root_domain: acme.test

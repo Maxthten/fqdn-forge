@@ -1,0 +1,17 @@
+id: 107-json-structural-mutation-campaign
+name: JSON structural mutation campaign
+description: Fixed campaign base scenario for bounded seed-driven JSON mutations.
+version: "1.4.0"
+root_domain: s107.v14.test
+seed: 10701
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [none], transport: [identity], fault_class: [none], execution_style: [campaign], assertion_focus: [finding, audit, determinism, resource] }
+composition: { fault_stages: [source_request], event_order: [{ before: seed_loaded, after: truth_derived }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/107, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s107, host: api.s107.v14.test }] } }]

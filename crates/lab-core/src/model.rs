@@ -29,7 +29,43 @@ pub struct Scenario {
     /// the run manifest. It never describes a real network destination.
     #[serde(default)]
     pub network_profile: NetworkProfile,
+    /// V1.4 coverage metadata.  This is declarative data used by the local
+    /// coverage matrix; it is never interpreted as a network target or code.
+    #[serde(default)]
+    pub coverage_tags: BTreeMap<String, Vec<String>>,
+    /// A bounded description of how already-supported local behaviours are
+    /// composed.  The server remains data driven: this field cannot execute
+    /// expressions, scripts, URLs, or plugins.
+    #[serde(default)]
+    pub composition: CompositionProfile,
     pub endpoints: Vec<Endpoint>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionProfile {
+    #[serde(default)]
+    pub fault_stages: Vec<FaultStage>,
+    #[serde(default)]
+    pub event_order: Vec<EventOrder>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultStage {
+    Manifest,
+    ProxyConnection,
+    SourceRequest,
+    ResponseTransport,
+    RetryRecovery,
+    Lifecycle,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventOrder {
+    pub before: String,
+    pub after: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -967,6 +1003,122 @@ pub struct ReplayReport {
     pub matched: Option<bool>,
     pub comparison_report: Option<String>,
     pub first_difference: Option<String>,
+    #[serde(default)]
+    pub provenance_status: Option<String>,
+    #[serde(default)]
+    pub differences: Vec<ReplayDifference>,
+    #[serde(default)]
+    pub difference_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub truncated_difference_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferenceCategory {
+    Provenance,
+    Finding,
+    Evidence,
+    SourceStatus,
+    Filter,
+    Audit,
+    Proxy,
+    Quota,
+    Transport,
+    Lifecycle,
+    Resource,
+}
+
+impl DifferenceCategory {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provenance => "provenance",
+            Self::Finding => "finding",
+            Self::Evidence => "evidence",
+            Self::SourceStatus => "source_status",
+            Self::Filter => "filter",
+            Self::Audit => "audit",
+            Self::Proxy => "proxy",
+            Self::Quota => "quota",
+            Self::Transport => "transport",
+            Self::Lifecycle => "lifecycle",
+            Self::Resource => "resource",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplayDifference {
+    pub category: DifferenceCategory,
+    pub path: String,
+    pub previous: String,
+    pub current: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RunProvenance {
+    #[serde(default)]
+    pub scenario_revision_digest: String,
+    #[serde(default)]
+    pub fixture_digest: String,
+    #[serde(default)]
+    pub campaign_id: Option<String>,
+    #[serde(default)]
+    pub campaign_seed: Option<u64>,
+    #[serde(default)]
+    pub network_profile_summary: String,
+    #[serde(default)]
+    pub coverage_tags: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub report_schema_version: String,
+    #[serde(default)]
+    pub legacy_provenance_unavailable: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DiagnosticSummary {
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub failure_categories: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub event_timeline: Vec<EventTimelineEntry>,
+    #[serde(default)]
+    pub proxy_summary: String,
+    #[serde(default)]
+    pub quota_summary: String,
+    #[serde(default)]
+    pub transport_summary: String,
+    #[serde(default)]
+    pub lifecycle_summary: String,
+    #[serde(default)]
+    pub resource_invariants: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub audit_reference: String,
+    #[serde(default)]
+    pub recommended_replay_command: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventTimelineEntry {
+    pub sequence: usize,
+    pub category: String,
+    pub status: u16,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ResourceSummary {
+    pub active_runs: usize,
+    pub reset_runs: usize,
+    pub deleted_runs: usize,
+    pub active_proxy_connections: usize,
+    pub audit_records: usize,
+    pub quota_state_entries: usize,
+    pub report_count: usize,
+    pub fixture_bytes: usize,
+    pub rejection_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1153,6 +1305,10 @@ pub struct RunReport {
     pub quota: QuotaReport,
     #[serde(default)]
     pub transport: TransportReport,
+    #[serde(default)]
+    pub provenance: RunProvenance,
+    #[serde(default)]
+    pub diagnostics: DiagnosticSummary,
     /// Kept for older GUI/MCP prototypes that read `audit`.
     pub audit: Vec<AuditRecord>,
 }

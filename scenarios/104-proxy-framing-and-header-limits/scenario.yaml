@@ -1,0 +1,17 @@
+id: 104-proxy-framing-and-header-limits
+name: Proxy framing and header limits
+description: Static regression record for duplicate headers and framing limit rejection.
+version: "1.4.0"
+root_domain: s104.v14.test
+seed: 104
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [http_proxy], quota_scope: [none], transport: [malformed], fault_class: [resource], execution_style: [single], assertion_focus: [audit, isolation, resource] }
+composition: { fault_stages: [proxy_connection, response_transport], event_order: [{ before: header_rejected, after: next_valid_request }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/104, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s104, host: api.s104.v14.test }] } }]

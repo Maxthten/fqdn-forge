@@ -2,6 +2,17 @@ id: 072-duplicate-cross-run-submission
 name: Duplicate and cross-run submission baseline
 description: A run freezes after its first accepted submission and remains isolated from other runs.
 version: "1.2.1"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [identity]
 root_domain: target-$SEED.acme.test
 seed: 72
 include_root: false

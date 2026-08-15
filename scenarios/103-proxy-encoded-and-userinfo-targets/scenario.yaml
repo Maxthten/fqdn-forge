@@ -1,0 +1,17 @@
+id: 103-proxy-encoded-and-userinfo-targets
+name: Proxy encoded and userinfo targets
+description: Static local record for encoded authority and userinfo rejection.
+version: "1.4.0"
+root_domain: s103.v14.test
+seed: 103
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [http_proxy], quota_scope: [none], transport: [identity], fault_class: [egress], execution_style: [single], assertion_focus: [audit, isolation, redaction] }
+composition: { fault_stages: [proxy_connection], event_order: [{ before: target_parsed, after: source_not_reached }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/103, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s103, host: api.s103.v14.test }] } }]

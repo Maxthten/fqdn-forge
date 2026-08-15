@@ -139,8 +139,8 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         ReportStatus::Failed
     };
     let mut report = RunReport {
-        schema_version: "1.3.0".to_owned(),
-        lab_version: "1.3.0".to_owned(),
+        schema_version: crate::V14_SCHEMA_VERSION.to_owned(),
+        lab_version: crate::V14_SCHEMA_VERSION.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_string(),
         scenario_id: scenario_id.to_owned(),
@@ -174,6 +174,8 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         network: network_from_audit(audit),
         quota: quota_from_audit(audit),
         transport: transport_from_audit(audit),
+        provenance: Default::default(),
+        diagnostics: Default::default(),
         audit: audit.to_vec(),
     };
     refresh_semantic_fingerprint(&mut report);
@@ -308,7 +310,7 @@ pub fn semantic_difference(previous: &RunReport, current: &RunReport) -> Option<
     )
 }
 
-fn semantic_projection(report: &RunReport) -> Value {
+pub fn semantic_projection(report: &RunReport) -> Value {
     let mut findings = report.findings.clone();
     findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
     for finding in &mut findings {

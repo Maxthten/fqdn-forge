@@ -245,6 +245,15 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         blocked: false,
         correlation_id: correlation_id.clone(),
     });
+    if let Some(reason) = proxy_request_shape_reason(&request) {
+        audit.response_status = 400;
+        audit.blocked = true;
+        audit.external_target_rejected = true;
+        audit.proxy_reason = Some(reason);
+        let _ = state.record_request(run_id, audit);
+        let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
+        return;
+    }
     if profile.mode == NetworkMode::Direct
         || (profile.mode == NetworkMode::HttpProxy && is_connect)
         || (profile.mode == NetworkMode::ConnectProxy && !is_connect)
@@ -432,7 +441,7 @@ async fn proxy_connect(
     request: RawProxyRequest,
     mut audit: AuditRecord,
 ) {
-    let port = match allowed_connect_proxy_target(&state, run_id, scenario, &request.target) {
+    let port = match allowed_connect_proxy_target(&state, run_id, scenario, &request) {
         Ok(port) => port,
         Err(reason) => {
             audit.response_status = 403;
@@ -497,18 +506,41 @@ fn allowed_forward_proxy_target(
     scenario: &Scenario,
     request: &RawProxyRequest,
 ) -> Result<Url, String> {
-    let target = Url::parse(&request.target).map_err(|_| "invalid_absolute_form".to_owned())?;
+    if request.target.contains('%')
+        || request.target.contains('@')
+        || request.target.contains('#')
+        || request.target.chars().any(char::is_control)
+    {
+        return Err("non_canonical_target".to_owned());
+    }
     let source = state
         .base_url()
         .ok_or_else(|| "source_unavailable".to_owned())?;
     let source = Url::parse(&source).map_err(|_| "source_unavailable".to_owned())?;
+    let expected_authority = format!(
+        "127.0.0.1:{}",
+        source.port_or_known_default().unwrap_or_default()
+    );
+    // `Url` deliberately accepts and canonicalizes several historical IPv4
+    // spellings.  The local proxy's allowlist is intentionally textual as
+    // well as semantic: only the exact numeric loopback authority advertised
+    // by the manifest may reach the parser or the source socket.
+    let expected_prefix = format!("http://{expected_authority}/");
+    if !request.target.starts_with(&expected_prefix) {
+        return Err("non_canonical_target".to_owned());
+    }
+    let target = Url::parse(&request.target).map_err(|_| "invalid_absolute_form".to_owned())?;
     if target.scheme() != "http"
         || target.host_str() != Some("127.0.0.1")
         || target.port_or_known_default() != source.port_or_known_default()
         || !target.username().is_empty()
         || target.password().is_some()
+        || target.fragment().is_some()
     {
         return Err("egress_denied".to_owned());
+    }
+    if exact_proxy_host(request) != Some(expected_authority.as_str()) {
+        return Err("host_authority_mismatch".to_owned());
     }
     if !scenario.endpoints.iter().any(|endpoint| {
         endpoint.request_match.path == target.path()
@@ -535,12 +567,24 @@ fn allowed_connect_proxy_target(
     state: &LabState,
     _run_id: &str,
     _scenario: &Scenario,
-    authority: &str,
+    request: &RawProxyRequest,
 ) -> Result<u16, String> {
+    let authority = &request.target;
+    if authority.contains('%')
+        || authority.contains('@')
+        || authority.contains('/')
+        || authority.contains('#')
+    {
+        return Err("egress_denied".to_owned());
+    }
     let (host, port) = authority
-        .rsplit_once(':')
+        .split_once(':')
         .ok_or_else(|| "invalid_connect_authority".to_owned())?;
-    if host != "127.0.0.1" || port.contains(':') {
+    if host != "127.0.0.1"
+        || port.is_empty()
+        || port.contains(':')
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return Err("egress_denied".to_owned());
     }
     let port = port
@@ -553,7 +597,64 @@ fn allowed_connect_proxy_target(
     if source.port_or_known_default() != Some(port) {
         return Err("unregistered_target".to_owned());
     }
+    if exact_proxy_host(request) != Some(authority.as_str()) {
+        return Err("host_authority_mismatch".to_owned());
+    }
     Ok(port)
+}
+
+fn exact_proxy_host(request: &RawProxyRequest) -> Option<&str> {
+    let mut hosts = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.as_str());
+    let host = hosts.next()?;
+    hosts.next().is_none().then_some(host)
+}
+
+fn proxy_request_shape_reason(request: &RawProxyRequest) -> Option<String> {
+    if request.method.is_empty()
+        || !request
+            .method
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic())
+        || request.target.is_empty()
+        || request.target.len() > 2_048
+        || request.target.chars().any(char::is_control)
+    {
+        return Some("malformed_request_line".to_owned());
+    }
+    let mut names = BTreeMap::<String, usize>::new();
+    let mut content_length = false;
+    let mut transfer_encoding = false;
+    for (name, value) in &request.headers {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || value.chars().any(char::is_control)
+        {
+            return Some("malformed_header".to_owned());
+        }
+        let normalized = name.to_ascii_lowercase();
+        *names.entry(normalized.clone()).or_default() += 1;
+        content_length |= normalized == "content-length";
+        transfer_encoding |= normalized == "transfer-encoding";
+    }
+    if names.get("host").copied().unwrap_or_default() != 1 {
+        return Some("host_header_ambiguity".to_owned());
+    }
+    if names.get("content-length").copied().unwrap_or_default() > 1 {
+        return Some("content_length_ambiguity".to_owned());
+    }
+    if transfer_encoding && content_length {
+        return Some("content_length_transfer_encoding_conflict".to_owned());
+    }
+    if transfer_encoding {
+        return Some("transfer_encoding_not_supported".to_owned());
+    }
+    None
 }
 
 fn proxy_header_map(headers: &[(String, String)]) -> BTreeMap<String, String> {
@@ -776,16 +877,29 @@ async fn read_proxy_request(stream: &mut TcpStream) -> Result<RawProxyRequest, S
         .next()
         .ok_or_else(|| "proxy_missing_target".to_owned())?
         .to_owned();
-    if request_line.next().is_none() {
+    if request_line.next() != Some("HTTP/1.1") || request_line.next().is_some() {
         return Err("proxy_missing_version".to_owned());
     }
     let mut headers = Vec::new();
     let mut content_length = 0_usize;
     for line in lines.filter(|line| !line.is_empty()) {
+        if headers.len() >= 64 || line.starts_with(' ') || line.starts_with('\t') {
+            return Err("proxy_header_limit_or_obs_fold".to_owned());
+        }
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "proxy_malformed_header".to_owned())?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("proxy_malformed_header".to_owned());
+        }
         let value = value.trim().to_owned();
+        if value.chars().any(char::is_control) {
+            return Err("proxy_malformed_header".to_owned());
+        }
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value
                 .parse::<usize>()
@@ -1076,8 +1190,11 @@ fn run_control_response(
             Ok(report) => json_response(StatusCode::OK, json!({"run_id":run_id,"report":report})),
             Err(error) => run_error_response(error),
         },
-        (&Method::POST, Some("reset")) => match state.reset(run_id) {
-            Ok(()) => json_response(StatusCode::OK, json!({"run_id":run_id,"reset":true})),
+        (&Method::POST, Some("reset")) => match state.reset_and_rotate(run_id) {
+            Ok(updated) => json_response(
+                StatusCode::OK,
+                json!({"run_id":run_id,"reset":true,"run_access_token":updated.access_token}),
+            ),
             Err(error) => run_error_response(error),
         },
         (&Method::POST, Some("submission")) => {
@@ -1264,7 +1381,7 @@ fn manifest_for_run(
             .effective_max_decoded_response_bytes(),
     };
     Ok(RunManifest {
-        schema_version: "1.3.0".to_owned(),
+        schema_version: lab_core::V14_SCHEMA_VERSION.to_owned(),
         run_id: run.run_id,
         scenario_id: run.scenario_id,
         seed: run.seed,
@@ -1453,8 +1570,11 @@ fn validate_submission(
     base_url: &str,
 ) -> Result<CollectorRun, String> {
     let limits = &loaded.scenario.submission;
-    if !matches!(submission.schema_version.as_str(), "1.2.1" | "1.3.0") {
-        return Err("submission schema_version must be 1.2.1 or 1.3.0".to_owned());
+    if !matches!(
+        submission.schema_version.as_str(),
+        "1.2.1" | "1.3.0" | "1.4.0"
+    ) {
+        return Err("submission schema_version must be 1.2.1, 1.3.0 or 1.4.0".to_owned());
     }
     if submission.collector.name.is_empty()
         || submission.collector.version.is_empty()

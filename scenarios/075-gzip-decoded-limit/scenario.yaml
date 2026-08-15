@@ -2,6 +2,17 @@ id: 075-gzip-decoded-limit
 name: Gzip decoded-size limit
 description: A small compressed response expands past the bounded decoded-response budget.
 version: "1.2.1"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [search]
+  transport: [gzip]
 root_domain: target-$SEED.acme.test
 seed: 75
 include_root: false

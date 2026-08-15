@@ -2,6 +2,17 @@ id: 080-brotli-success
 name: Brotli success
 description: A deterministic local Brotli response is decompressed before extraction.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [brotli]
 root_domain: target-80.acme.test
 seed: 80
 include_root: false

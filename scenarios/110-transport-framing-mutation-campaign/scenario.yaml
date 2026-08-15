@@ -1,0 +1,17 @@
+id: 110-transport-framing-mutation-campaign
+name: Transport framing mutation campaign
+description: Fixed campaign base scenario for bounded transport framing variants.
+version: "1.4.0"
+root_domain: s110.v14.test
+seed: 11001
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [none], transport: [chunked], fault_class: [resource], execution_style: [campaign], assertion_focus: [finding, audit, determinism, resource] }
+composition: { fault_stages: [response_transport], event_order: [{ before: frame_mutated, after: next_request_clean }] }
+endpoints:
+  - id: source
+    source_kind: generic_json
+    match: { method: GET, path: /v14/110, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, transfer_mode: chunked, chunk_count: 2, body: { items: [{ id: s110, host: api.s110.v14.test }] } }]

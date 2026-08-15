@@ -2,6 +2,17 @@ id: 079-deflate-success
 name: Deflate success
 description: A deterministic local deflate response is decompressed before extraction.
 version: "1.3.0"
+coverage_tags:
+  assertion_focus: [finding]
+  authentication: [none]
+  execution_style: [concurrent]
+  fault_class: [none]
+  network_profile: [direct]
+  pagination: [none]
+  payload_format: [json]
+  quota_scope: [none]
+  source_shape: [generic]
+  transport: [deflate]
 root_domain: target-79.acme.test
 seed: 79
 include_root: false
