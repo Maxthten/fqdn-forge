@@ -161,7 +161,9 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
             );
         }
     };
-    if let Some(response) = control_response(&state, &method, &path, &body, &base_url).await {
+    if let Some(response) =
+        control_response(&state, &method, &path, &headers, &body, &base_url).await
+    {
         return response;
     }
     scenario_response(
@@ -198,6 +200,7 @@ async fn control_response(
     state: &LabState,
     method: &Method,
     path: &str,
+    headers: &HeaderMap,
     body: &[u8],
     base_url: &str,
 ) -> Option<Response> {
@@ -227,6 +230,8 @@ async fn control_response(
                         "required_source_header": "x-lab-run-id",
                         "status": run.status,
                         "required_request_header": {"x-lab-run-id": run.run_id},
+                        "run_access_header": "x-lab-run-access-token",
+                        "run_access_token": run.access_token,
                     }),
                 ),
                 Err(_) => {
@@ -243,7 +248,7 @@ async fn control_response(
     }
     if let Some((run_id, action)) = run_route(path) {
         return Some(run_control_response(
-            state, method, run_id, action, body, base_url,
+            state, method, run_id, action, headers, body, base_url,
         ));
     }
     let value = match (method, path) {
@@ -337,6 +342,7 @@ fn run_control_response(
     method: &Method,
     run_id: &str,
     action: Option<&str>,
+    headers: &HeaderMap,
     body: &[u8],
     base_url: &str,
 ) -> Response {
@@ -344,6 +350,12 @@ fn run_control_response(
         Ok(run) => run,
         Err(error) => return run_error_response(error),
     };
+    if run_access_is_required(method, action) && !has_run_access(&run, headers) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error":"run access capability is required"}),
+        );
+    }
     match (method, action) {
         (&Method::GET, None) => json_response(StatusCode::OK, run_summary(&run)),
         (&Method::GET, Some("requests")) => match state.audit(run_id) {
@@ -390,6 +402,24 @@ fn run_control_response(
             json!({"error":"unknown run control route"}),
         ),
     }
+}
+
+fn run_access_is_required(method: &Method, action: Option<&str>) -> bool {
+    matches!(
+        (method, action),
+        (
+            &Method::GET,
+            None | Some("requests") | Some("manifest") | Some("report")
+        ) | (&Method::POST, Some("reset") | Some("submission"))
+            | (&Method::DELETE, None)
+    )
+}
+
+fn has_run_access(run: &RunSession, headers: &HeaderMap) -> bool {
+    headers
+        .get("x-lab-run-access-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == run.access_token)
 }
 
 fn run_summary(run: &RunSession) -> Value {
@@ -1965,9 +1995,23 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         .expect("UUID")
     }
 
-    async fn requests(client: &Client, base_url: &str, run_id: Uuid) -> Vec<AuditRecord> {
+    fn run_access_token(server: &LocalServer, run_id: Uuid) -> String {
+        server
+            .state
+            .session(&run_id.to_string())
+            .expect("test run")
+            .access_token
+    }
+
+    async fn requests(
+        server: &LocalServer,
+        client: &Client,
+        base_url: &str,
+        run_id: Uuid,
+    ) -> Vec<AuditRecord> {
         let value: serde_json::Value = client
             .get(format!("{base_url}/api/runs/{run_id}/requests"))
+            .header("x-lab-run-access-token", run_access_token(server, run_id))
             .send()
             .await
             .expect("requests response")
@@ -1993,7 +2037,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .run(base_url, &loaded.scenario, run_id, "default")
             .await
             .expect("reference run");
-        let audit = requests(client, base_url, run_id).await;
+        let audit = requests(server, client, base_url, run_id).await;
         let report = judge_run(JudgeInput {
             run_id,
             scenario_id: &loaded.scenario.id,
@@ -2118,6 +2162,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         );
         let report: serde_json::Value = client
             .get(format!("{base_url}/api/runs/{run_id}/report"))
+            .header("x-lab-run-access-token", run_access_token(&server, run_id))
             .send()
             .await
             .expect("empty report")
@@ -2148,6 +2193,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert_eq!(
             client
                 .delete(format!("{base_url}/api/runs/{run_id}"))
+                .header("x-lab-run-access-token", run_access_token(&server, run_id))
                 .send()
                 .await
                 .expect("delete run")
@@ -2186,8 +2232,8 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         );
         assert_eq!(first_report.status, ReportStatus::Passed);
         assert_eq!(second_report.status, ReportStatus::Passed);
-        let first_audit = requests(&client, &base_url, first).await;
-        let second_audit = requests(&client, &base_url, second).await;
+        let first_audit = requests(&server, &client, &base_url, first).await;
+        let second_audit = requests(&server, &client, &base_url, second).await;
         assert_eq!(first_audit.len(), 2);
         assert_eq!(second_audit.len(), 2);
         assert_eq!(response_indices(&first_audit), vec![0, 1]);
@@ -2226,15 +2272,20 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert_eq!(first_page.status(), StatusCode::OK);
         let reset = client
             .post(format!("{base_url}/api/runs/{first}/reset"))
+            .header("x-lab-run-access-token", run_access_token(&server, first))
             .send()
             .await
             .expect("reset");
         assert_eq!(reset.status(), StatusCode::OK);
         let second_report = run_report(&server, &client, &base_url, &loaded, second).await;
         assert_eq!(second_report.status, ReportStatus::Passed);
-        assert!(requests(&client, &base_url, first).await.is_empty());
+        assert!(
+            requests(&server, &client, &base_url, first)
+                .await
+                .is_empty()
+        );
         assert_eq!(
-            response_indices(&requests(&client, &base_url, second).await),
+            response_indices(&requests(&server, &client, &base_url, second).await),
             vec![0, 1]
         );
         server.shutdown().await;
@@ -2267,11 +2318,11 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert_eq!(pages_report.virtual_waited_ms, 0);
         assert_eq!(rate_report.virtual_waited_ms, 1_000);
         assert_eq!(
-            response_indices(&requests(&client, &base_url, pages_id).await),
+            response_indices(&requests(&server, &client, &base_url, pages_id).await),
             vec![0, 1]
         );
         assert_eq!(
-            response_indices(&requests(&client, &base_url, rate_id).await),
+            response_indices(&requests(&server, &client, &base_url, rate_id).await),
             vec![0, 1]
         );
         server.shutdown().await;
@@ -2294,7 +2345,11 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("missing run header request");
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
-        assert!(requests(&client, &base_url, run_id).await.is_empty());
+        assert!(
+            requests(&server, &client, &base_url, run_id)
+                .await
+                .is_empty()
+        );
         let diagnostics = client
             .get(format!("{base_url}/api/diagnostics/unscoped-requests"))
             .send()
@@ -2307,7 +2362,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         let report = run_report(&server, &client, &base_url, &loaded, run_id).await;
         assert_eq!(report.status, ReportStatus::Passed);
         assert_eq!(
-            response_indices(&requests(&client, &base_url, run_id).await),
+            response_indices(&requests(&server, &client, &base_url, run_id).await),
             vec![0, 1]
         );
         server.shutdown().await;
@@ -2371,7 +2426,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("extra request");
         assert_eq!(extra.status(), StatusCode::CONFLICT);
-        let audit = requests(&client, &base_url, page_id).await;
+        let audit = requests(&server, &client, &base_url, page_id).await;
         assert_eq!(response_indices(&audit), vec![0, 1]);
         assert!(audit.last().is_some_and(|record| record.extra));
 
@@ -2385,7 +2440,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .expect("wrong key request");
         assert_eq!(wrong_key.status(), StatusCode::BAD_REQUEST);
         assert!(
-            !serde_json::to_string(&requests(&client, &base_url, rate_id).await)
+            !serde_json::to_string(&requests(&server, &client, &base_url, rate_id).await)
                 .expect("audit JSON")
                 .contains("wrong-key")
         );
@@ -2393,7 +2448,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         let rate_report = run_report(&server, &client, &base_url, &rate_limit, good_rate_id).await;
         assert_eq!(rate_report.status, ReportStatus::Passed);
         assert!(
-            !serde_json::to_string(&requests(&client, &base_url, good_rate_id).await)
+            !serde_json::to_string(&requests(&server, &client, &base_url, good_rate_id).await)
                 .expect("audit JSON")
                 .contains("lab-demo-key")
         );
@@ -2422,7 +2477,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .expect("correct POST body");
         assert_eq!(correct.status(), StatusCode::OK);
         assert_eq!(
-            response_indices(&requests(&client, &base_url, correct_run).await),
+            response_indices(&requests(&server, &client, &base_url, correct_run).await),
             vec![0]
         );
 
@@ -2435,7 +2490,9 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("wrong POST body");
         assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
-        assert!(response_indices(&requests(&client, &base_url, wrong_run).await).is_empty());
+        assert!(
+            response_indices(&requests(&server, &client, &base_url, wrong_run).await).is_empty()
+        );
 
         let redirect_run = create_run(&client, &base_url, &redirect.scenario.id).await;
         let guard = EgressGuard::default();
@@ -2450,7 +2507,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         );
         assert!(collector.metrics.blocked_egress);
         assert_eq!(guard.rejected_urls(), vec!["http://198.51.100.10/redirect"]);
-        let redirect_audit = requests(&client, &base_url, redirect_run).await;
+        let redirect_audit = requests(&server, &client, &base_url, redirect_run).await;
         assert_eq!(redirect_audit.len(), 1);
         assert_eq!(redirect_audit[0].response_status, 302);
         assert!(redirect_audit[0].blocked);

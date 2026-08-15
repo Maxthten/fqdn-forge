@@ -28,6 +28,8 @@ struct MutableLabState {
 #[derive(Clone, Debug, Serialize)]
 pub struct RunSession {
     pub run_id: String,
+    #[serde(skip_serializing)]
+    pub access_token: String,
     pub scenario_id: String,
     pub seed: u64,
     pub created_at: DateTime<Utc>,
@@ -134,6 +136,7 @@ impl LabState {
         let now = Utc::now();
         let run = RunSession {
             run_id: Uuid::new_v4().to_string(),
+            access_token: Uuid::new_v4().to_string(),
             scenario_id: scenario_id.to_owned(),
             seed: seed.unwrap_or(scenario.scenario.seed),
             created_at: now,

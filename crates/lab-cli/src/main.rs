@@ -137,7 +137,7 @@ async fn run_one(
     let guard = EgressGuard::default();
     let runner = ReferenceRunner::new(guard.clone())?;
     let control_client = Client::builder().redirect(Policy::none()).build()?;
-    let run_id = create_run(
+    let created_run = create_run(
         &control_client,
         &server.base_url(),
         id,
@@ -145,14 +145,19 @@ async fn run_one(
     )
     .await?;
     let collector = runner
-        .run(&server.base_url(), &loaded.scenario, run_id, profile)
+        .run(
+            &server.base_url(),
+            &loaded.scenario,
+            created_run.run_id,
+            profile,
+        )
         .await?;
     let finished = Utc::now();
-    let audit = fetch_audit(&control_client, &server.base_url(), run_id).await?;
+    let audit = fetch_audit(&control_client, &server.base_url(), &created_run).await?;
     let rejected = guard.rejected_urls();
     let target = target_domain(&loaded.scenario);
     let report = judge_run(JudgeInput {
-        run_id,
+        run_id: created_run.run_id,
         scenario_id: &loaded.scenario.id,
         seed: loaded.scenario.seed,
         target_domain: &target,
@@ -317,8 +322,19 @@ async fn external_http_conformance(
         .get("run_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("public create-run response is missing run_id"))?;
+    let run_access_header = create
+        .get("run_access_header")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("public create-run response is missing run_access_header")
+        })?;
+    let run_access_token = create
+        .get("run_access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("public create-run response is missing run_access_token"))?;
     let manifest: serde_json::Value = client
         .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+        .header(run_access_header, run_access_token)
         .send()
         .await?
         .error_for_status()?
@@ -411,12 +427,14 @@ async fn external_http_conformance(
     });
     client
         .post(format!("{base_url}/api/runs/{run_id}/submission"))
+        .header(run_access_header, run_access_token)
         .json(&submission)
         .send()
         .await?
         .error_for_status()?;
     let report: serde_json::Value = client
         .get(format!("{base_url}/api/runs/{run_id}/report"))
+        .header(run_access_header, run_access_token)
         .send()
         .await?
         .error_for_status()?
@@ -503,13 +521,14 @@ async fn run_negative_client(
         .await
         .map_err(anyhow::Error::msg)?;
     let client = Client::builder().redirect(Policy::none()).build()?;
-    let run_id = create_run(
+    let created_run = create_run(
         &client,
         &server.base_url(),
         scenario_id,
         Some(loaded.scenario.seed),
     )
     .await?;
+    let run_id = created_run.run_id;
     let started = Utc::now();
     let mut collector = CollectorRun::default();
     let mut rejected = Vec::new();
@@ -668,7 +687,7 @@ async fn run_negative_client(
         }
         _ => unreachable!("fixed self-test set"),
     }
-    let audit = fetch_audit(&client, &server.base_url(), run_id).await?;
+    let audit = fetch_audit(&client, &server.base_url(), &created_run).await?;
     let report = judge_run(JudgeInput {
         run_id,
         scenario_id,
@@ -686,12 +705,18 @@ async fn run_negative_client(
     Ok(report)
 }
 
+#[derive(Clone)]
+struct CreatedRun {
+    run_id: Uuid,
+    access_token: String,
+}
+
 async fn create_run(
     client: &Client,
     base_url: &str,
     scenario_id: &str,
     seed: Option<u64>,
-) -> anyhow::Result<Uuid> {
+) -> anyhow::Result<CreatedRun> {
     let response = client
         .post(format!("{base_url}/api/runs"))
         .json(&serde_json::json!({"scenario_id":scenario_id,"seed":seed}))
@@ -703,16 +728,24 @@ async fn create_run(
         .get("run_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("run creation response is missing run_id"))?;
-    Ok(Uuid::parse_str(run_id)?)
+    let access_token = value
+        .get("run_access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("run creation response is missing run_access_token"))?;
+    Ok(CreatedRun {
+        run_id: Uuid::parse_str(run_id)?,
+        access_token: access_token.to_owned(),
+    })
 }
 
 async fn fetch_audit(
     client: &Client,
     base_url: &str,
-    run_id: Uuid,
+    run: &CreatedRun,
 ) -> anyhow::Result<Vec<lab_core::AuditRecord>> {
     let response = client
-        .get(format!("{base_url}/api/runs/{run_id}/requests"))
+        .get(format!("{base_url}/api/runs/{}/requests", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
         .send()
         .await?
         .error_for_status()?;
@@ -913,6 +946,10 @@ mod tests {
             .await
             .expect("create run JSON");
         let run_id = created["run_id"].as_str().expect("run id").to_owned();
+        let run_access_token = created["run_access_token"]
+            .as_str()
+            .expect("run access token")
+            .to_owned();
         assert_eq!(
             client
                 .get(format!("{base_url}/api/runs/{run_id}/truth"))
@@ -933,6 +970,7 @@ mod tests {
         );
         let manifest: serde_json::Value = client
             .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+            .header("x-lab-run-access-token", &run_access_token)
             .send()
             .await
             .expect("manifest request")
@@ -971,6 +1009,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&invalid_target)
                 .send()
                 .await
@@ -983,6 +1022,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&unknown_source)
                 .send()
                 .await
@@ -995,6 +1035,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&out_of_scope)
                 .send()
                 .await
@@ -1007,6 +1048,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&no_evidence)
                 .send()
                 .await
@@ -1019,6 +1061,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&forged)
                 .send()
                 .await
@@ -1031,6 +1074,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&sensitive)
                 .send()
                 .await
@@ -1044,6 +1088,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&sensitive_evidence_url)
                 .send()
                 .await
@@ -1058,6 +1103,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .header("content-type", "application/json")
                 .body(oversized)
                 .send()
@@ -1069,6 +1115,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&correct_submission)
                 .send()
                 .await
@@ -1078,6 +1125,7 @@ mod tests {
         );
         let audit: serde_json::Value = client
             .get(format!("{base_url}/api/runs/{run_id}/requests"))
+            .header("x-lab-run-access-token", &run_access_token)
             .send()
             .await
             .expect("submission audit request")
@@ -1101,6 +1149,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/reset"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .send()
                 .await
                 .expect("reset submitted run")
@@ -1121,6 +1170,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&correct_submission)
                 .send()
                 .await
@@ -1140,9 +1190,43 @@ mod tests {
             .await
             .expect("second run JSON");
         let second_run_id = second_run["run_id"].as_str().expect("second run id");
+        let second_run_access_token = second_run["run_access_token"]
+            .as_str()
+            .expect("second run access token");
+        assert_eq!(
+            client
+                .get(format!("{base_url}/api/runs/{run_id}/report"))
+                .header("x-lab-run-access-token", second_run_access_token)
+                .send()
+                .await
+                .expect("cross-run report request")
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/reset"))
+                .header("x-lab-run-access-token", second_run_access_token)
+                .send()
+                .await
+                .expect("cross-run reset request")
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .delete(format!("{base_url}/api/runs/{run_id}"))
+                .header("x-lab-run-access-token", second_run_access_token)
+                .send()
+                .await
+                .expect("cross-run delete request")
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{second_run_id}/submission"))
+                .header("x-lab-run-access-token", second_run_access_token)
                 .json(&correct_submission)
                 .send()
                 .await
@@ -1153,6 +1237,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("x-lab-run-access-token", &run_access_token)
                 .json(&correct_submission)
                 .send()
                 .await
@@ -1173,6 +1258,7 @@ mod tests {
         assert_eq!(
             client
                 .delete(format!("{base_url}/api/runs/{second_run_id}"))
+                .header("x-lab-run-access-token", second_run_access_token)
                 .send()
                 .await
                 .expect("delete secondary run")
@@ -1182,6 +1268,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base_url}/api/runs/{second_run_id}/submission"))
+                .header("x-lab-run-access-token", second_run_access_token)
                 .json(&correct_submission)
                 .send()
                 .await
