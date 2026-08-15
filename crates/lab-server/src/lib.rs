@@ -2,7 +2,8 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -16,15 +17,20 @@ use axum::{
     routing::any,
 };
 use chrono::Utc;
+use flate2::{Compression, write::GzEncoder};
 use futures_util::stream;
 use lab_core::{
-    AuditRecord, Endpoint, GeneratorKind, LabState, LoadedScenario, Reply, RunReport, RunSession,
-    RunStateError, Scenario, ScenarioRepository, ValueRule,
+    AuditRecord, CollectorRun, CollectorSubmission, Endpoint, GeneratorKind, LabState,
+    LoadedScenario, ManifestNetwork, ManifestSource, ManifestSubmission, Reply, ResponseMetrics,
+    RunManifest, RunReport, RunSession, RunStateError, Scenario, ScenarioRepository, SourceStatus,
+    SubmissionLimits, SubmissionReport, ValueRule, accept_candidate, judge_run,
+    refresh_semantic_fingerprint,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use url::Url;
+use uuid::Uuid;
 
 pub struct LocalServer {
     address: SocketAddr,
@@ -55,6 +61,7 @@ impl LocalServer {
             return Err("refusing non-loopback listener".to_owned());
         }
         let state = LabState::new(repository);
+        state.set_base_url(format!("http://127.0.0.1:{}", address.port()));
         if let Some(id) = active {
             state.activate(id).map_err(|error| error.to_string())?;
         }
@@ -138,7 +145,22 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
             .and_then(|value| value.to_str().ok())
             .unwrap_or("127.0.0.1")
     );
-    let body = to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+    let (max_body_bytes, body_timeout) = request_body_limits(&state, &method, &path);
+    let body = match tokio::time::timeout(body_timeout, to_bytes(body, max_body_bytes)).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error":"request body exceeds the local safety limit"}),
+            );
+        }
+        Err(_) => {
+            return json_response(
+                StatusCode::REQUEST_TIMEOUT,
+                json!({"error":"request body exceeded the local safety timeout"}),
+            );
+        }
+    };
     if let Some(response) = control_response(&state, &method, &path, &body, &base_url).await {
         return response;
     }
@@ -152,6 +174,24 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
         &base_url,
     )
     .await
+}
+
+fn request_body_limits(state: &LabState, method: &Method, path: &str) -> (usize, Duration) {
+    if method == Method::POST
+        && let Some((run_id, Some("submission"))) = run_route(path)
+        && let Ok(loaded) = state.loaded_for_run(run_id)
+    {
+        let limits = loaded.scenario.submission;
+        return (
+            limits.max_bytes,
+            Duration::from_millis(limits.max_submission_time_ms),
+        );
+    }
+    let limits = SubmissionLimits::default();
+    (
+        16 * 1024 * 1024,
+        Duration::from_millis(limits.max_submission_time_ms),
+    )
 }
 
 async fn control_response(
@@ -179,7 +219,13 @@ async fn control_response(
                         "run_id": run.run_id,
                         "scenario_id": run.scenario_id,
                         "seed": run.seed,
-                        "base_url": base_url,
+                        "target_domain": state.loaded_for_run(&run.run_id).ok().map(|loaded| loaded.scenario.root_domain),
+                        "base_url": state.base_url().unwrap_or_else(|| base_url.to_owned()),
+                        "manifest_url": format!("/api/runs/{}/manifest", run.run_id),
+                        "submission_url": format!("/api/runs/{}/submission", run.run_id),
+                        "report_url": format!("/api/runs/{}/report", run.run_id),
+                        "required_source_header": "x-lab-run-id",
+                        "status": run.status,
                         "required_request_header": {"x-lab-run-id": run.run_id},
                     }),
                 ),
@@ -196,7 +242,9 @@ async fn control_response(
         ));
     }
     if let Some((run_id, action)) = run_route(path) {
-        return Some(run_control_response(state, method, run_id, action, body));
+        return Some(run_control_response(
+            state, method, run_id, action, body, base_url,
+        ));
     }
     let value = match (method, path) {
         (&Method::GET, "/health") => {
@@ -290,6 +338,7 @@ fn run_control_response(
     run_id: &str,
     action: Option<&str>,
     body: &[u8],
+    base_url: &str,
 ) -> Response {
     let run = match state.session(run_id) {
         Ok(run) => run,
@@ -303,13 +352,17 @@ fn run_control_response(
             }
             Err(error) => run_error_response(error),
         },
-        (&Method::GET, Some("truth")) => match state.loaded_for_run(run_id) {
-            Ok(loaded) => json_response(
+        (&Method::GET, Some("manifest")) => match manifest_for_run(state, run_id, base_url) {
+            Ok(manifest) => json_response(
                 StatusCode::OK,
-                json!({"run_id":run_id,"scenario_id":loaded.scenario.id,"truth":loaded.truth}),
+                serde_json::to_value(manifest).expect("manifest is serializable"),
             ),
             Err(error) => run_error_response(error),
         },
+        (&Method::GET, Some("truth")) => json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error":"truth is not available through the external run API"}),
+        ),
         (&Method::GET, Some("report")) => match state.latest_report(run_id) {
             Ok(report) => json_response(StatusCode::OK, json!({"run_id":run_id,"report":report})),
             Err(error) => run_error_response(error),
@@ -318,27 +371,13 @@ fn run_control_response(
             Ok(()) => json_response(StatusCode::OK, json!({"run_id":run_id,"reset":true})),
             Err(error) => run_error_response(error),
         },
-        (&Method::POST, Some("report")) => {
-            let report = match serde_json::from_slice::<RunReport>(body) {
-                Ok(report) => report,
-                Err(_) => {
-                    return json_response(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error":"invalid run report JSON"}),
-                    );
-                }
-            };
-            if report.run_id != run_id || report.scenario_id != run.scenario_id {
-                return json_response(
-                    StatusCode::BAD_REQUEST,
-                    json!({"error":"report run_id or scenario_id does not match session"}),
-                );
-            }
-            match state.set_report(run_id, report) {
-                Ok(()) => json_response(StatusCode::OK, json!({"run_id":run_id,"stored":true})),
-                Err(error) => run_error_response(error),
-            }
+        (&Method::POST, Some("submission")) => {
+            submit_collector_result(state, run_id, &run, body, base_url)
         }
+        (&Method::POST, Some("report")) => json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"error":"external clients cannot write RunReport; use submission"}),
+        ),
         (&Method::DELETE, None) => match state.delete(run_id) {
             Ok(()) => Response::builder()
                 .status(StatusCode::NO_CONTENT)
@@ -365,6 +404,398 @@ fn run_summary(run: &RunSession) -> Value {
     })
 }
 
+fn manifest_for_run(
+    state: &LabState,
+    run_id: &str,
+    _request_base_url: &str,
+) -> Result<RunManifest, RunStateError> {
+    let run = state.session(run_id)?;
+    let loaded = state.loaded_for_run(run_id)?;
+    let base_url = state
+        .base_url()
+        .unwrap_or_else(|| "http://127.0.0.1".to_owned());
+    let sources = loaded
+        .scenario
+        .endpoints
+        .iter()
+        .map(|endpoint| ManifestSource {
+            source_id: endpoint.id.clone(),
+            source_kind: endpoint.source_kind,
+            source_label: endpoint
+                .source_label
+                .clone()
+                .unwrap_or_else(|| endpoint.id.clone()),
+            base_url: base_url.clone(),
+            method: endpoint.request_match.method,
+            path_template: endpoint.request_match.path.clone(),
+            required_query: endpoint
+                .request_match
+                .query
+                .iter()
+                .filter(|(_, rule)| rule.requires_value() && !rule.optional)
+                .map(|(name, rule)| {
+                    (
+                        name.clone(),
+                        rule.equals
+                            .as_deref()
+                            .map(|value| manifest_value(value, &loaded.scenario))
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            required_headers: endpoint
+                .request_match
+                .headers
+                .iter()
+                .filter(|(_, rule)| rule.requires_value() && !rule.optional)
+                .map(|(name, _)| name.clone())
+                .collect(),
+            authentication_field_names: endpoint
+                .request_match
+                .headers
+                .keys()
+                .filter(|name| is_sensitive(name))
+                .cloned()
+                .collect(),
+            pagination_mode: endpoint.pagination.mode,
+            run_header_name: "x-lab-run-id".to_owned(),
+            allow_retry: endpoint.allow_retry,
+            allow_redirect: false,
+            local_test_only: true,
+        })
+        .collect();
+    Ok(RunManifest {
+        schema_version: "1.2.1".to_owned(),
+        run_id: run.run_id,
+        scenario_id: run.scenario_id,
+        seed: run.seed,
+        target_domain: loaded.scenario.root_domain,
+        network: ManifestNetwork {
+            allowed_hosts: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
+            external_network_allowed: false,
+            required_header: "x-lab-run-id".to_owned(),
+        },
+        sources,
+        submission: ManifestSubmission {
+            url: format!("/api/runs/{run_id}/submission"),
+            max_bytes: loaded.scenario.submission.max_bytes,
+            max_submission_time_ms: loaded.scenario.submission.max_submission_time_ms,
+            finalizes_run: true,
+        },
+    })
+}
+
+fn manifest_value(value: &str, scenario: &Scenario) -> String {
+    match value {
+        "$ROOT_DOMAIN" | "$TARGET_DOMAIN" => scenario.root_domain.clone(),
+        "$SEED" => scenario.seed.to_string(),
+        "$OBSERVATION_TIME" => format!("2025-01-{:02}T00:00:00Z", scenario.seed % 28 + 1),
+        _ => value.to_owned(),
+    }
+}
+
+fn submit_collector_result(
+    state: &LabState,
+    run_id: &str,
+    run: &RunSession,
+    body: &[u8],
+    _request_base_url: &str,
+) -> Response {
+    let loaded = match state.loaded_for_run(run_id) {
+        Ok(loaded) => loaded,
+        Err(error) => return run_error_response(error),
+    };
+    if body.len() > loaded.scenario.submission.max_bytes {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"error":"submission exceeds scenario max_bytes"}),
+        );
+    }
+    let raw: Value = match serde_json::from_slice(body) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"submission must be valid JSON"}),
+            );
+        }
+    };
+    if let Some(field) = sensitive_field(&raw, "$") {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"submission contains a forbidden sensitive field","field":field}),
+        );
+    }
+    if json_depth(&raw) > loaded.scenario.submission.max_depth {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"submission exceeds max nesting depth"}),
+        );
+    }
+    let submission: CollectorSubmission = match serde_json::from_value(raw) {
+        Ok(submission) => submission,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"submission schema is invalid or includes rejected fields"}),
+            );
+        }
+    };
+    let canonical_base_url = state
+        .base_url()
+        .unwrap_or_else(|| "http://127.0.0.1".to_owned());
+    let collector = match validate_submission(&submission, &loaded, &canonical_base_url) {
+        Ok(collector) => collector,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error":error})),
+    };
+    if let Err(error) = state.freeze_submission(run_id, submission.clone()) {
+        return run_error_response(error);
+    }
+    let audit = match state.audit(run_id) {
+        Ok(audit) => audit,
+        Err(error) => return run_error_response(error),
+    };
+    let rejected_egress = audit
+        .iter()
+        .filter(|record| record.external_target_rejected)
+        .map(|record| record.path.clone())
+        .collect::<Vec<_>>();
+    let mut report = judge_run(lab_core::JudgeInput {
+        run_id: Uuid::parse_str(run_id).expect("run id has already been validated"),
+        scenario_id: &loaded.scenario.id,
+        seed: run.seed,
+        target_domain: &loaded.scenario.root_domain,
+        started_at: run.created_at,
+        finished_at: Utc::now(),
+        collector_run: &collector,
+        truth: &loaded.truth,
+        assertions: &loaded.assertions,
+        audit: &audit,
+        rejected_egress_urls: &rejected_egress,
+    });
+    // Client payloads never supply metrics, retry counts, virtual waits or
+    // request totals.  These report values are derived exclusively from the
+    // immutable server audit captured before the submission was frozen.
+    report.metrics.request_count = audit.len();
+    report.metrics.retry_count = audit
+        .iter()
+        .filter(|record| record.response_status == StatusCode::TOO_MANY_REQUESTS.as_u16())
+        .count();
+    report.virtual_waited_ms = audit.iter().map(|record| record.virtual_wait_ms).sum();
+    report.metrics.virtual_wait_ms = report.virtual_waited_ms;
+    let consistent = source_statuses_match_audit(&submission.source_statuses, &audit);
+    report.assertions.submission_consistency = consistent;
+    if !consistent {
+        report
+            .failures
+            .push("submitted source_statuses do not match the immutable server audit".to_owned());
+        report.status = lab_core::ReportStatus::Failed;
+        report.result = lab_core::ReportStatus::Failed;
+    }
+    report.submission = SubmissionReport {
+        received: true,
+        collector_name: Some(submission.collector.name),
+        collector_version: Some(submission.collector.version),
+        finding_count: submission.findings.len(),
+        accepted: true,
+        rejected_fields: Vec::new(),
+    };
+    refresh_semantic_fingerprint(&mut report);
+    if let Err(error) = state.set_report(run_id, report.clone()) {
+        return run_error_response(error);
+    }
+    json_response(
+        StatusCode::CREATED,
+        json!({
+            "run_id":run_id,
+            "accepted":true,
+            "status":report.status,
+            "report_url":format!("/api/runs/{run_id}/report"),
+        }),
+    )
+}
+
+fn validate_submission(
+    submission: &CollectorSubmission,
+    loaded: &LoadedScenario,
+    base_url: &str,
+) -> Result<CollectorRun, String> {
+    let limits = &loaded.scenario.submission;
+    if submission.schema_version != "1.2.1" {
+        return Err("submission schema_version must be 1.2.1".to_owned());
+    }
+    if submission.collector.name.is_empty()
+        || submission.collector.version.is_empty()
+        || submission.collector.name.len() > limits.max_string_bytes
+        || submission.collector.version.len() > limits.max_string_bytes
+    {
+        return Err("collector name and version must be bounded non-empty strings".to_owned());
+    }
+    if submission.target_domain != loaded.scenario.root_domain {
+        return Err("submission target_domain does not match the run manifest".to_owned());
+    }
+    if submission.findings.len() > limits.max_findings {
+        return Err("submission exceeds max_findings".to_owned());
+    }
+    if submission.source_statuses.keys().any(|source| {
+        !loaded
+            .scenario
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.id == *source)
+    }) {
+        return Err("source_statuses reference a source_id absent from the manifest".to_owned());
+    }
+    let mut collector = CollectorRun {
+        source_statuses: submission.source_statuses.clone(),
+        ..Default::default()
+    };
+    for finding in &submission.findings {
+        if finding.fqdn.len() > limits.max_string_bytes {
+            return Err("finding fqdn exceeds max string length".to_owned());
+        }
+        if finding.evidence.is_empty() && !limits.allow_evidence_free_findings {
+            return Err("findings require at least one evidence entry".to_owned());
+        }
+        if finding.evidence.len() > limits.max_evidence_per_finding {
+            return Err("finding exceeds max_evidence_per_finding".to_owned());
+        }
+        let fqdn = accept_candidate(
+            &finding.fqdn,
+            &loaded.scenario.root_domain,
+            loaded.scenario.include_root,
+        )
+        .map_err(|_| "finding fqdn is invalid or outside target_domain".to_owned())?;
+        for evidence in &finding.evidence {
+            if evidence.source_id.len() > limits.max_string_bytes
+                || evidence
+                    .record_id
+                    .as_ref()
+                    .is_some_and(|value| value.len() > limits.max_string_bytes)
+                || evidence
+                    .url
+                    .as_ref()
+                    .is_some_and(|value| value.len() > limits.max_string_bytes)
+                || evidence.tags.len() > limits.max_tags
+                || evidence
+                    .tags
+                    .iter()
+                    .any(|tag| tag.len() > limits.max_string_bytes)
+            {
+                return Err("evidence exceeds a configured size limit".to_owned());
+            }
+            let endpoint = loaded
+                .scenario
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == evidence.source_id)
+                .ok_or_else(|| "evidence source_id is absent from the manifest".to_owned())?;
+            if endpoint.source_kind != evidence.source_kind {
+                return Err("evidence source_kind does not match manifest source".to_owned());
+            }
+            if let Some(url) = &evidence.url
+                && !is_local_source_url(url, base_url)
+            {
+                return Err("evidence url must point to a local FQDN Forge source".to_owned());
+            }
+            let mut observation_evidence = BTreeMap::new();
+            if let Some(url) = &evidence.url {
+                observation_evidence.insert("url".to_owned(), url.clone());
+            }
+            collector.observations.push(lab_core::Observation {
+                fqdn: fqdn.clone(),
+                source_kind: evidence.source_kind,
+                source_name: endpoint
+                    .source_label
+                    .clone()
+                    .unwrap_or_else(|| endpoint.id.clone()),
+                record_id: evidence.record_id.clone(),
+                observed_at: evidence.observed_at,
+                tags: evidence.tags.clone(),
+                confidence: evidence.confidence,
+                evidence: observation_evidence,
+            });
+        }
+    }
+    collector.metrics.request_count = collector.source_statuses.len();
+    Ok(collector)
+}
+
+fn is_local_source_url(value: &str, base_url: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    let Ok(local) = Url::parse(base_url) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port_or_known_default() == local.port_or_known_default()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !url
+            .query_pairs()
+            .any(|(name, _)| is_sensitive(name.as_ref()))
+}
+
+fn source_statuses_match_audit(
+    statuses: &BTreeMap<String, SourceStatus>,
+    audit: &[AuditRecord],
+) -> bool {
+    statuses.iter().all(|(source, status)| {
+        let records = audit
+            .iter()
+            .filter(|record| record.endpoint_id.as_deref() == Some(source.as_str()))
+            .collect::<Vec<_>>();
+        match status {
+            SourceStatus::Success | SourceStatus::Succeeded | SourceStatus::Completed => {
+                records.iter().any(|record| {
+                    record.matched
+                        && record.consumed
+                        && (200..300).contains(&record.response_status)
+                })
+            }
+            SourceStatus::AuthFailed | SourceStatus::Unauthorized => records
+                .iter()
+                .any(|record| matches!(record.response_status, 401 | 403)),
+            SourceStatus::RateLimited => records.iter().any(|record| record.response_status == 429),
+            SourceStatus::Blocked => records.iter().any(|record| record.external_target_rejected),
+            SourceStatus::Pending
+            | SourceStatus::Running
+            | SourceStatus::Partial
+            | SourceStatus::Failed
+            | SourceStatus::TimedOut
+            | SourceStatus::Cancelled => true,
+        }
+    })
+}
+
+fn sensitive_field(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::Object(values) => values.iter().find_map(|(name, value)| {
+            let next = format!("{path}.{name}");
+            if is_sensitive(name) {
+                Some(next)
+            } else {
+                sensitive_field(value, &next)
+            }
+        }),
+        Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .find_map(|(index, value)| sensitive_field(value, &format!("{path}[{index}]"))),
+        _ => None,
+    }
+}
+
+fn json_depth(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
+        Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
+        _ => 1,
+    }
+}
+
 fn legacy_run(state: &LabState) -> Option<RunSession> {
     state.developer_run()
 }
@@ -380,6 +811,10 @@ fn run_error_response(error: RunStateError) -> Response {
     let status = match error {
         RunStateError::InvalidRunId => StatusCode::BAD_REQUEST,
         RunStateError::UnknownRun => StatusCode::NOT_FOUND,
+        RunStateError::AlreadySubmitted
+        | RunStateError::CrossRunSubmission
+        | RunStateError::RunNotAcceptingSubmission
+        | RunStateError::RunNotAcceptingSourceRequests => StatusCode::CONFLICT,
     };
     json_response(status, json!({"error":error.message()}))
 }
@@ -406,6 +841,19 @@ async fn scenario_response(
             );
         }
     };
+    let run = match state.session(run_id) {
+        Ok(run) => run,
+        Err(error) => {
+            state.record_unscoped_request(method.as_ref(), &path, error.message());
+            return run_error_response(error);
+        }
+    };
+    if !matches!(
+        run.status,
+        lab_core::RunSessionStatus::Active | lab_core::RunSessionStatus::Reset
+    ) {
+        return run_error_response(RunStateError::RunNotAcceptingSourceRequests);
+    }
     let loaded = match state.loaded_for_run(run_id) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -413,6 +861,10 @@ async fn scenario_response(
             let status = match error {
                 RunStateError::InvalidRunId => StatusCode::BAD_REQUEST,
                 RunStateError::UnknownRun => StatusCode::CONFLICT,
+                RunStateError::AlreadySubmitted
+                | RunStateError::CrossRunSubmission
+                | RunStateError::RunNotAcceptingSubmission
+                | RunStateError::RunNotAcceptingSourceRequests => StatusCode::CONFLICT,
             };
             return json_response(status, json!({"error":error.message()}));
         }
@@ -538,10 +990,36 @@ async fn scenario_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("default");
     if status == StatusCode::NO_CONTENT || reply.close_before_body {
-        return reply_response(status, reply, Vec::new()).await;
+        return reply_response(
+            &state,
+            run_id,
+            ReplyResponseInput {
+                endpoint_id: &endpoint.id,
+                response_index: index,
+                status,
+                reply,
+                runner: &loaded.scenario.runner,
+                bytes: Vec::new(),
+            },
+        )
+        .await;
     }
     match response_body(reply, endpoint, &loaded, profile, run_id, &template_context) {
-        Ok(bytes) => reply_response(status, reply, bytes).await,
+        Ok(bytes) => {
+            reply_response(
+                &state,
+                run_id,
+                ReplyResponseInput {
+                    endpoint_id: &endpoint.id,
+                    response_index: index,
+                    status,
+                    reply,
+                    runner: &loaded.scenario.runner,
+                    bytes,
+                },
+            )
+            .await
+        }
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error":format!("fixture error: {error}")}),
@@ -853,21 +1331,95 @@ fn with_oversize(reply: &Reply, mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-async fn reply_response(status: StatusCode, reply: &Reply, bytes: Vec<u8>) -> Response {
-    if reply.first_byte_delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(reply.first_byte_delay_ms)).await;
+struct ReplyResponseInput<'a> {
+    endpoint_id: &'a str,
+    response_index: usize,
+    status: StatusCode,
+    reply: &'a Reply,
+    runner: &'a lab_core::RunnerConfig,
+    bytes: Vec<u8>,
+}
+
+async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInput<'_>) -> Response {
+    let ReplyResponseInput {
+        endpoint_id,
+        response_index,
+        status,
+        reply,
+        runner,
+        bytes,
+    } = input;
+    let decoded = if reply.malformed_body {
+        b"{malformed-response".to_vec()
+    } else {
+        bytes
+    };
+    let decoded_bytes = decoded.len();
+    let mut encoded = if reply
+        .encoding
+        .as_deref()
+        .is_some_and(|encoding| encoding.eq_ignore_ascii_case("gzip"))
+    {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        if encoder.write_all(&decoded).is_err() {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"could not gzip local fixture"}),
+            );
+        }
+        match encoder.finish() {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error":"could not finish gzip local fixture"}),
+                );
+            }
+        }
+    } else {
+        decoded.clone()
+    };
+    if reply.gzip_corrupt && !encoded.is_empty() {
+        let index = encoded.len() - 1;
+        encoded[index] ^= 0xff;
+    }
+    if reply.gzip_truncated && !encoded.is_empty() {
+        encoded.truncate(encoded.len().saturating_sub(8));
     }
     let sent = if reply.disconnect
         || reply.connection_reset
         || reply.close_before_body
         || reply.truncated_body
     {
-        bytes[..bytes.len() / 2].to_vec()
-    } else if reply.malformed_body {
-        b"{malformed-response".to_vec()
+        encoded[..encoded.len() / 2].to_vec()
     } else {
-        bytes.clone()
+        encoded
     };
+    let content_encoding = reply.encoding.as_ref().and_then(|encoding| {
+        encoding
+            .eq_ignore_ascii_case("gzip")
+            .then(|| "gzip".to_owned())
+    });
+    let compression_limit_violation = compression_limit_violation(
+        runner,
+        content_encoding.as_deref(),
+        sent.len(),
+        decoded_bytes,
+    );
+    let _ = state.set_response_metrics(
+        run_id,
+        ResponseMetrics {
+            endpoint_id: endpoint_id.to_owned(),
+            response_index,
+            wire_bytes: sent.len(),
+            decoded_bytes,
+            content_encoding: content_encoding.clone(),
+            compression_limit_violation,
+        },
+    );
+    if reply.first_byte_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(reply.first_byte_delay_ms)).await;
+    }
     let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, reply.content_type())
@@ -875,8 +1427,7 @@ async fn reply_response(status: StatusCode, reply: &Reply, bytes: Vec<u8>) -> Re
     let transport_fault = reply.disconnect
         || reply.connection_reset
         || reply.close_before_body
-        || reply.truncated_body
-        || reply.malformed_content_length.is_some();
+        || reply.truncated_body;
     if let Some(location) = &reply.redirect {
         builder = builder.header(header::LOCATION, location);
     }
@@ -886,21 +1437,36 @@ async fn reply_response(status: StatusCode, reply: &Reply, bytes: Vec<u8>) -> Re
     if let Some(retry_after) = &reply.retry_after {
         builder = builder.header("retry-after", retry_after);
     }
-    if let Some(encoding) = &reply.encoding {
+    if let Some(encoding) = content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, encoding);
     }
     for (name, value) in &reply.headers {
         builder = builder.header(name, value);
     }
-    let body = if transport_fault {
+    if !transport_fault {
+        builder = builder.header(
+            header::CONTENT_LENGTH,
+            reply
+                .malformed_content_length
+                .unwrap_or(sent.len())
+                .to_string(),
+        );
+    }
+    let body = if transport_fault || reply.malformed_content_length.is_some() {
         let error = io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "synthetic transport fault",
         );
-        Body::from_stream(stream::iter(vec![
-            Ok::<Bytes, io::Error>(Bytes::from(sent)),
-            Err(error),
-        ]))
+        if transport_fault {
+            Body::from_stream(stream::iter(vec![
+                Ok::<Bytes, io::Error>(Bytes::from(sent)),
+                Err(error),
+            ]))
+        } else {
+            Body::from_stream(stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(
+                sent,
+            ))]))
+        }
     } else {
         Body::from(sent)
     };
@@ -910,6 +1476,27 @@ async fn reply_response(status: StatusCode, reply: &Reply, bytes: Vec<u8>) -> Re
             json!({"error":"invalid response headers"}),
         )
     })
+}
+
+fn compression_limit_violation(
+    runner: &lab_core::RunnerConfig,
+    encoding: Option<&str>,
+    wire_bytes: usize,
+    decoded_bytes: usize,
+) -> Option<String> {
+    if !encoding.is_some_and(|value| value.eq_ignore_ascii_case("gzip")) {
+        return None;
+    }
+    if wire_bytes > runner.effective_max_wire_response_bytes() {
+        return Some("max_wire_response_bytes exceeded".to_owned());
+    }
+    if decoded_bytes > runner.effective_max_decoded_response_bytes() {
+        return Some("max_decoded_response_bytes exceeded".to_owned());
+    }
+    if wire_bytes == 0 || decoded_bytes > wire_bytes.saturating_mul(runner.max_expansion_ratio) {
+        return Some("max_expansion_ratio exceeded".to_owned());
+    }
+    None
 }
 
 fn response_location(reply: &Reply) -> Option<&str> {
@@ -1149,6 +1736,7 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
         response_index,
         response_sequence: response_index,
         response_status,
+        before_submission: false,
         redacted_headers,
         virtual_wait_ms: 0,
         retry_after: None,
@@ -1158,6 +1746,10 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
         matched,
         extra,
         mismatch_reasons,
+        wire_bytes: 0,
+        decoded_bytes: 0,
+        content_encoding: None,
+        compression_limit_violation: None,
     }
 }
 
@@ -1170,6 +1762,8 @@ fn is_sensitive(name: &str) -> bool {
         "secret",
         "password",
         "api-key",
+        "api_key",
+        "apikey",
     ]
     .iter()
     .any(|needle| name.contains(needle))
@@ -1386,6 +1980,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
     }
 
     async fn run_report(
+        server: &LocalServer,
         client: &Client,
         base_url: &str,
         loaded: &LoadedScenario,
@@ -1412,14 +2007,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             audit: &audit,
             rejected_egress_urls: &guard.rejected_urls(),
         });
-        client
-            .post(format!("{base_url}/api/runs/{run_id}/report"))
-            .json(&report)
-            .send()
-            .await
-            .expect("store report request")
-            .error_for_status()
-            .expect("store report status");
+        server.set_report(report.clone());
         report
     }
 
@@ -1593,8 +2181,8 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             create_run(&client, &base_url, &loaded.scenario.id)
         );
         let (first_report, second_report) = tokio::join!(
-            run_report(&client, &base_url, &loaded, first),
-            run_report(&client, &base_url, &loaded, second)
+            run_report(&server, &client, &base_url, &loaded, first),
+            run_report(&server, &client, &base_url, &loaded, second)
         );
         assert_eq!(first_report.status, ReportStatus::Passed);
         assert_eq!(second_report.status, ReportStatus::Passed);
@@ -1642,7 +2230,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("reset");
         assert_eq!(reset.status(), StatusCode::OK);
-        let second_report = run_report(&client, &base_url, &loaded, second).await;
+        let second_report = run_report(&server, &client, &base_url, &loaded, second).await;
         assert_eq!(second_report.status, ReportStatus::Passed);
         assert!(requests(&client, &base_url, first).await.is_empty());
         assert_eq!(
@@ -1671,8 +2259,8 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             create_run(&client, &base_url, &rate_limit.scenario.id)
         );
         let (pages_report, rate_report) = tokio::join!(
-            run_report(&client, &base_url, &pages, pages_id),
-            run_report(&client, &base_url, &rate_limit, rate_id)
+            run_report(&server, &client, &base_url, &pages, pages_id),
+            run_report(&server, &client, &base_url, &rate_limit, rate_id)
         );
         assert_eq!(pages_report.status, ReportStatus::Passed);
         assert_eq!(rate_report.status, ReportStatus::Passed);
@@ -1716,7 +2304,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("diagnostics body");
         assert!(diagnostics.contains("missing x-lab-run-id"));
-        let report = run_report(&client, &base_url, &loaded, run_id).await;
+        let report = run_report(&server, &client, &base_url, &loaded, run_id).await;
         assert_eq!(report.status, ReportStatus::Passed);
         assert_eq!(
             response_indices(&requests(&client, &base_url, run_id).await),
@@ -1802,7 +2390,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
                 .contains("wrong-key")
         );
         let good_rate_id = create_run(&client, &base_url, &rate_limit.scenario.id).await;
-        let rate_report = run_report(&client, &base_url, &rate_limit, good_rate_id).await;
+        let rate_report = run_report(&server, &client, &base_url, &rate_limit, good_rate_id).await;
         assert_eq!(rate_report.status, ReportStatus::Passed);
         assert!(
             !serde_json::to_string(&requests(&client, &base_url, good_rate_id).await)

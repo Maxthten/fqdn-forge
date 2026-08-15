@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-70.acme.test]
+expected_observations: { api.target-70.acme.test: { source_names: [search-source], source_kinds: [internet_search], record_ids: [synthetic-70-1], requires_time: true, tags: [synthetic], minimum_confidence: 80 } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { search-source: success }

@@ -1,0 +1,16 @@
+id: 068-external-submission-missing
+name: External submission missing-result baseline
+description: Baseline data for a negative client that omits a required finding before submission.
+version: "1.2.1"
+root_domain: target-$SEED.acme.test
+seed: 68
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+endpoints:
+  - id: search-source
+    source_kind: internet_search
+    source_label: search-source
+    match: { method: GET, path: /v121/search, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id, timestamp_field: observed_at, tags_field: tags, confidence_field: confidence }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

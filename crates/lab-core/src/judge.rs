@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AssertionResults, Assertions, AuditRecord, CollectorRun, FilterExpectation, ReportStatus,
-    RequestSummary, RunReport, RunStatus, Truth,
+    AssertionResults, Assertions, AuditRecord, CollectorRun, CompressionReport, FilterExpectation,
+    ReportStatus, RequestSummary, RunReport, RunStatus, SubmissionEvidence, SubmissionFinding,
+    Truth,
 };
 
 pub struct JudgeInput<'a> {
@@ -64,8 +67,10 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
     let evidence_pass = evidence_matches(collector_run, truth);
     let filter_pass = filters_match(collector_run, &truth.expected_filter_reasons);
     let actual_run_status = derive_run_status(&collector_run.source_statuses);
-    let source_pass = collector_run.source_statuses == truth.expected_source_status
-        && actual_run_status == truth.expected_run_status;
+    let source_pass = source_statuses_match(
+        &collector_run.source_statuses,
+        &truth.expected_source_status,
+    ) && actual_run_status == truth.expected_run_status;
     let request_contract =
         request_contract_matches(audit, assertions, collector_run.virtual_waited_ms);
     let egress_guard = rejected_egress_urls.len() == assertions.expected_rejected_egress_attempts;
@@ -77,6 +82,7 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         source_status: source_pass,
         request_contract,
         egress_guard,
+        submission_consistency: true,
     };
     let mut failures = Vec::new();
     if !expected_fqdns_pass {
@@ -117,9 +123,9 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
     } else {
         ReportStatus::Failed
     };
-    RunReport {
-        schema_version: "1.2".to_owned(),
-        lab_version: "1.2".to_owned(),
+    let mut report = RunReport {
+        schema_version: "1.2.1".to_owned(),
+        lab_version: "1.2.1".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_string(),
         scenario_id: scenario_id.to_owned(),
@@ -132,6 +138,8 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         actual_run_status,
         expected_run_status: truth.expected_run_status,
         source_statuses: collector_run.source_statuses.clone(),
+        findings: findings_from_collector(collector_run),
+        filtered: collector_run.filtered.clone(),
         assertions: results,
         truth: truth.clone(),
         requests: audit.to_vec(),
@@ -141,10 +149,170 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         failures,
         violations: Vec::new(),
         replay_command: format!(
-            "cargo run -p lab-cli -- replay --report artifacts/reports/{scenario_id}-default.json"
+            "cargo run -p lab-cli -- replay --strict --report artifacts/reports/{scenario_id}-default.json"
         ),
         reproducible: true,
+        submission: Default::default(),
+        semantic_fingerprint: String::new(),
+        replay: Default::default(),
+        compression: compression_from_audit(audit),
         audit: audit.to_vec(),
+    };
+    refresh_semantic_fingerprint(&mut report);
+    report
+}
+
+#[must_use]
+pub fn findings_from_collector(run: &CollectorRun) -> Vec<SubmissionFinding> {
+    run.observations
+        .iter()
+        .map(|observation| SubmissionFinding {
+            fqdn: observation.fqdn.clone(),
+            evidence: vec![SubmissionEvidence {
+                source_id: observation.source_name.clone(),
+                source_kind: observation.source_kind,
+                record_id: observation.record_id.clone(),
+                url: observation.evidence.get("url").cloned(),
+                observed_at: observation.observed_at,
+                tags: observation.tags.clone(),
+                confidence: observation.confidence,
+            }],
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn compression_from_audit(audit: &[AuditRecord]) -> CompressionReport {
+    CompressionReport {
+        wire_bytes: audit.iter().map(|record| record.wire_bytes).sum(),
+        decoded_bytes: audit.iter().map(|record| record.decoded_bytes).sum(),
+        encoding: audit
+            .iter()
+            .filter_map(|record| record.content_encoding.clone())
+            .find(|encoding| !encoding.eq_ignore_ascii_case("identity")),
+        limit_violation: audit
+            .iter()
+            .find_map(|record| record.compression_limit_violation.clone()),
+    }
+}
+
+pub fn refresh_semantic_fingerprint(report: &mut RunReport) {
+    report.semantic_fingerprint = semantic_fingerprint(report);
+}
+
+#[must_use]
+pub fn semantic_fingerprint(report: &RunReport) -> String {
+    let canonical = semantic_projection(report);
+    let encoded = serde_json::to_vec(&canonical).expect("semantic projection is serializable");
+    let digest = Sha256::digest(encoded);
+    format!("sha256-{digest:x}")
+}
+
+#[must_use]
+pub fn semantic_difference(previous: &RunReport, current: &RunReport) -> Option<String> {
+    first_difference(
+        "$",
+        &semantic_projection(previous),
+        &semantic_projection(current),
+    )
+}
+
+fn semantic_projection(report: &RunReport) -> Value {
+    let mut findings = report.findings.clone();
+    findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
+    for finding in &mut findings {
+        finding.evidence.sort_by(|left, right| {
+            (
+                &left.source_id,
+                &left.record_id,
+                &left.url,
+                &left.observed_at,
+            )
+                .cmp(&(
+                    &right.source_id,
+                    &right.record_id,
+                    &right.url,
+                    &right.observed_at,
+                ))
+        });
+    }
+    let requests = report
+        .requests
+        .iter()
+        .map(|record| {
+            json!({
+                "sequence": record.sequence,
+                "method": record.method,
+                "path": record.path,
+                "query": record.query,
+                "headers": record.headers,
+                "body": record.body_summary,
+                "endpoint_id": record.endpoint_id,
+                "response_index": record.response_index,
+                "response_status": record.response_status,
+                "before_submission": record.before_submission,
+                "consumed": record.consumed,
+                "matched": record.matched,
+                "blocked_egress": record.external_target_rejected,
+                "virtual_wait_ms": record.virtual_wait_ms,
+                "wire_bytes": record.wire_bytes,
+                "decoded_bytes": record.decoded_bytes,
+                "content_encoding": record.content_encoding,
+                "compression_limit_violation": record.compression_limit_violation,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": report.schema_version,
+        "scenario_id": report.scenario_id,
+        "seed": report.seed,
+        "target_domain": report.target_domain,
+        "status": report.status,
+        "findings": findings,
+        "filtered": report.filtered,
+        "source_statuses": report.source_statuses,
+        "requests": requests,
+        "request_count": report.metrics.request_count,
+        "retry_count": report.metrics.retry_count,
+        "virtual_wait_ms": report.virtual_waited_ms,
+        "cancelled": report.metrics.cancelled,
+        "submission": {
+            "received": report.submission.received,
+            "accepted": report.submission.accepted,
+            "finding_count": report.submission.finding_count,
+        },
+    })
+}
+
+fn first_difference(path: &str, left: &Value, right: &Value) -> Option<String> {
+    match (left, right) {
+        (Value::Object(left), Value::Object(right)) => {
+            let keys = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
+            keys.into_iter().find_map(|key| {
+                let next = format!("{path}.{key}");
+                match (left.get(key), right.get(key)) {
+                    (Some(left), Some(right)) => first_difference(&next, left, right),
+                    _ => Some(format!("{next}: field presence differs")),
+                }
+            })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            if left.len() != right.len() {
+                return Some(format!(
+                    "{path}: array length {} != {}",
+                    left.len(),
+                    right.len()
+                ));
+            }
+            left.iter()
+                .zip(right)
+                .enumerate()
+                .find_map(|(index, (left, right))| {
+                    first_difference(&format!("{path}[{index}]"), left, right)
+                })
+        }
+        _ if left != right => Some(format!("{path}: {left} != {right}")),
+        _ => None,
     }
 }
 
@@ -273,4 +441,27 @@ fn derive_run_status(
     } else {
         RunStatus::Failure
     }
+}
+
+fn source_statuses_match(
+    actual: &std::collections::BTreeMap<String, crate::SourceStatus>,
+    expected: &std::collections::BTreeMap<String, crate::SourceStatus>,
+) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().all(|(source, actual)| {
+            expected
+                .get(source)
+                .is_some_and(|expected| source_status_equivalent(*actual, *expected))
+        })
+}
+
+fn source_status_equivalent(actual: crate::SourceStatus, expected: crate::SourceStatus) -> bool {
+    use crate::SourceStatus::{Completed, Succeeded, Success};
+    matches!(
+        (actual, expected),
+        (
+            Success | Succeeded | Completed,
+            Success | Succeeded | Completed
+        )
+    ) || actual == expected
 }

@@ -21,6 +21,10 @@ pub struct Scenario {
     pub allow_concurrent: bool,
     #[serde(default)]
     pub runner: RunnerConfig,
+    /// Limits for the public collector-submission contract.  They are part of
+    /// the local scenario, never part of a collector supplied payload.
+    #[serde(default)]
+    pub submission: SubmissionLimits,
     pub endpoints: Vec<Endpoint>,
 }
 
@@ -35,6 +39,14 @@ pub struct RunnerConfig {
     pub max_retries: usize,
     #[serde(default = "default_retry_after_cap_ms")]
     pub retry_after_cap_ms: u64,
+    #[serde(default = "default_max_wire_response_bytes")]
+    pub max_wire_response_bytes: usize,
+    #[serde(default = "default_max_decoded_response_bytes")]
+    pub max_decoded_response_bytes: usize,
+    #[serde(default = "default_max_expansion_ratio")]
+    pub max_expansion_ratio: usize,
+    #[serde(default = "default_max_decompression_time_ms")]
+    pub max_decompression_time_ms: u64,
     pub cancel_after_requests: Option<usize>,
 }
 
@@ -45,7 +57,38 @@ impl Default for RunnerConfig {
             max_response_bytes: default_max_response_bytes(),
             max_retries: default_max_retries(),
             retry_after_cap_ms: default_retry_after_cap_ms(),
+            max_wire_response_bytes: default_max_wire_response_bytes(),
+            max_decoded_response_bytes: default_max_decoded_response_bytes(),
+            max_expansion_ratio: default_max_expansion_ratio(),
+            max_decompression_time_ms: default_max_decompression_time_ms(),
             cancel_after_requests: None,
+        }
+    }
+}
+
+impl RunnerConfig {
+    /// Preserve the V1.2.0 `max_response_bytes` contract for scenarios that
+    /// predate the distinct wire/decoded gzip limits. New scenarios can set
+    /// the V1.2.1 fields explicitly for tighter independent bounds.
+    #[must_use]
+    pub const fn effective_max_wire_response_bytes(&self) -> usize {
+        if self.max_wire_response_bytes == default_max_wire_response_bytes()
+            && self.max_response_bytes != default_max_response_bytes()
+        {
+            self.max_response_bytes
+        } else {
+            self.max_wire_response_bytes
+        }
+    }
+
+    #[must_use]
+    pub const fn effective_max_decoded_response_bytes(&self) -> usize {
+        if self.max_decoded_response_bytes == default_max_decoded_response_bytes()
+            && self.max_response_bytes != default_max_response_bytes()
+        {
+            self.max_response_bytes
+        } else {
+            self.max_decoded_response_bytes
         }
     }
 }
@@ -64,6 +107,86 @@ const fn default_max_retries() -> usize {
 
 const fn default_retry_after_cap_ms() -> u64 {
     30_000
+}
+
+const fn default_max_wire_response_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+const fn default_max_decoded_response_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+const fn default_max_expansion_ratio() -> usize {
+    32
+}
+
+const fn default_max_decompression_time_ms() -> u64 {
+    1_000
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionLimits {
+    #[serde(default = "default_submission_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "default_submission_max_findings")]
+    pub max_findings: usize,
+    #[serde(default = "default_submission_max_evidence")]
+    pub max_evidence_per_finding: usize,
+    #[serde(default = "default_submission_max_string")]
+    pub max_string_bytes: usize,
+    #[serde(default = "default_submission_max_tags")]
+    pub max_tags: usize,
+    #[serde(default = "default_submission_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_submission_max_time_ms")]
+    pub max_submission_time_ms: u64,
+    #[serde(default)]
+    pub allow_evidence_free_findings: bool,
+}
+
+impl Default for SubmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_submission_max_bytes(),
+            max_findings: default_submission_max_findings(),
+            max_evidence_per_finding: default_submission_max_evidence(),
+            max_string_bytes: default_submission_max_string(),
+            max_tags: default_submission_max_tags(),
+            max_depth: default_submission_max_depth(),
+            max_submission_time_ms: default_submission_max_time_ms(),
+            allow_evidence_free_findings: false,
+        }
+    }
+}
+
+const fn default_submission_max_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+const fn default_submission_max_findings() -> usize {
+    10_000
+}
+
+const fn default_submission_max_evidence() -> usize {
+    32
+}
+
+const fn default_submission_max_string() -> usize {
+    4_096
+}
+
+const fn default_submission_max_tags() -> usize {
+    32
+}
+
+const fn default_submission_max_depth() -> usize {
+    8
+}
+
+const fn default_submission_max_time_ms() -> u64 {
+    1_000
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -295,6 +418,10 @@ pub struct Reply {
     #[serde(default)]
     pub malformed_body: bool,
     #[serde(default)]
+    pub gzip_corrupt: bool,
+    #[serde(default)]
+    pub gzip_truncated: bool,
+    #[serde(default)]
     pub invalid_content_type: bool,
     pub redirect: Option<String>,
     pub retry_after: Option<String>,
@@ -481,6 +608,12 @@ pub struct RunMetrics {
     pub cancelled: bool,
     pub cancellation_reason: Option<String>,
     pub blocked_egress: bool,
+    #[serde(default)]
+    pub wire_response_bytes: usize,
+    #[serde(default)]
+    pub decoded_response_bytes: usize,
+    #[serde(default)]
+    pub compression_limit_violation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -518,6 +651,121 @@ pub enum SourceStatus {
     Completed,
 }
 
+/// The only payload an external collector is allowed to submit. It contains
+/// discovered data and source evidence, never a report, assertions, audit or
+/// a client-side pass/fail decision.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorSubmission {
+    pub schema_version: String,
+    pub collector: CollectorIdentity,
+    pub target_domain: String,
+    #[serde(default)]
+    pub source_statuses: BTreeMap<String, SourceStatus>,
+    #[serde(default)]
+    pub findings: Vec<SubmissionFinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorIdentity {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionFinding {
+    pub fqdn: String,
+    #[serde(default)]
+    pub evidence: Vec<SubmissionEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionEvidence {
+    pub source_id: String,
+    pub source_kind: SourceKind,
+    pub record_id: Option<String>,
+    pub url: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub confidence: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RunManifest {
+    pub schema_version: String,
+    pub run_id: String,
+    pub scenario_id: String,
+    pub seed: u64,
+    pub target_domain: String,
+    pub network: ManifestNetwork,
+    pub sources: Vec<ManifestSource>,
+    pub submission: ManifestSubmission,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestNetwork {
+    pub allowed_hosts: Vec<String>,
+    pub external_network_allowed: bool,
+    pub required_header: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestSource {
+    pub source_id: String,
+    pub source_kind: SourceKind,
+    pub source_label: String,
+    pub base_url: String,
+    pub method: HttpMethod,
+    pub path_template: String,
+    pub required_query: BTreeMap<String, String>,
+    pub required_headers: Vec<String>,
+    pub authentication_field_names: Vec<String>,
+    pub pagination_mode: PaginationMode,
+    pub run_header_name: String,
+    pub allow_retry: bool,
+    pub allow_redirect: bool,
+    pub local_test_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestSubmission {
+    pub url: String,
+    pub max_bytes: usize,
+    pub max_submission_time_ms: u64,
+    pub finalizes_run: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SubmissionReport {
+    pub received: bool,
+    pub collector_name: Option<String>,
+    pub collector_version: Option<String>,
+    pub finding_count: usize,
+    pub accepted: bool,
+    #[serde(default)]
+    pub rejected_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReplayReport {
+    pub strict: bool,
+    pub matched: Option<bool>,
+    pub comparison_report: Option<String>,
+    pub first_difference: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CompressionReport {
+    pub wire_bytes: usize,
+    pub decoded_bytes: usize,
+    pub encoding: Option<String>,
+    pub limit_violation: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -548,6 +796,8 @@ pub struct AuditRecord {
     pub response_sequence: Option<usize>,
     pub response_status: u16,
     #[serde(default)]
+    pub before_submission: bool,
+    #[serde(default)]
     pub virtual_wait_ms: u64,
     pub retry_after: Option<String>,
     #[serde(default)]
@@ -559,6 +809,14 @@ pub struct AuditRecord {
     pub matched: bool,
     pub extra: bool,
     pub mismatch_reasons: Vec<String>,
+    #[serde(default)]
+    pub wire_bytes: usize,
+    #[serde(default)]
+    pub decoded_bytes: usize,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub compression_limit_violation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -578,6 +836,11 @@ pub struct RunReport {
     pub actual_run_status: RunStatus,
     pub expected_run_status: RunStatus,
     pub source_statuses: BTreeMap<String, SourceStatus>,
+    #[serde(default)]
+    pub findings: Vec<SubmissionFinding>,
+    #[serde(default)]
+    pub filtered: Vec<FilteredCandidate>,
+    #[serde(skip_serializing, default)]
     pub truth: Truth,
     pub assertions: AssertionResults,
     pub requests: Vec<AuditRecord>,
@@ -589,6 +852,14 @@ pub struct RunReport {
     pub violations: Vec<String>,
     pub replay_command: String,
     pub reproducible: bool,
+    #[serde(default)]
+    pub submission: SubmissionReport,
+    #[serde(default)]
+    pub semantic_fingerprint: String,
+    #[serde(default)]
+    pub replay: ReplayReport,
+    #[serde(default)]
+    pub compression: CompressionReport,
     /// Kept for older GUI/MCP prototypes that read `audit`.
     pub audit: Vec<AuditRecord>,
 }
@@ -609,6 +880,12 @@ pub struct AssertionResults {
     pub source_status: bool,
     pub request_contract: bool,
     pub egress_guard: bool,
+    #[serde(default = "default_submission_consistency")]
+    pub submission_consistency: bool,
+}
+
+const fn default_submission_consistency() -> bool {
+    true
 }
 
 impl AssertionResults {
@@ -621,6 +898,7 @@ impl AssertionResults {
             && self.source_status
             && self.request_contract
             && self.egress_guard
+            && self.submission_consistency
     }
 
     #[must_use]
@@ -632,6 +910,7 @@ impl AssertionResults {
             + self.source_status as usize
             + self.request_contract as usize
             + self.egress_guard as usize
+            + self.submission_consistency as usize
     }
 }
 

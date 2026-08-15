@@ -9,6 +9,7 @@ lab-core = { path = "../lab-core" }
 axum.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 tokio.workspace = true

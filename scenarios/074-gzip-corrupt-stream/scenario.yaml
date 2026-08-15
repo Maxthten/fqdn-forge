@@ -1,0 +1,17 @@
+id: 074-gzip-corrupt-stream
+name: Corrupt gzip stream
+description: A gzip CRC fault must fail this source without producing an empty successful result.
+version: "1.2.1"
+root_domain: target-$SEED.acme.test
+seed: 74
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+runner: { max_wire_response_bytes: 65536, max_decoded_response_bytes: 65536, max_expansion_ratio: 32, max_decompression_time_ms: 1000 }
+endpoints:
+  - id: search-source
+    source_kind: internet_search
+    source_label: search-source
+    match: { method: GET, path: /v121/gzip, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, encoding: gzip, gzip_corrupt: true, body_file: fixtures/data.json }]

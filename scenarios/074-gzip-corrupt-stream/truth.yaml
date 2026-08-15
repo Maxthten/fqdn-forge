@@ -1,0 +1,4 @@
+expected_fqdns: []
+expected_filter_reasons: []
+expected_run_status: failure
+expected_source_status: { search-source: failed }

@@ -1,0 +1,17 @@
+id: 073-gzip-json-success
+name: Gzip JSON success
+description: The server gzips a local JSON fixture and the reference runner decompresses it before parsing.
+version: "1.2.1"
+root_domain: target-$SEED.acme.test
+seed: 73
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+runner: { max_wire_response_bytes: 65536, max_decoded_response_bytes: 65536, max_expansion_ratio: 32, max_decompression_time_ms: 1000 }
+endpoints:
+  - id: search-source
+    source_kind: internet_search
+    source_label: search-source
+    match: { method: GET, path: /v121/gzip, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id, timestamp_field: observed_at }
+    replies: [{ status: 200, encoding: gzip, body_file: fixtures/data.json }]

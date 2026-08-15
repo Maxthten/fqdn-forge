@@ -1,0 +1,21 @@
+id: 067-external-submission-pass
+name: External collector submission passes
+description: A black-box collector reads the manifest, queries a local source and submits one evidenced finding.
+version: "1.2.1"
+root_domain: target-$SEED.acme.test
+seed: 67
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+submission: { max_bytes: 8388608, max_findings: 100, max_evidence_per_finding: 8, max_string_bytes: 4096, max_tags: 16, max_depth: 8 }
+endpoints:
+  - id: search-source
+    source_kind: internet_search
+    source_label: search-source
+    match:
+      method: GET
+      path: /v121/search
+      query: { domain: { equals: $TARGET_DOMAIN } }
+      headers: { x-lab-run-id: { present: true } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id, timestamp_field: observed_at, tags_field: tags, confidence_field: confidence }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

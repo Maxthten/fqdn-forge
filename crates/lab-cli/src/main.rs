@@ -4,7 +4,8 @@ use anyhow::Context;
 use chrono::Utc;
 use lab_core::{
     CollectorRun, EgressGuard, JudgeInput, Observation, ReferenceRunner, ReportStatus,
-    ScenarioRepository, SourceKind, SourceStatus, judge_run, report_json,
+    ScenarioRepository, SourceKind, SourceStatus, judge_run, refresh_semantic_fingerprint,
+    report_json, semantic_difference, semantic_fingerprint,
 };
 use lab_server::LocalServer;
 use reqwest::{
@@ -58,6 +59,7 @@ async fn run() -> anyhow::Result<bool> {
         "run" => run_command(&repository, &args).await,
         "repeat" => repeat_command(&repository, &args).await,
         "replay" => replay_command(&repository, &args).await,
+        "conformance" => conformance_command(&repository, &args).await,
         "self-test" => self_test(&repository).await,
         "serve" => serve_command(repository, &args).await,
         _ => {
@@ -162,7 +164,10 @@ async fn run_one(
         audit: &audit,
         rejected_egress_urls: &rejected,
     });
-    store_report(&control_client, &server.base_url(), run_id, &report).await?;
+    // This is the built-in reference path, not an external HTTP client.  The
+    // public HTTP API deliberately rejects report writes; external tools can
+    // only submit findings to the server-side judge.
+    server.set_report(report.clone());
     server.shutdown().await;
     Ok(report)
 }
@@ -221,18 +226,210 @@ async fn replay_command(repository: &ScenarioRepository, args: &[String]) -> any
     let path = flag_value(args, "--report")
         .ok_or_else(|| anyhow::anyhow!("use: lab-cli replay --report <report-path>"))?;
     let prior: lab_core::RunReport = serde_json::from_slice(&fs::read(&path)?)?;
-    let replay = run_one(repository, &prior.scenario_id, "default", Some(prior.seed)).await?;
-    let matched = replay.status == prior.status
-        && replay.scenario_id == prior.scenario_id
-        && replay.seed == prior.seed
-        && replay.target_domain == prior.target_domain;
+    let strict = args.iter().any(|arg| arg == "--strict");
+    if strict && prior.schema_version != "1.2.1" {
+        eprintln!("strict replay requires a compatible 1.2.1 report schema");
+        return Ok(false);
+    }
+    let mut replay = run_one(repository, &prior.scenario_id, "default", Some(prior.seed)).await?;
+    let matched = if strict {
+        prior.semantic_fingerprint == semantic_fingerprint(&prior)
+            && prior.semantic_fingerprint == replay.semantic_fingerprint
+            && semantic_difference(&prior, &replay).is_none()
+    } else {
+        replay.status == prior.status
+            && replay.scenario_id == prior.scenario_id
+            && replay.seed == prior.seed
+            && replay.target_domain == prior.target_domain
+    };
+    let difference = strict
+        .then(|| semantic_difference(&prior, &replay))
+        .flatten();
+    let report_path = PathBuf::from(&path);
+    let parent = report_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = report_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("report");
+    let comparison_path = parent.join(format!(
+        "{stem}-{}-replay-{}.json",
+        if strict { "strict" } else { "standard" },
+        Uuid::new_v4()
+    ));
+    replay.replay.strict = strict;
+    replay.replay.matched = Some(matched);
+    replay.replay.first_difference = difference.clone();
+    replay.replay.comparison_report = Some(comparison_path.display().to_string());
+    refresh_semantic_fingerprint(&mut replay);
+    fs::write(&comparison_path, report_json(&replay)?)?;
     println!("replay scenario: {}", replay.scenario_id);
     println!(
         "replay result: {}",
         if matched { "matched" } else { "mismatch" }
     );
     println!("seed: {}; new run_id: {}", replay.seed, replay.run_id);
+    if let Some(difference) = difference {
+        println!("first semantic difference: {difference}");
+    }
+    println!("comparison report: {}", comparison_path.display());
     Ok(matched && replay.status == ReportStatus::Passed)
+}
+
+async fn conformance_command(
+    repository: &ScenarioRepository,
+    args: &[String],
+) -> anyhow::Result<bool> {
+    let scenario =
+        flag_value(args, "--scenario").unwrap_or_else(|| "067-external-submission-pass".to_owned());
+    let server = LocalServer::spawn(repository.clone(), None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let result = external_http_conformance(&server.base_url(), &scenario).await;
+    server.shutdown().await;
+    let report = result?;
+    let passed = report.get("status").and_then(serde_json::Value::as_str) == Some("passed");
+    println!(
+        "external HTTP conformance {scenario}: {}",
+        if passed { "passed" } else { "failed" }
+    );
+    Ok(passed)
+}
+
+/// An intentionally black-box client: after receiving a base URL it uses only
+/// public HTTP responses. It does not receive LabState, scenario files, truth
+/// or assertions.
+async fn external_http_conformance(
+    base_url: &str,
+    scenario_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let client = Client::builder().redirect(Policy::none()).build()?;
+    let create: serde_json::Value = client
+        .post(format!("{base_url}/api/runs"))
+        .json(&serde_json::json!({"scenario_id":scenario_id}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let run_id = create
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("public create-run response is missing run_id"))?;
+    let manifest: serde_json::Value = client
+        .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if manifest.get("truth").is_some() {
+        anyhow::bail!("manifest leaked truth");
+    }
+    let target_domain = manifest
+        .get("target_domain")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest is missing target_domain"))?;
+    let sources = manifest
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("manifest is missing sources"))?;
+    let mut findings = Vec::new();
+    let mut source_statuses = serde_json::Map::new();
+    for source in sources {
+        let source_id = source
+            .get("source_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
+        let source_kind = source
+            .get("source_kind")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_kind"))?;
+        let source_base = source
+            .get("base_url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("manifest source is missing base_url"))?;
+        let path = source
+            .get("path_template")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("manifest source is missing path_template"))?;
+        let query = source
+            .get("required_query")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let url = format!("{source_base}{path}");
+        let mut request = match source.get("method").and_then(serde_json::Value::as_str) {
+            Some("POST") => client.post(&url),
+            Some("PUT") => client.put(&url),
+            Some("DELETE") => client.delete(&url),
+            _ => client.get(&url),
+        }
+        .header("x-lab-run-id", run_id)
+        .query(&query);
+        // The run header is mandatory. A source-specific fake credential is
+        // intentionally not inferred or copied from private scenario state.
+        request = request.header("x-lab-data-profile", "default");
+        let response = request.send().await?;
+        let evidence_url = response.url().to_string();
+        if !response.status().is_success() {
+            source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
+            continue;
+        }
+        source_statuses.insert(source_id.to_owned(), serde_json::json!("succeeded"));
+        let payload: serde_json::Value = response.json().await?;
+        for item in payload
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(fqdn) = item.get("host").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            findings.push(serde_json::json!({
+                "fqdn":fqdn,
+                "evidence":[{
+                    "source_id":source_id,
+                    "source_kind":source_kind.clone(),
+                    "record_id":item.get("id").and_then(serde_json::Value::as_str),
+                    "url":evidence_url.clone(),
+                    "observed_at":item.get("observed_at").and_then(serde_json::Value::as_str),
+                    "tags":item.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "confidence":item.get("confidence").and_then(serde_json::Value::as_f64),
+                }]
+            }));
+        }
+    }
+    let submission = serde_json::json!({
+        "schema_version":"1.2.1",
+        "collector":{"name":"fqdn-forge-http-conformance","version":"1.2.1"},
+        "target_domain":target_domain,
+        "source_statuses":source_statuses,
+        "findings":findings,
+    });
+    client
+        .post(format!("{base_url}/api/runs/{run_id}/submission"))
+        .json(&submission)
+        .send()
+        .await?
+        .error_for_status()?;
+    let report: serde_json::Value = client
+        .get(format!("{base_url}/api/runs/{run_id}/report"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let report = report
+        .get("report")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("public report response is missing report"))?;
+    if report.get("truth").is_some() {
+        anyhow::bail!("public report leaked truth");
+    }
+    Ok(report)
 }
 
 async fn serve_command(repository: ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
@@ -529,21 +726,6 @@ async fn fetch_audit(
     .map_err(Into::into)
 }
 
-async fn store_report(
-    client: &Client,
-    base_url: &str,
-    run_id: Uuid,
-    report: &lab_core::RunReport,
-) -> anyhow::Result<()> {
-    client
-        .post(format!("{base_url}/api/runs/{run_id}/report"))
-        .json(report)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 fn print_report(report: &lab_core::RunReport, path: &std::path::Path) {
     println!("scenario: {}", report.scenario_id);
     println!(
@@ -554,7 +736,7 @@ fn print_report(report: &lab_core::RunReport, path: &std::path::Path) {
             "failed"
         }
     );
-    println!("assertions: {}/7", report.assertions.passed_count());
+    println!("assertions: {}/8", report.assertions.passed_count());
     println!(
         "requests: total {}, unmatched {}, extra {}, blocked egress {}",
         report.request_summary.total,
@@ -578,7 +760,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay --report <report-path>\n  self-test\n  serve [--scenario <id>] [--port 18080]"
+        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  serve [--scenario <id>] [--port 18080]"
     );
 }
 
@@ -590,13 +772,15 @@ fn target_domain(scenario: &lab_core::Scenario) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_negative_client, run_one, scenarios_dir};
+    use super::{external_http_conformance, run_negative_client, run_one, scenarios_dir};
     use lab_core::{ReportStatus, ScenarioRepository};
+    use lab_server::LocalServer;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn every_scenario_is_a_rust_regression_test() {
         let repository = ScenarioRepository::load(scenarios_dir()).expect("load scenarios");
-        assert_eq!(repository.all().len(), 60);
+        assert_eq!(repository.all().len(), 72);
         for loaded in repository.all() {
             let report = run_one(&repository, &loaded.scenario.id, "default", None)
                 .await
@@ -661,6 +845,351 @@ mod tests {
                 "{kind} needs a readable failure reason"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn independent_http_client_completes_the_public_contract_without_truth() {
+        let repository = ScenarioRepository::load(scenarios_dir()).expect("load scenarios");
+        let server = LocalServer::spawn(repository, None)
+            .await
+            .expect("start local test service");
+        let report = external_http_conformance(&server.base_url(), "067-external-submission-pass")
+            .await
+            .expect("public HTTP contract");
+        assert_eq!(
+            report.get("status").and_then(serde_json::Value::as_str),
+            Some("passed")
+        );
+        assert!(report.get("truth").is_none());
+        assert_eq!(
+            report
+                .get("submission")
+                .and_then(|value| value.get("received"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_submission_contract_rejects_security_and_lifecycle_abuse() {
+        let repository = ScenarioRepository::load(scenarios_dir()).expect("load scenarios");
+        let server = LocalServer::spawn(repository, None)
+            .await
+            .expect("start local test service");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("HTTP client");
+        let base_url = server.base_url();
+        assert_eq!(
+            client
+                .get(format!("{base_url}/v121/search"))
+                .send()
+                .await
+                .expect("unscoped source request")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs"))
+                .json(&serde_json::json!({"scenario_id":"not-a-scenario"}))
+                .send()
+                .await
+                .expect("unknown scenario request")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let created: serde_json::Value = client
+            .post(format!("{base_url}/api/runs"))
+            .json(&serde_json::json!({"scenario_id":"067-external-submission-pass","seed":67}))
+            .send()
+            .await
+            .expect("create run")
+            .error_for_status()
+            .expect("create run status")
+            .json()
+            .await
+            .expect("create run JSON");
+        let run_id = created["run_id"].as_str().expect("run id").to_owned();
+        assert_eq!(
+            client
+                .get(format!("{base_url}/api/runs/{run_id}/truth"))
+                .send()
+                .await
+                .expect("truth request")
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .get(format!("{base_url}/api/runs/{}/manifest", Uuid::new_v4()))
+                .send()
+                .await
+                .expect("unknown manifest request")
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        let manifest: serde_json::Value = client
+            .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+            .send()
+            .await
+            .expect("manifest request")
+            .error_for_status()
+            .expect("manifest status")
+            .json()
+            .await
+            .expect("manifest JSON");
+        let source = &manifest["sources"][0];
+        let source_url = format!(
+            "{}{}",
+            source["base_url"].as_str().expect("source base URL"),
+            source["path_template"].as_str().expect("source path")
+        );
+        let source_response = client
+            .get(&source_url)
+            .header("x-lab-run-id", &run_id)
+            .query(&source["required_query"])
+            .send()
+            .await
+            .expect("source request")
+            .error_for_status()
+            .expect("source status");
+        let evidence_url = source_response.url().to_string();
+        let source_kind = source["source_kind"].clone();
+        let target = manifest["target_domain"].as_str().expect("target domain");
+        let correct_submission = serde_json::json!({
+            "schema_version":"1.2.1",
+            "collector":{"name":"negative-contract-test","version":"1.2.1"},
+            "target_domain":target,
+            "source_statuses":{"search-source":"succeeded"},
+            "findings":[{"fqdn":format!("api.{target}"),"evidence":[{"source_id":"search-source","source_kind":source_kind,"record_id":"synthetic-67-1","url":evidence_url,"observed_at":"2025-01-12T00:00:00Z","tags":["synthetic"],"confidence":80}]}]
+        });
+        let mut invalid_target = correct_submission.clone();
+        invalid_target["target_domain"] = serde_json::json!("other.acme.test");
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&invalid_target)
+                .send()
+                .await
+                .expect("invalid target submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let mut unknown_source = correct_submission.clone();
+        unknown_source["source_statuses"] = serde_json::json!({"unknown-source":"succeeded"});
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&unknown_source)
+                .send()
+                .await
+                .expect("unknown source submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let mut out_of_scope = correct_submission.clone();
+        out_of_scope["findings"][0]["fqdn"] = serde_json::json!("outside.evil.test");
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&out_of_scope)
+                .send()
+                .await
+                .expect("out of scope submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let mut no_evidence = correct_submission.clone();
+        no_evidence["findings"][0]["evidence"] = serde_json::json!([]);
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&no_evidence)
+                .send()
+                .await
+                .expect("missing evidence submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let mut forged = correct_submission.clone();
+        forged["passed"] = serde_json::json!(true);
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&forged)
+                .send()
+                .await
+                .expect("forged result submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let mut sensitive = correct_submission.clone();
+        sensitive["authorization"] = serde_json::json!("Bearer real-looking-secret");
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&sensitive)
+                .send()
+                .await
+                .expect("sensitive submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let mut sensitive_evidence_url = correct_submission.clone();
+        sensitive_evidence_url["findings"][0]["evidence"][0]["url"] =
+            serde_json::json!(format!("{evidence_url}&api_key=synthetic-secret"));
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&sensitive_evidence_url)
+                .send()
+                .await
+                .expect("sensitive evidence URL submission")
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let oversized = format!(
+            "{{\"schema_version\":\"1.2.1\",\"padding\":\"{}\"}}",
+            "x".repeat(8 * 1024 * 1024)
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .header("content-type", "application/json")
+                .body(oversized)
+                .send()
+                .await
+                .expect("oversized submission")
+                .status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&correct_submission)
+                .send()
+                .await
+                .expect("valid submission")
+                .status(),
+            reqwest::StatusCode::CREATED
+        );
+        let audit: serde_json::Value = client
+            .get(format!("{base_url}/api/runs/{run_id}/requests"))
+            .send()
+            .await
+            .expect("submission audit request")
+            .error_for_status()
+            .expect("submission audit status")
+            .json()
+            .await
+            .expect("submission audit JSON");
+        assert_eq!(audit["requests"][0]["before_submission"], true);
+        assert_eq!(
+            client
+                .get(&source_url)
+                .header("x-lab-run-id", &run_id)
+                .query(&source["required_query"])
+                .send()
+                .await
+                .expect("post-submission source request")
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/reset"))
+                .send()
+                .await
+                .expect("reset submitted run")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(&source_url)
+                .header("x-lab-run-id", &run_id)
+                .query(&source["required_query"])
+                .send()
+                .await
+                .expect("source request after reset")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&correct_submission)
+                .send()
+                .await
+                .expect("submission after reset")
+                .status(),
+            reqwest::StatusCode::CREATED
+        );
+        let second_run: serde_json::Value = client
+            .post(format!("{base_url}/api/runs"))
+            .json(&serde_json::json!({"scenario_id":"067-external-submission-pass","seed":67}))
+            .send()
+            .await
+            .expect("second run")
+            .error_for_status()
+            .expect("second run status")
+            .json()
+            .await
+            .expect("second run JSON");
+        let second_run_id = second_run["run_id"].as_str().expect("second run id");
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{second_run_id}/submission"))
+                .json(&correct_submission)
+                .send()
+                .await
+                .expect("cross-run submission")
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/submission"))
+                .json(&correct_submission)
+                .send()
+                .await
+                .expect("duplicate submission")
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{run_id}/report"))
+                .json(&serde_json::json!({"status":"passed"}))
+                .send()
+                .await
+                .expect("forged report route")
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            client
+                .delete(format!("{base_url}/api/runs/{second_run_id}"))
+                .send()
+                .await
+                .expect("delete secondary run")
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            client
+                .post(format!("{base_url}/api/runs/{second_run_id}/submission"))
+                .json(&correct_submission)
+                .send()
+                .await
+                .expect("submission to deleted run")
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test]

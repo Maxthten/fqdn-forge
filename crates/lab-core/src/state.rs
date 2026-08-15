@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{AuditRecord, LoadedScenario, RunReport, ScenarioRepository};
+use crate::{AuditRecord, CollectorSubmission, LoadedScenario, RunReport, ScenarioRepository};
 
 #[derive(Clone, Debug)]
 pub struct LabState {
@@ -21,6 +21,8 @@ struct MutableLabState {
     runs: BTreeMap<String, RunSession>,
     unscoped_audit: Vec<RejectedRequestAudit>,
     developer_run_id: Option<String>,
+    base_url: Option<String>,
+    submitted_payloads: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -37,12 +39,15 @@ pub struct RunSession {
     pub audit: Vec<AuditRecord>,
     #[serde(skip_serializing)]
     pub latest_report: Option<RunReport>,
+    #[serde(skip_serializing)]
+    pub submission: Option<CollectorSubmission>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunSessionStatus {
     Active,
+    Submitted,
     Completed,
     Reset,
     Expired,
@@ -57,9 +62,23 @@ pub struct RejectedRequestAudit {
 }
 
 #[derive(Clone, Debug)]
+pub struct ResponseMetrics {
+    pub endpoint_id: String,
+    pub response_index: usize,
+    pub wire_bytes: usize,
+    pub decoded_bytes: usize,
+    pub content_encoding: Option<String>,
+    pub compression_limit_violation: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub enum RunStateError {
     InvalidRunId,
     UnknownRun,
+    AlreadySubmitted,
+    CrossRunSubmission,
+    RunNotAcceptingSubmission,
+    RunNotAcceptingSourceRequests,
 }
 
 impl RunStateError {
@@ -68,6 +87,10 @@ impl RunStateError {
         match self {
             Self::InvalidRunId => "invalid run id",
             Self::UnknownRun => "unknown run id",
+            Self::AlreadySubmitted => "submission has already been accepted for this run",
+            Self::CrossRunSubmission => "submission payload was already accepted by another run",
+            Self::RunNotAcceptingSubmission => "run is not accepting a submission",
+            Self::RunNotAcceptingSourceRequests => "run is not accepting source requests",
         }
     }
 }
@@ -84,6 +107,19 @@ impl LabState {
     #[must_use]
     pub fn repository(&self) -> &ScenarioRepository {
         &self.repository
+    }
+
+    pub fn set_base_url(&self, base_url: String) {
+        self.inner.lock().expect("lab state lock poisoned").base_url = Some(base_url);
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .base_url
+            .clone()
     }
 
     pub fn create_run(&self, scenario_id: &str) -> Result<RunSession> {
@@ -106,6 +142,7 @@ impl LabState {
             response_counts: BTreeMap::new(),
             audit: Vec::new(),
             latest_report: None,
+            submission: None,
         };
         self.inner
             .lock()
@@ -179,6 +216,12 @@ impl LabState {
             .runs
             .get_mut(run_id)
             .ok_or(RunStateError::UnknownRun)?;
+        if !matches!(
+            run.status,
+            RunSessionStatus::Active | RunSessionStatus::Reset
+        ) {
+            return Err(RunStateError::RunNotAcceptingSourceRequests);
+        }
         let count = run
             .response_counts
             .entry(endpoint_id.to_owned())
@@ -219,9 +262,42 @@ impl LabState {
             .runs
             .get_mut(run_id)
             .ok_or(RunStateError::UnknownRun)?;
+        if run.submission.is_some()
+            || !matches!(
+                run.status,
+                RunSessionStatus::Active | RunSessionStatus::Reset
+            )
+        {
+            return Err(RunStateError::RunNotAcceptingSourceRequests);
+        }
         audit.sequence = run.audit.len() + 1;
+        audit.before_submission = true;
         run.audit.push(audit);
         run.last_activity_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn set_response_metrics(
+        &self,
+        run_id: &str,
+        metrics: ResponseMetrics,
+    ) -> std::result::Result<(), RunStateError> {
+        validate_run_id(run_id)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or(RunStateError::UnknownRun)?;
+        let Some(record) = run.audit.iter_mut().rev().find(|record| {
+            record.endpoint_id.as_deref() == Some(&metrics.endpoint_id)
+                && record.response_index == Some(metrics.response_index)
+        }) else {
+            return Ok(());
+        };
+        record.wire_bytes = metrics.wire_bytes;
+        record.decoded_bytes = metrics.decoded_bytes;
+        record.content_encoding = metrics.content_encoding;
+        record.compression_limit_violation = metrics.compression_limit_violation;
         Ok(())
     }
 
@@ -232,15 +308,26 @@ impl LabState {
     pub fn reset(&self, run_id: &str) -> std::result::Result<(), RunStateError> {
         validate_run_id(run_id)?;
         let mut inner = self.inner.lock().expect("lab state lock poisoned");
-        let run = inner
-            .runs
-            .get_mut(run_id)
-            .ok_or(RunStateError::UnknownRun)?;
-        run.audit.clear();
-        run.response_counts.clear();
-        run.latest_report = None;
-        run.last_activity_at = Utc::now();
-        run.status = RunSessionStatus::Reset;
+        let digest = {
+            let run = inner
+                .runs
+                .get_mut(run_id)
+                .ok_or(RunStateError::UnknownRun)?;
+            let digest = run
+                .submission
+                .as_ref()
+                .and_then(|submission| serde_json::to_string(submission).ok());
+            run.audit.clear();
+            run.response_counts.clear();
+            run.latest_report = None;
+            run.submission = None;
+            run.last_activity_at = Utc::now();
+            run.status = RunSessionStatus::Reset;
+            digest
+        };
+        if let Some(digest) = digest {
+            inner.submitted_payloads.remove(&digest);
+        }
         Ok(())
     }
 
@@ -261,6 +348,57 @@ impl LabState {
         Ok(())
     }
 
+    /// Atomically freezes the first valid collector payload for a run. The
+    /// server judges this immutable payload immediately afterwards; a caller
+    /// can never replace it with a different report or submission.
+    pub fn freeze_submission(
+        &self,
+        run_id: &str,
+        submission: CollectorSubmission,
+    ) -> std::result::Result<(), RunStateError> {
+        validate_run_id(run_id)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let digest = serde_json::to_string(&submission)
+            .map_err(|_| RunStateError::RunNotAcceptingSubmission)?;
+        if !inner.runs.contains_key(run_id) {
+            return Err(RunStateError::UnknownRun);
+        }
+        if inner
+            .submitted_payloads
+            .get(&digest)
+            .is_some_and(|owner| owner != run_id)
+        {
+            return Err(RunStateError::CrossRunSubmission);
+        }
+        {
+            let run = inner
+                .runs
+                .get_mut(run_id)
+                .ok_or(RunStateError::UnknownRun)?;
+            if run.submission.is_some() {
+                return Err(RunStateError::AlreadySubmitted);
+            }
+            if !matches!(
+                run.status,
+                RunSessionStatus::Active | RunSessionStatus::Reset
+            ) {
+                return Err(RunStateError::RunNotAcceptingSubmission);
+            }
+            run.submission = Some(submission);
+            run.status = RunSessionStatus::Submitted;
+            run.last_activity_at = Utc::now();
+        }
+        inner.submitted_payloads.insert(digest, run_id.to_owned());
+        Ok(())
+    }
+
+    pub fn submission(
+        &self,
+        run_id: &str,
+    ) -> std::result::Result<Option<CollectorSubmission>, RunStateError> {
+        Ok(self.session(run_id)?.submission)
+    }
+
     pub fn latest_report(
         &self,
         run_id: &str,
@@ -271,8 +409,14 @@ impl LabState {
     pub fn delete(&self, run_id: &str) -> std::result::Result<(), RunStateError> {
         validate_run_id(run_id)?;
         let mut inner = self.inner.lock().expect("lab state lock poisoned");
-        if inner.runs.remove(run_id).is_none() {
-            return Err(RunStateError::UnknownRun);
+        let run = inner.runs.remove(run_id).ok_or(RunStateError::UnknownRun)?;
+        if let Some(digest) = run
+            .submission
+            .as_ref()
+            .and_then(|submission| serde_json::to_string(submission).ok())
+            && inner.submitted_payloads.get(&digest) == Some(&run.run_id)
+        {
+            inner.submitted_payloads.remove(&digest);
         }
         if inner.developer_run_id.as_deref() == Some(run_id) {
             inner.developer_run_id = None;

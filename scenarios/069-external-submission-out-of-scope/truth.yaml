@@ -1,0 +1,6 @@
+expected_fqdns: [api.target-69.acme.test]
+forbidden_fqdns: [api.target-69.acme.test.evil.test]
+expected_observations: { api.target-69.acme.test: { source_names: [search-source], source_kinds: [internet_search], record_ids: [synthetic-69-1], requires_time: true } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { search-source: success }

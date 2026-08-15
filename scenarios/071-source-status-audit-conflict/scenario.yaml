@@ -1,0 +1,16 @@
+id: 071-source-status-audit-conflict
+name: Source status must match audit
+description: A collector cannot claim source success without a matching local audited request.
+version: "1.2.1"
+root_domain: target-$SEED.acme.test
+seed: 71
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+endpoints:
+  - id: search-source
+    source_kind: internet_search
+    source_label: search-source
+    match: { method: GET, path: /v121/search, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id, timestamp_field: observed_at }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

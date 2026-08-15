@@ -1,0 +1,3 @@
+expected_requests: 1
+endpoint_requests: { search-source: 1 }
+expected_rejected_egress_attempts: 0

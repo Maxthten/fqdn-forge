@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     time::Instant,
 };
 
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
+use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
@@ -258,10 +260,9 @@ impl ReferenceRunner {
             if response.status() == StatusCode::NO_CONTENT {
                 return (SourceStatus::Success, request_count);
             }
-            if response
-                .content_length()
-                .is_some_and(|length| length > scenario.runner.max_response_bytes as u64)
-            {
+            if response.content_length().is_some_and(|length| {
+                length > scenario.runner.effective_max_wire_response_bytes() as u64
+            }) {
                 run.filtered.push(FilteredCandidate {
                     value: endpoint.id.clone(),
                     reason: FilterReason::ResponseTooLarge,
@@ -272,7 +273,7 @@ impl ReferenceRunner {
             let response_headers = response.headers().clone();
             let bytes = match read_limited_response(
                 response,
-                scenario.runner.max_response_bytes,
+                scenario.runner.effective_max_wire_response_bytes(),
                 scenario.runner.timeout_ms,
             )
             .await
@@ -289,8 +290,34 @@ impl ReferenceRunner {
                 Err(ReadResponseError::TimedOut) => return (SourceStatus::TimedOut, request_count),
                 Err(ReadResponseError::Body) => return (SourceStatus::Failed, request_count),
             };
-            run.metrics.response_bytes = run.metrics.response_bytes.saturating_add(bytes.len());
-            let extracted = match extract_records(endpoint, &response_headers, &bytes) {
+            run.metrics.wire_response_bytes =
+                run.metrics.wire_response_bytes.saturating_add(bytes.len());
+            let decoded = match decode_response(&response_headers, &bytes, scenario) {
+                Ok(decoded) => decoded,
+                Err(DecodeResponseError::Limit(reason)) => {
+                    run.metrics.compression_limit_violation = Some(reason.to_owned());
+                    run.filtered.push(FilteredCandidate {
+                        value: endpoint.id.clone(),
+                        reason: FilterReason::ResponseTooLarge,
+                        source_name: endpoint.id.clone(),
+                    });
+                    return (SourceStatus::Failed, request_count);
+                }
+                Err(DecodeResponseError::Invalid) => {
+                    run.filtered.push(FilteredCandidate {
+                        value: endpoint.id.clone(),
+                        reason: FilterReason::Malformed,
+                        source_name: endpoint.id.clone(),
+                    });
+                    return (SourceStatus::Failed, request_count);
+                }
+            };
+            run.metrics.response_bytes = run.metrics.response_bytes.saturating_add(decoded.len());
+            run.metrics.decoded_response_bytes = run
+                .metrics
+                .decoded_response_bytes
+                .saturating_add(decoded.len());
+            let extracted = match extract_records(endpoint, &response_headers, &decoded) {
                 Ok(result) => result,
                 Err(_) => {
                     run.filtered.push(FilteredCandidate {
@@ -556,6 +583,58 @@ async fn read_limited_response(
     tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read)
         .await
         .map_err(|_| ReadResponseError::TimedOut)?
+}
+
+enum DecodeResponseError {
+    Invalid,
+    Limit(&'static str),
+}
+
+fn decode_response(
+    headers: &HeaderMap,
+    wire: &[u8],
+    scenario: &Scenario,
+) -> Result<Vec<u8>, DecodeResponseError> {
+    let encoding = headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity");
+    if !encoding.eq_ignore_ascii_case("gzip") {
+        return Ok(wire.to_vec());
+    }
+    let started = Instant::now();
+    let mut decoder = GzDecoder::new(wire);
+    let mut decoded = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if started.elapsed().as_millis() > u128::from(scenario.runner.max_decompression_time_ms) {
+            return Err(DecodeResponseError::Limit(
+                "max_decompression_time exceeded",
+            ));
+        }
+        let count = decoder
+            .read(&mut buffer)
+            .map_err(|_| DecodeResponseError::Invalid)?;
+        if count == 0 {
+            break;
+        }
+        let next = decoded.len().saturating_add(count);
+        if next > scenario.runner.effective_max_decoded_response_bytes() {
+            return Err(DecodeResponseError::Limit(
+                "max_decoded_response_bytes exceeded",
+            ));
+        }
+        if wire.is_empty()
+            || next
+                > wire
+                    .len()
+                    .saturating_mul(scenario.runner.max_expansion_ratio)
+        {
+            return Err(DecodeResponseError::Limit("max_expansion_ratio exceeded"));
+        }
+        decoded.extend_from_slice(&buffer[..count]);
+    }
+    Ok(decoded)
 }
 
 fn extract_records(

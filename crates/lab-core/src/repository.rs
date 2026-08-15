@@ -101,16 +101,46 @@ impl ScenarioRepository {
 fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
     let id = &loaded.scenario.id;
     let mut issues = Vec::new();
-    if loaded.scenario.version != "1.2" {
+    if !matches!(loaded.scenario.version.as_str(), "1.2" | "1.2.1") {
         issues.push(issue_at(
             id,
             "scenario.yaml",
             "version",
             format!(
-                "scenario version {} is unsupported for the V1.2 repository",
+                "scenario version {} is unsupported for the V1.2.1 repository",
                 loaded.scenario.version
             ),
-            "set version to 1.2",
+            "set version to 1.2 or 1.2.1",
+        ));
+    }
+    let limits = &loaded.scenario.submission;
+    if limits.max_bytes == 0
+        || limits.max_findings == 0
+        || limits.max_evidence_per_finding == 0
+        || limits.max_string_bytes == 0
+        || limits.max_tags == 0
+        || limits.max_depth == 0
+        || limits.max_submission_time_ms == 0
+    {
+        issues.push(issue_at(
+            id,
+            "scenario.yaml",
+            "submission",
+            "submission limits must all be greater than zero",
+            "set bounded positive submission limits",
+        ));
+    }
+    if loaded.scenario.runner.max_wire_response_bytes == 0
+        || loaded.scenario.runner.max_decoded_response_bytes == 0
+        || loaded.scenario.runner.max_expansion_ratio < 1
+        || loaded.scenario.runner.max_decompression_time_ms == 0
+    {
+        issues.push(issue_at(
+            id,
+            "scenario.yaml",
+            "runner",
+            "compression limits must be positive and expansion ratio must be at least one",
+            "set finite wire, decoded, ratio and decompression-time limits",
         ));
     }
     let target_domain = loaded
@@ -221,13 +251,13 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
             if let Some(encoding) = &reply.encoding
                 && !matches!(
                     encoding.to_ascii_lowercase().as_str(),
-                    "identity" | "utf-8" | "utf8"
+                    "identity" | "utf-8" | "utf8" | "gzip"
                 )
             {
                 issues.push(issue(
                     id,
                     format!(
-                        "endpoint {} reply encoding {encoding} is unsupported; use identity or utf-8",
+                        "endpoint {} reply encoding {encoding} is unsupported; use identity, utf-8 or gzip",
                         endpoint.id
                     ),
                 ));
@@ -239,6 +269,23 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
                         "endpoint {} Retry-After is only valid on 429; fix the status or remove retry_after",
                         endpoint.id
                     ),
+                ));
+            }
+            if (reply.gzip_corrupt || reply.gzip_truncated)
+                && !reply
+                    .encoding
+                    .as_deref()
+                    .is_some_and(|encoding| encoding.eq_ignore_ascii_case("gzip"))
+            {
+                issues.push(issue_at(
+                    id,
+                    "scenario.yaml",
+                    "endpoints.replies.gzip",
+                    format!(
+                        "endpoint {} uses a gzip fault without Content-Encoding gzip",
+                        endpoint.id
+                    ),
+                    "set encoding to gzip or remove the gzip fault",
                 ));
             }
             if reply.virtual_wait_ms > loaded.scenario.runner.retry_after_cap_ms {
@@ -437,6 +484,31 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
             "expected_unmatched_requests cannot exceed expected_requests",
             "lower expected_unmatched_requests or raise expected_requests",
         ));
+    }
+    if let Some(number) = id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        && (67..=78).contains(&number)
+    {
+        if loaded.scenario.version != "1.2.1" {
+            issues.push(issue_at(
+                id,
+                "scenario.yaml",
+                "version",
+                "V1.2.1 contract scenarios must use version 1.2.1",
+                "set version to 1.2.1",
+            ));
+        }
+        if loaded.scenario.endpoints.is_empty() {
+            issues.push(issue_at(
+                id,
+                "scenario.yaml",
+                "endpoints",
+                "external contract scenarios need at least one manifest source",
+                "add a local source endpoint",
+            ));
+        }
     }
     issues
 }
