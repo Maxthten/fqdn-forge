@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+brotli.workspace = true
 chrono.workspace = true
 csv.workspace = true
 reqwest.workspace = true

@@ -4,25 +4,30 @@ use std::{
     time::Instant,
 };
 
+use brotli::Decompressor;
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
-use flate2::read::GzDecoder;
+use flate2::read::{GzDecoder, ZlibDecoder};
 use futures_util::StreamExt;
 use reqwest::{
-    Client, StatusCode,
+    Client, Proxy, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
     redirect::Policy,
 };
 use scraper::{Html, Selector};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
     CandidateError, CollectorRun, ContentFormat, EgressGuard, Endpoint, ExtractKind, FilterReason,
-    FilteredCandidate, HttpMethod, Observation, PaginationMode, Scenario, SourceStatus,
-    accept_candidate, domainish_tokens, host_from_url,
+    FilteredCandidate, HttpMethod, NetworkMode, Observation, PaginationMode, Scenario,
+    SourceStatus, accept_candidate, domainish_tokens, host_from_url,
 };
 
 #[derive(Debug, Error)]
@@ -42,6 +47,7 @@ impl ReferenceRunner {
     pub fn new(guard: EgressGuard) -> Result<Self, RunnerError> {
         let client = Client::builder()
             .redirect(Policy::none())
+            .no_proxy()
             .build()
             .map_err(|error| RunnerError::InvalidBaseUrl(error.to_string()))?;
         Ok(Self { client, guard })
@@ -59,6 +65,18 @@ impl ReferenceRunner {
         run_id: Uuid,
         profile: &str,
     ) -> Result<CollectorRun, RunnerError> {
+        self.run_with_proxy(base_url, None, scenario, run_id, profile)
+            .await
+    }
+
+    pub async fn run_with_proxy(
+        &self,
+        base_url: &str,
+        proxy_url: Option<&str>,
+        scenario: &Scenario,
+        run_id: Uuid,
+        profile: &str,
+    ) -> Result<CollectorRun, RunnerError> {
         let started = Instant::now();
         self.guard.validate(base_url)?;
         let base_url =
@@ -67,6 +85,36 @@ impl ReferenceRunner {
         let root_domain = crate::normalize_domain(&root_domain)
             .map_err(|_| RunnerError::InvalidBaseUrl("invalid scenario root domain".to_owned()))?;
         let mut run = CollectorRun::default();
+        if scenario.network_profile.mode == NetworkMode::ConnectProxy {
+            let status = match proxy_url {
+                Some(proxy_url) => {
+                    connect_proxy_probe(proxy_url, &base_url, run_id, scenario).await
+                }
+                None => SourceStatus::Failed,
+            };
+            for endpoint in &scenario.endpoints {
+                run.source_statuses.insert(endpoint.id.clone(), status);
+            }
+            run.metrics.request_count = usize::from(!scenario.endpoints.is_empty());
+            run.metrics.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            return Ok(run);
+        }
+        let client = if scenario.network_profile.mode == NetworkMode::HttpProxy {
+            let proxy_url = proxy_url
+                .ok_or_else(|| RunnerError::InvalidBaseUrl("missing local proxy URL".to_owned()))?;
+            self.guard.validate(proxy_url)?;
+            Client::builder()
+                .redirect(Policy::none())
+                .no_proxy()
+                .proxy(
+                    Proxy::http(proxy_url)
+                        .map_err(|error| RunnerError::InvalidBaseUrl(error.to_string()))?,
+                )
+                .build()
+                .map_err(|error| RunnerError::InvalidBaseUrl(error.to_string()))?
+        } else {
+            self.client.clone()
+        };
         let mut seen = BTreeSet::new();
         let mut sent = 0_usize;
         for endpoint in &scenario.endpoints {
@@ -83,6 +131,7 @@ impl ReferenceRunner {
             }
             let (status, _) = self
                 .run_endpoint(
+                    &client,
                     &base_url,
                     scenario,
                     endpoint,
@@ -132,6 +181,7 @@ impl ReferenceRunner {
     #[allow(clippy::too_many_arguments)]
     async fn run_endpoint(
         &self,
+        client: &Client,
         base_url: &Url,
         scenario: &Scenario,
         endpoint: &Endpoint,
@@ -147,6 +197,7 @@ impl ReferenceRunner {
         let mut current_url: Option<Url> = None;
         let mut seen_cursors = BTreeSet::new();
         let mut retries = 0_usize;
+        let mut client_virtual_wait_ms = 0_u64;
         loop {
             if scenario
                 .runner
@@ -174,17 +225,23 @@ impl ReferenceRunner {
                 });
                 return (SourceStatus::Blocked, request_count);
             }
-            let headers = match headers_for(endpoint, scenario, run_id, profile, cursor.as_deref())
-            {
+            let headers = match headers_for(
+                endpoint,
+                scenario,
+                run_id,
+                profile,
+                cursor.as_deref(),
+                client_virtual_wait_ms,
+            ) {
                 Ok(headers) => headers,
                 Err(_) => return (SourceStatus::Failed, request_count),
             };
             let method = endpoint.request_match.method;
             let request = match method {
-                HttpMethod::Get => self.client.get(url.clone()),
-                HttpMethod::Post => self.client.post(url.clone()),
-                HttpMethod::Put => self.client.put(url.clone()),
-                HttpMethod::Delete => self.client.delete(url.clone()),
+                HttpMethod::Get => client.get(url.clone()),
+                HttpMethod::Post => client.post(url.clone()),
+                HttpMethod::Put => client.put(url.clone()),
+                HttpMethod::Delete => client.delete(url.clone()),
             }
             .headers(headers);
             let request = request_body(request, endpoint, scenario, run_id, cursor.as_deref());
@@ -209,6 +266,7 @@ impl ReferenceRunner {
                 .unwrap_or(0)
                 .min(scenario.runner.retry_after_cap_ms);
             run.virtual_waited_ms = run.virtual_waited_ms.saturating_add(virtual_wait);
+            client_virtual_wait_ms = client_virtual_wait_ms.saturating_add(virtual_wait);
             if status.is_redirection() {
                 let Some(location) = response
                     .headers()
@@ -244,6 +302,7 @@ impl ReferenceRunner {
                         .unwrap_or(0)
                         .min(scenario.runner.retry_after_cap_ms);
                     run.virtual_waited_ms = run.virtual_waited_ms.saturating_add(wait);
+                    client_virtual_wait_ms = client_virtual_wait_ms.saturating_add(wait);
                     continue;
                 }
                 return (SourceStatus::RateLimited, request_count);
@@ -275,11 +334,23 @@ impl ReferenceRunner {
                 response,
                 scenario.runner.effective_max_wire_response_bytes(),
                 scenario.runner.timeout_ms,
+                scenario.runner.max_chunk_bytes,
+                scenario.runner.max_chunk_count,
             )
             .await
             {
                 Ok(bytes) => bytes,
                 Err(ReadResponseError::TooLarge) => {
+                    run.filtered.push(FilteredCandidate {
+                        value: endpoint.id.clone(),
+                        reason: FilterReason::ResponseTooLarge,
+                        source_name: endpoint.id.clone(),
+                    });
+                    return (SourceStatus::Failed, request_count);
+                }
+                Err(ReadResponseError::ChunkTooLarge | ReadResponseError::TooManyChunks) => {
+                    run.metrics.compression_limit_violation =
+                        Some("chunk resource limit exceeded".to_owned());
                     run.filtered.push(FilteredCandidate {
                         value: endpoint.id.clone(),
                         reason: FilterReason::ResponseTooLarge,
@@ -459,6 +530,7 @@ fn headers_for(
     run_id: Uuid,
     profile: &str,
     cursor: Option<&str>,
+    client_virtual_wait_ms: u64,
 ) -> Result<HeaderMap, ()> {
     let omitted = endpoint
         .omit_headers
@@ -476,6 +548,18 @@ fn headers_for(
     }
     values.insert("x-lab-run-id".to_owned(), run_id.to_string());
     values.insert("x-lab-data-profile".to_owned(), profile.to_owned());
+    values.insert(
+        "x-lab-client-virtual-wait-ms".to_owned(),
+        client_virtual_wait_ms.to_string(),
+    );
+    if scenario.network_profile.mode == NetworkMode::HttpProxy {
+        let capability = format!("cap-{run_id}");
+        values.insert(
+            "proxy-authorization".to_owned(),
+            format!("Lab {capability}"),
+        );
+        values.insert("x-lab-proxy-capability".to_owned(), capability);
+    }
     let mut headers = HeaderMap::new();
     for (name, value) in values {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?;
@@ -484,6 +568,54 @@ fn headers_for(
         headers.insert(name, value);
     }
     Ok(headers)
+}
+
+async fn connect_proxy_probe(
+    proxy_url: &str,
+    source_url: &Url,
+    run_id: Uuid,
+    scenario: &Scenario,
+) -> SourceStatus {
+    let Ok(proxy) = Url::parse(proxy_url) else {
+        return SourceStatus::Failed;
+    };
+    if proxy.scheme() != "http" || proxy.host_str() != Some("127.0.0.1") {
+        return SourceStatus::Blocked;
+    }
+    let Some(proxy_port) = proxy.port_or_known_default() else {
+        return SourceStatus::Failed;
+    };
+    let Some(target_port) = source_url.port_or_known_default() else {
+        return SourceStatus::Failed;
+    };
+    let mut stream = match TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, proxy_port)).await {
+        Ok(stream) => stream,
+        Err(_) => return SourceStatus::Failed,
+    };
+    let capability = format!("cap-{run_id}");
+    let request = format!(
+        "CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\nx-lab-run-id: {run_id}\r\nProxy-Authorization: Lab {capability}\r\nx-lab-proxy-capability: {capability}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return SourceStatus::Failed;
+    }
+    let mut response = [0_u8; 512];
+    let Ok(Ok(count)) = tokio::time::timeout(
+        std::time::Duration::from_millis(scenario.network_profile.virtual_timeout_ms.max(50)),
+        stream.read(&mut response),
+    )
+    .await
+    else {
+        return SourceStatus::TimedOut;
+    };
+    let response = String::from_utf8_lossy(&response[..count]);
+    if response.starts_with("HTTP/1.1 200") {
+        SourceStatus::Success
+    } else if response.starts_with("HTTP/1.1 407") || response.starts_with("HTTP/1.1 403") {
+        SourceStatus::AuthFailed
+    } else {
+        SourceStatus::Failed
+    }
 }
 
 fn materialize(value: &str, scenario: &Scenario, run_id: Uuid, cursor: Option<&str>) -> String {
@@ -559,6 +691,8 @@ fn parse_retry_after_ms(value: &str) -> u64 {
 
 enum ReadResponseError {
     TooLarge,
+    ChunkTooLarge,
+    TooManyChunks,
     TimedOut,
     Body,
 }
@@ -567,12 +701,22 @@ async fn read_limited_response(
     response: reqwest::Response,
     limit: usize,
     timeout_ms: u64,
+    max_chunk_bytes: usize,
+    max_chunk_count: usize,
 ) -> Result<Vec<u8>, ReadResponseError> {
     let read = async move {
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
+        let mut chunk_count = 0_usize;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| ReadResponseError::Body)?;
+            chunk_count = chunk_count.saturating_add(1);
+            if chunk.len() > max_chunk_bytes {
+                return Err(ReadResponseError::ChunkTooLarge);
+            }
+            if chunk_count > max_chunk_count {
+                return Err(ReadResponseError::TooManyChunks);
+            }
             if bytes.len().saturating_add(chunk.len()) > limit {
                 return Err(ReadResponseError::TooLarge);
             }
@@ -599,11 +743,25 @@ fn decode_response(
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("identity");
-    if !encoding.eq_ignore_ascii_case("gzip") {
+    if encoding.contains(',') {
+        return Err(DecodeResponseError::Invalid);
+    }
+    if encoding.eq_ignore_ascii_case("identity")
+        || encoding.eq_ignore_ascii_case("utf-8")
+        || encoding.eq_ignore_ascii_case("utf8")
+    {
         return Ok(wire.to_vec());
     }
     let started = Instant::now();
-    let mut decoder = GzDecoder::new(wire);
+    let mut decoder: Box<dyn Read> = if encoding.eq_ignore_ascii_case("gzip") {
+        Box::new(GzDecoder::new(wire))
+    } else if encoding.eq_ignore_ascii_case("deflate") {
+        Box::new(ZlibDecoder::new(wire))
+    } else if encoding.eq_ignore_ascii_case("br") {
+        Box::new(Decompressor::new(wire, 8 * 1024))
+    } else {
+        return Err(DecodeResponseError::Invalid);
+    };
     let mut decoded = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
     loop {

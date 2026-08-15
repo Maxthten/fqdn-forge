@@ -1,0 +1,16 @@
+id: 089-cache-observable-audit
+name: Observable cache audit
+description: A single equivalent request has one auditable source and quota decision; duplicates remain observable.
+version: "1.3.0"
+root_domain: target-89.acme.test
+seed: 89
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+endpoints:
+  - id: cache-source
+    source_kind: generic_json
+    quota: [{ scope: per_source, success_limit: 2, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 1000 }]
+    match: { method: GET, path: /v13/cache, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

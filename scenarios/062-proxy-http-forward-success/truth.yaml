@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-62.acme.test]
+expected_observations: { api.target-62.acme.test: { source_names: [proxy-source], source_kinds: [generic_json], record_ids: [proxy-62] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { proxy-source: success }

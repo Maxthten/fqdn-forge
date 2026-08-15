@@ -1,0 +1,16 @@
+id: 084-chunked-truncated
+name: Truncated chunked response
+description: A chunked body aborts before completion and emits no synthetic finding.
+version: "1.3.0"
+root_domain: target-84.acme.test
+seed: 84
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+runner: { max_wire_response_bytes: 65536, max_decoded_response_bytes: 65536, max_expansion_ratio: 32, max_decompression_time_ms: 1000, max_chunk_bytes: 65536, max_chunk_count: 8 }
+endpoints:
+  - id: truncated-source
+    source_kind: generic_json
+    match: { method: GET, path: /v13/chunked-truncated, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, transfer_mode: chunked, chunk_count: 2, truncated_body: true, body_file: fixtures/data.json }]

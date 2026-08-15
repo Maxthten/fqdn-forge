@@ -8,7 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{AuditRecord, CollectorSubmission, LoadedScenario, RunReport, ScenarioRepository};
+use crate::{
+    AuditRecord, CollectorSubmission, LoadedScenario, QuotaProfile, QuotaScope, RunReport,
+    ScenarioRepository,
+};
 
 #[derive(Clone, Debug)]
 pub struct LabState {
@@ -22,6 +25,7 @@ struct MutableLabState {
     unscoped_audit: Vec<RejectedRequestAudit>,
     developer_run_id: Option<String>,
     base_url: Option<String>,
+    proxy_url: Option<String>,
     submitted_payloads: BTreeMap<String, String>,
 }
 
@@ -37,6 +41,8 @@ pub struct RunSession {
     pub status: RunSessionStatus,
     #[serde(skip_serializing)]
     pub response_counts: BTreeMap<String, usize>,
+    #[serde(skip_serializing)]
+    pub quota_counts: BTreeMap<String, usize>,
     #[serde(skip_serializing)]
     pub audit: Vec<AuditRecord>,
     #[serde(skip_serializing)]
@@ -71,6 +77,18 @@ pub struct ResponseMetrics {
     pub decoded_bytes: usize,
     pub content_encoding: Option<String>,
     pub compression_limit_violation: Option<String>,
+    pub transfer_mode: Option<crate::TransferMode>,
+    pub chunk_count: usize,
+    pub transport_fault: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuotaDecision {
+    pub profile: QuotaProfile,
+    pub remaining_before: usize,
+    pub remaining_after: usize,
+    pub consumed: bool,
+    pub rate_limited: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +133,22 @@ impl LabState {
         self.inner.lock().expect("lab state lock poisoned").base_url = Some(base_url);
     }
 
+    pub fn set_proxy_url(&self, proxy_url: String) {
+        self.inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .proxy_url = Some(proxy_url);
+    }
+
+    #[must_use]
+    pub fn proxy_url(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .proxy_url
+            .clone()
+    }
+
     #[must_use]
     pub fn base_url(&self) -> Option<String> {
         self.inner
@@ -143,6 +177,7 @@ impl LabState {
             last_activity_at: now,
             status: RunSessionStatus::Active,
             response_counts: BTreeMap::new(),
+            quota_counts: BTreeMap::new(),
             audit: Vec::new(),
             latest_report: None,
             submission: None,
@@ -301,7 +336,73 @@ impl LabState {
         record.decoded_bytes = metrics.decoded_bytes;
         record.content_encoding = metrics.content_encoding;
         record.compression_limit_violation = metrics.compression_limit_violation;
+        record.transfer_mode = metrics.transfer_mode;
+        record.chunk_count = metrics.chunk_count;
+        record.transport_fault = metrics.transport_fault;
         Ok(())
+    }
+
+    /// Atomically evaluates all quota scopes configured for one source request.
+    /// A denied scope leaves every counter unchanged, so a rejected proxy or a
+    /// later quota scope can never accidentally consume an earlier budget.
+    pub fn evaluate_quota(
+        &self,
+        run_id: &str,
+        endpoint_id: &str,
+        profiles: &[QuotaProfile],
+        credential_identity: &str,
+        client_virtual_wait_ms: u64,
+    ) -> std::result::Result<Vec<QuotaDecision>, RunStateError> {
+        validate_run_id(run_id)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or(RunStateError::UnknownRun)?;
+        if !matches!(
+            run.status,
+            RunSessionStatus::Active | RunSessionStatus::Reset
+        ) {
+            return Err(RunStateError::RunNotAcceptingSourceRequests);
+        }
+        let mut decisions = Vec::with_capacity(profiles.len());
+        let mut permitted = true;
+        for profile in profiles {
+            let key = quota_key(profile.scope, endpoint_id, credential_identity);
+            let mut used = run.quota_counts.get(&key).copied().unwrap_or_default();
+            if used >= profile.success_limit
+                && profile
+                    .recover_after_virtual_ms
+                    .is_some_and(|minimum| client_virtual_wait_ms >= minimum)
+            {
+                used = 0;
+            }
+            let remaining_before = profile.success_limit.saturating_sub(used);
+            let rate_limited = used >= profile.success_limit;
+            permitted &= !rate_limited;
+            decisions.push(QuotaDecision {
+                profile: profile.clone(),
+                remaining_before,
+                remaining_after: remaining_before.saturating_sub(usize::from(!rate_limited)),
+                consumed: !rate_limited,
+                rate_limited,
+            });
+        }
+        if permitted {
+            for (profile, decision) in profiles.iter().zip(&decisions) {
+                let key = quota_key(profile.scope, endpoint_id, credential_identity);
+                let before = profile
+                    .success_limit
+                    .saturating_sub(decision.remaining_before);
+                run.quota_counts.insert(key, before.saturating_add(1));
+            }
+        } else {
+            for decision in &mut decisions {
+                decision.consumed = false;
+                decision.remaining_after = decision.remaining_before;
+            }
+        }
+        Ok(decisions)
     }
 
     pub fn audit(&self, run_id: &str) -> std::result::Result<Vec<AuditRecord>, RunStateError> {
@@ -322,6 +423,7 @@ impl LabState {
                 .and_then(|submission| serde_json::to_string(submission).ok());
             run.audit.clear();
             run.response_counts.clear();
+            run.quota_counts.clear();
             run.latest_report = None;
             run.submission = None;
             run.last_activity_at = Utc::now();
@@ -464,4 +566,12 @@ fn validate_run_id(run_id: &str) -> std::result::Result<(), RunStateError> {
     Uuid::parse_str(run_id)
         .map(|_| ())
         .map_err(|_| RunStateError::InvalidRunId)
+}
+
+fn quota_key(scope: QuotaScope, endpoint_id: &str, credential_identity: &str) -> String {
+    match scope {
+        QuotaScope::PerSource => format!("source:{endpoint_id}"),
+        QuotaScope::PerKey => format!("key:{endpoint_id}:{credential_identity}"),
+        QuotaScope::GlobalRun => "global".to_owned(),
+    }
 }

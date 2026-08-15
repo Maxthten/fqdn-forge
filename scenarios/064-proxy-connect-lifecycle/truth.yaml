@@ -1,0 +1,4 @@
+expected_fqdns: []
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { connect-fixture: success }

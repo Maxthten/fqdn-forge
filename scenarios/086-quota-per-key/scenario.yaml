@@ -1,0 +1,19 @@
+id: 086-quota-per-key
+name: Per-key quota exhaustion
+description: A synthetic credential identity gets an isolated bounded request allowance.
+version: "1.3.0"
+root_domain: target-86.acme.test
+seed: 86
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+runner: { max_retries: 3, retry_after_cap_ms: 5000 }
+endpoints:
+  - id: key-budget
+    source_kind: key_api
+    allow_retry: true
+    quota: [{ scope: per_key, success_limit: 1, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 1000 }]
+    match: { method: GET, path: /v13/quota-key, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true }, x-api-key: { equals: lab-key-86 } } }
+    request_headers: { x-api-key: lab-key-86 }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 429, virtual_wait_ms: 1000, retry_after: "1", body_file: fixtures/data.json }]

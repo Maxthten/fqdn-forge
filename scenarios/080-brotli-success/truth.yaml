@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-80.acme.test]
+expected_observations: { api.target-80.acme.test: { source_names: [brotli-source], source_kinds: [generic_json], record_ids: [brotli-80] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { brotli-source: success }

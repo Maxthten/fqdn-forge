@@ -1,0 +1,16 @@
+id: 090-quota-concurrent-atomicity
+name: Concurrent quota atomicity
+description: A one-request local quota is safe for independent concurrent black-box requests.
+version: "1.3.0"
+root_domain: target-90.acme.test
+seed: 90
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+endpoints:
+  - id: atomic-source
+    source_kind: generic_json
+    quota: [{ scope: global_run, success_limit: 1, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 1000 }]
+    match: { method: GET, path: /v13/atomic, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

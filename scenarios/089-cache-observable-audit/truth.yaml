@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-89.acme.test]
+expected_observations: { api.target-89.acme.test: { source_names: [cache-source], source_kinds: [generic_json], record_ids: [cache-89] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { cache-source: success }

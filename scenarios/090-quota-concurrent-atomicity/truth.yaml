@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-90.acme.test]
+expected_observations: { api.target-90.acme.test: { source_names: [atomic-source], source_kinds: [generic_json], record_ids: [atomic-90] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { atomic-source: success }

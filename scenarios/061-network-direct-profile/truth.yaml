@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-61.acme.test]
+expected_observations: { api.target-61.acme.test: { source_names: [direct-source], source_kinds: [generic_json], record_ids: [direct-61] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { direct-source: success }

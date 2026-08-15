@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-79.acme.test]
+expected_observations: { api.target-79.acme.test: { source_names: [deflate-source], source_kinds: [generic_json], record_ids: [deflate-79] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { deflate-source: success }

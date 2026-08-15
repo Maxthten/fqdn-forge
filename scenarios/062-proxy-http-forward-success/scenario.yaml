@@ -1,0 +1,16 @@
+id: 062-proxy-http-forward-success
+name: Forward proxy success
+description: Absolute-form HTTP traffic must traverse the run-local forward proxy.
+version: "1.3.0"
+root_domain: target-62.acme.test
+seed: 62
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+network_profile: { mode: http_proxy, proxy_must_be_used: true, max_connections: 4, virtual_timeout_ms: 250 }
+endpoints:
+  - id: proxy-source
+    source_kind: generic_json
+    match: { method: GET, path: /v13/proxy, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

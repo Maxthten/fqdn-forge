@@ -1,0 +1,11 @@
+expected_requests: 2
+expected_unmatched_requests: 0
+endpoint_requests: { recovery-source: 2 }
+required_paths: [/v13/quota-recovery]
+forbidden_paths: [/api/runs, /truth]
+request_sequence: [{ endpoint: recovery-source, response_index: 0 }, { endpoint: recovery-source, response_index: 1 }]
+expected_proxy_requests: 0
+expected_quota_decisions: 2
+require_proxy: false
+timing: { min_virtual_wait_ms: 1000 }
+required_transfer_mode: content_length

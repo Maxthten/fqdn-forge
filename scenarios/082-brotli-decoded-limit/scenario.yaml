@@ -1,0 +1,16 @@
+id: 082-brotli-decoded-limit
+name: Brotli decoded limit
+description: A local Brotli response exceeds the declared decoded byte ceiling.
+version: "1.3.0"
+root_domain: target-82.acme.test
+seed: 82
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+runner: { max_wire_response_bytes: 65536, max_decoded_response_bytes: 20, max_expansion_ratio: 32, max_decompression_time_ms: 1000, max_chunk_bytes: 65536, max_chunk_count: 8 }
+endpoints:
+  - id: limit-source
+    source_kind: generic_json
+    match: { method: GET, path: /v13/brotli-limit, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, encoding: br, body_file: fixtures/data.json }]

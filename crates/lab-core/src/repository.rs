@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 
-use crate::{Assertions, PaginationMode, Scenario, SourceKind, Truth, normalize_domain};
+use crate::{
+    Assertions, NetworkMode, PaginationMode, ProxyFault, Scenario, SourceKind, Truth,
+    normalize_domain,
+};
 
 #[derive(Clone, Debug)]
 pub struct LoadedScenario {
@@ -94,23 +97,37 @@ impl ScenarioRepository {
 
     #[must_use]
     pub fn validate(&self) -> Vec<ValidationIssue> {
-        self.scenarios.iter().flat_map(validate_loaded).collect()
+        let mut issues = self
+            .scenarios
+            .iter()
+            .flat_map(validate_loaded)
+            .collect::<Vec<_>>();
+        if self.scenarios.len() != 90 {
+            issues.push(issue_at(
+                "repository",
+                "scenarios",
+                "count",
+                format!("V1.3 requires exactly 90 scenarios; found {}", self.scenarios.len()),
+                "add the 061-066 and 079-090 V1.3 scenario directories without removing baseline scenarios",
+            ));
+        }
+        issues
     }
 }
 
 fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
     let id = &loaded.scenario.id;
     let mut issues = Vec::new();
-    if !matches!(loaded.scenario.version.as_str(), "1.2" | "1.2.1") {
+    if !matches!(loaded.scenario.version.as_str(), "1.2" | "1.2.1" | "1.3.0") {
         issues.push(issue_at(
             id,
             "scenario.yaml",
             "version",
             format!(
-                "scenario version {} is unsupported for the V1.2.1 repository",
+                "scenario version {} is unsupported for the V1.3 repository",
                 loaded.scenario.version
             ),
-            "set version to 1.2 or 1.2.1",
+            "set version to 1.2, 1.2.1 or 1.3.0",
         ));
     }
     let limits = &loaded.scenario.submission;
@@ -134,13 +151,36 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
         || loaded.scenario.runner.max_decoded_response_bytes == 0
         || loaded.scenario.runner.max_expansion_ratio < 1
         || loaded.scenario.runner.max_decompression_time_ms == 0
+        || loaded.scenario.runner.max_chunk_bytes == 0
+        || loaded.scenario.runner.max_chunk_count == 0
     {
         issues.push(issue_at(
             id,
             "scenario.yaml",
             "runner",
-            "compression limits must be positive and expansion ratio must be at least one",
-            "set finite wire, decoded, ratio and decompression-time limits",
+            "compression and chunk limits must be positive and expansion ratio must be at least one",
+            "set finite wire, decoded, chunk, ratio and decompression-time limits",
+        ));
+    }
+    let network = &loaded.scenario.network_profile;
+    if network.max_connections == 0 || network.virtual_timeout_ms == 0 {
+        issues.push(issue_at(
+            id,
+            "scenario.yaml",
+            "network_profile",
+            "proxy connection and virtual timeout limits must be positive",
+            "set finite max_connections and virtual_timeout_ms values",
+        ));
+    }
+    if network.mode == NetworkMode::Direct
+        && (network.proxy_must_be_used || network.fault != ProxyFault::None)
+    {
+        issues.push(issue_at(
+            id,
+            "scenario.yaml",
+            "network_profile",
+            "direct profile cannot require or fault a proxy",
+            "use http_proxy/connect_proxy for proxy behavior or remove proxy fields",
         ));
     }
     let target_domain = loaded
@@ -157,6 +197,23 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
     for endpoint in &loaded.scenario.endpoints {
         if !endpoint_ids.insert(&endpoint.id) {
             issues.push(issue(id, format!("duplicate endpoint id {}", endpoint.id)));
+        }
+        for quota in &endpoint.quota {
+            if quota.success_limit == 0
+                || quota.retry_after_ms == 0
+                || !(400..=599).contains(&quota.exhausted_status)
+            {
+                issues.push(issue_at(
+                    id,
+                    "scenario.yaml",
+                    "endpoints.quota",
+                    format!(
+                        "endpoint {} has invalid bounded quota configuration",
+                        endpoint.id
+                    ),
+                    "set a positive limit/retry time and an HTTP error status",
+                ));
+            }
         }
         if endpoint.request_match.path.is_empty() || !endpoint.request_match.path.starts_with('/') {
             issues.push(issue(
@@ -251,13 +308,13 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
             if let Some(encoding) = &reply.encoding
                 && !matches!(
                     encoding.to_ascii_lowercase().as_str(),
-                    "identity" | "utf-8" | "utf8" | "gzip"
+                    "identity" | "utf-8" | "utf8" | "gzip" | "deflate" | "br"
                 )
             {
                 issues.push(issue(
                     id,
                     format!(
-                        "endpoint {} reply encoding {encoding} is unsupported; use identity, utf-8 or gzip",
+                        "endpoint {} reply encoding {encoding} is unsupported; use identity, gzip, deflate or br",
                         endpoint.id
                     ),
                 ));
@@ -271,21 +328,38 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
                     ),
                 ));
             }
-            if (reply.gzip_corrupt || reply.gzip_truncated)
-                && !reply
-                    .encoding
-                    .as_deref()
-                    .is_some_and(|encoding| encoding.eq_ignore_ascii_case("gzip"))
+            if (reply.gzip_corrupt
+                || reply.gzip_truncated
+                || reply.encoding_corrupt
+                || reply.encoding_truncated)
+                && !reply.encoding.as_deref().is_some_and(|encoding| {
+                    matches!(
+                        encoding.to_ascii_lowercase().as_str(),
+                        "gzip" | "deflate" | "br"
+                    )
+                })
             {
                 issues.push(issue_at(
                     id,
                     "scenario.yaml",
                     "endpoints.replies.gzip",
                     format!(
-                        "endpoint {} uses a gzip fault without Content-Encoding gzip",
+                        "endpoint {} uses an encoding fault without a supported Content-Encoding",
                         endpoint.id
                     ),
-                    "set encoding to gzip or remove the gzip fault",
+                    "set encoding to gzip, deflate or br or remove the encoding fault",
+                ));
+            }
+            if reply.transfer_mode == crate::TransferMode::Chunked && reply.chunk_count == 0 {
+                issues.push(issue_at(
+                    id,
+                    "scenario.yaml",
+                    "endpoints.replies.chunk_count",
+                    format!(
+                        "endpoint {} chunked reply needs at least one chunk",
+                        endpoint.id
+                    ),
+                    "set chunk_count to a positive bounded value",
                 ));
             }
             if reply.virtual_wait_ms > loaded.scenario.runner.retry_after_cap_ms {
@@ -507,6 +581,48 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
                 "endpoints",
                 "external contract scenarios need at least one manifest source",
                 "add a local source endpoint",
+            ));
+        }
+    }
+    if let Some(number) = id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        && ((61..=66).contains(&number) || (79..=90).contains(&number))
+    {
+        if loaded.scenario.version != "1.3.0" {
+            issues.push(issue_at(
+                id,
+                "scenario.yaml",
+                "version",
+                "V1.3 network, quota and transport scenarios must use version 1.3.0",
+                "set version to 1.3.0",
+            ));
+        }
+        let assertion_count = 1
+            + usize::from(loaded.assertions.expected_unmatched_requests > 0)
+            + loaded.assertions.endpoint_requests.len()
+            + loaded.assertions.required_paths.len()
+            + loaded.assertions.forbidden_paths.len()
+            + loaded.assertions.request_sequence.len()
+            + usize::from(loaded.assertions.timing.min_virtual_wait_ms.is_some())
+            + usize::from(loaded.assertions.timing.max_virtual_wait_ms.is_some())
+            + usize::from(loaded.assertions.expected_rejected_egress_attempts > 0)
+            + usize::from(loaded.assertions.expected_proxy_requests.is_some())
+            + usize::from(loaded.assertions.expected_quota_decisions.is_some())
+            + usize::from(loaded.assertions.require_proxy.is_some())
+            + usize::from(loaded.assertions.forbid_direct_source)
+            + usize::from(loaded.assertions.require_quota_rate_limited)
+            + usize::from(loaded.assertions.required_content_encoding.is_some())
+            + usize::from(loaded.assertions.required_transfer_mode.is_some())
+            + usize::from(loaded.assertions.required_transport_fault.is_some());
+        if assertion_count < 8 {
+            issues.push(issue_at(
+                id,
+                "assertions.yaml",
+                "assertions",
+                "each V1.3 scenario needs at least eight observable assertions",
+                "add source, proxy, quota, transport, wait, egress or request assertions",
             ));
         }
     }

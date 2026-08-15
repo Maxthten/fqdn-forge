@@ -1,0 +1,16 @@
+id: 064-proxy-connect-lifecycle
+name: CONNECT lifecycle
+description: A numeric loopback CONNECT negotiation is accepted by the local proxy.
+version: "1.3.0"
+root_domain: target-64.acme.test
+seed: 64
+include_root: false
+allow_duplicates: false
+allow_concurrent: true
+network_profile: { mode: connect_proxy, proxy_must_be_used: true, max_connections: 2, virtual_timeout_ms: 250, tunnel_close_after_bytes: 4096 }
+endpoints:
+  - id: connect-fixture
+    source_kind: generic_json
+    match: { method: GET, path: /v13/connect, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    hash::{Hash, Hasher},
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -16,27 +17,41 @@ use axum::{
     response::Response,
     routing::any,
 };
+use brotli::CompressorWriter;
 use chrono::Utc;
-use flate2::{Compression, write::GzEncoder};
+use flate2::{
+    Compression,
+    write::{GzEncoder, ZlibEncoder},
+};
 use futures_util::stream;
 use lab_core::{
-    AuditRecord, CollectorRun, CollectorSubmission, Endpoint, GeneratorKind, LabState,
-    LoadedScenario, ManifestNetwork, ManifestSource, ManifestSubmission, Reply, ResponseMetrics,
-    RunManifest, RunReport, RunSession, RunStateError, Scenario, ScenarioRepository, SourceStatus,
-    SubmissionLimits, SubmissionReport, ValueRule, accept_candidate, judge_run,
-    refresh_semantic_fingerprint,
+    AuditEventType, AuditRecord, CollectorRun, CollectorSubmission, Endpoint, FilterReason,
+    FilteredCandidate, GeneratorKind, LabState, LoadedScenario, ManifestNetwork,
+    ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource, ManifestSubmission,
+    ManifestTransportProfile, NetworkMode, NetworkProfile, ProxyAuthenticationState, ProxyFault,
+    QuotaProfile, Reply, ResponseMetrics, RetryAfterMode, RunManifest, RunReport, RunSession,
+    RunStateError, Scenario, ScenarioRepository, SourceStatus, SubmissionLimits, SubmissionReport,
+    TransferMode, ValueRule, accept_candidate, judge_run, refresh_semantic_fingerprint,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+    task::JoinHandle,
+};
 use url::Url;
 use uuid::Uuid;
 
 pub struct LocalServer {
     address: SocketAddr,
+    proxy_address: SocketAddr,
     state: LabState,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+    proxy_shutdown: Option<oneshot::Sender<()>>,
+    proxy_task: Option<JoinHandle<()>>,
 }
 
 impl LocalServer {
@@ -62,6 +77,16 @@ impl LocalServer {
         }
         let state = LabState::new(repository);
         state.set_base_url(format!("http://127.0.0.1:{}", address.port()));
+        let proxy_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .map_err(|error| error.to_string())?;
+        let proxy_address = proxy_listener
+            .local_addr()
+            .map_err(|error| error.to_string())?;
+        if proxy_address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            return Err("refusing non-loopback proxy listener".to_owned());
+        }
+        state.set_proxy_url(format!("http://127.0.0.1:{}", proxy_address.port()));
         if let Some(id) = active {
             state.activate(id).map_err(|error| error.to_string())?;
         }
@@ -76,17 +101,30 @@ impl LocalServer {
                 })
                 .await;
         });
+        let (proxy_shutdown, proxy_receiver) = oneshot::channel();
+        let proxy_state = state.clone();
+        let proxy_task = tokio::spawn(async move {
+            proxy_loop(proxy_listener, proxy_state, proxy_receiver).await;
+        });
         Ok(Self {
             address,
+            proxy_address,
             state,
             shutdown: Some(shutdown),
             task: Some(task),
+            proxy_shutdown: Some(proxy_shutdown),
+            proxy_task: Some(proxy_task),
         })
     }
 
     #[must_use]
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.address.port())
+    }
+
+    #[must_use]
+    pub fn proxy_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.proxy_address.port())
     }
 
     pub fn activate(&self, id: &str) -> Result<(), String> {
@@ -118,7 +156,13 @@ impl LocalServer {
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
+        if let Some(sender) = self.proxy_shutdown.take() {
+            let _ = sender.send(());
+        }
         if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.proxy_task.take() {
             let _ = task.await;
         }
     }
@@ -129,7 +173,660 @@ impl Drop for LocalServer {
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
+        if let Some(sender) = self.proxy_shutdown.take() {
+            let _ = sender.send(());
+        }
     }
+}
+
+const MAX_PROXY_HEADER_BYTES: usize = 32 * 1024;
+const MAX_PROXY_BODY_BYTES: usize = 1024 * 1024;
+const MAX_PROXY_TUNNEL_BYTES: usize = 64 * 1024;
+
+struct RawProxyRequest {
+    method: String,
+    target: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+async fn proxy_loop(listener: TcpListener, state: LabState, mut shutdown: oneshot::Receiver<()>) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, address)) if address.ip().is_loopback() => {
+                    let state = state.clone();
+                    tokio::spawn(async move { handle_proxy_connection(stream, state).await; });
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
+    let request = match read_proxy_request(&mut client).await {
+        Ok(request) => request,
+        Err(reason) => {
+            let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
+            state.record_unscoped_request("PROXY", "/", &reason);
+            return;
+        }
+    };
+    let headers = proxy_header_map(&request.headers);
+    let Some(run_id) = headers.get("x-lab-run-id").map(String::as_str) else {
+        state.record_unscoped_request(&request.method, &request.target, "missing x-lab-run-id");
+        let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
+        return;
+    };
+    let loaded = match state.loaded_for_run(run_id) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            state.record_unscoped_request(&request.method, &request.target, "unknown proxy run");
+            let _ = write_proxy_response(&mut client, 404, "Not Found", None).await;
+            return;
+        }
+    };
+    let profile = loaded.scenario.network_profile.clone();
+    let auth = proxy_authentication_state(&headers, run_id);
+    let is_connect = request.method.eq_ignore_ascii_case("CONNECT");
+    let correlation_id = Uuid::new_v4().to_string();
+    let mut audit = proxy_audit_record(ProxyAuditContext {
+        run_id,
+        scenario: &loaded.scenario,
+        method: &request.method,
+        target: &request.target,
+        profile: &profile,
+        authentication: auth,
+        response_status: 0,
+        reason: None,
+        blocked: false,
+        correlation_id: correlation_id.clone(),
+    });
+    if profile.mode == NetworkMode::Direct
+        || (profile.mode == NetworkMode::HttpProxy && is_connect)
+        || (profile.mode == NetworkMode::ConnectProxy && !is_connect)
+    {
+        audit.response_status = 403;
+        audit.blocked = true;
+        audit.proxy_reason = Some("profile_mismatch".to_owned());
+        let _ = state.record_request(run_id, audit);
+        let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+        return;
+    }
+    if auth != ProxyAuthenticationState::Valid {
+        audit.response_status = 407;
+        audit.proxy_reason = Some("proxy_authentication_required".to_owned());
+        let _ = state.record_request(run_id, audit);
+        let _ = write_proxy_response(
+            &mut client,
+            407,
+            "Proxy Authentication Required",
+            Some("Proxy-Authenticate: Lab\r\n"),
+        )
+        .await;
+        return;
+    }
+    if matches!(profile.fault, ProxyFault::ConnectionRefused) {
+        audit.response_status = 502;
+        audit.proxy_reason = Some("connection_refused".to_owned());
+        let _ = state.record_request(run_id, audit);
+        let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+        return;
+    }
+    if matches!(profile.fault, ProxyFault::ConnectTimeout) {
+        audit.response_status = 504;
+        audit.proxy_reason = Some("connect_timeout".to_owned());
+        let _ = state.record_request(run_id, audit);
+        tokio::time::sleep(Duration::from_millis(profile.virtual_timeout_ms.min(50))).await;
+        let _ = write_proxy_response(&mut client, 504, "Gateway Timeout", None).await;
+        return;
+    }
+    if matches!(profile.fault, ProxyFault::ResetBeforeResponse) {
+        audit.proxy_reason = Some("reset_before_response".to_owned());
+        let _ = state.record_request(run_id, audit);
+        return;
+    }
+    if matches!(profile.fault, ProxyFault::ResetAfterHeaders) {
+        audit.response_status = 502;
+        audit.proxy_reason = Some("reset_after_headers".to_owned());
+        let _ = state.record_request(run_id, audit);
+        let _ = client
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\n")
+            .await;
+        return;
+    }
+    if is_connect {
+        proxy_connect(
+            client,
+            state,
+            run_id,
+            &loaded.scenario,
+            profile,
+            request,
+            audit,
+        )
+        .await;
+    } else {
+        proxy_forward(
+            client,
+            state,
+            run_id,
+            &loaded.scenario,
+            profile,
+            request,
+            audit,
+        )
+        .await;
+    }
+}
+
+async fn proxy_forward(
+    mut client: TcpStream,
+    state: LabState,
+    run_id: &str,
+    scenario: &Scenario,
+    profile: NetworkProfile,
+    request: RawProxyRequest,
+    mut audit: AuditRecord,
+) {
+    let target = match allowed_forward_proxy_target(&state, run_id, scenario, &request) {
+        Ok(target) => target,
+        Err(reason) => {
+            audit.response_status = 403;
+            audit.blocked = true;
+            audit.external_target_rejected = true;
+            audit.proxy_reason = Some(reason);
+            let _ = state.record_request(run_id, audit);
+            let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+            return;
+        }
+    };
+    audit.endpoint_id = scenario
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.request_match.path == target.path())
+        .map(|endpoint| endpoint.id.clone());
+    if matches!(profile.fault, ProxyFault::EgressDenied) {
+        // The target has already passed the numeric-loopback allowlist, so
+        // this is a scenario-selected local proxy fault rather than a client
+        // egress attempt. It must not reach the source endpoint.
+        audit.response_status = 403;
+        audit.blocked = true;
+        audit.proxy_reason = Some("egress_denied".to_owned());
+        let _ = state.record_request(run_id, audit);
+        let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+        return;
+    }
+    audit.response_status = 200;
+    audit.proxy_reason = Some("forwarded".to_owned());
+    let correlation = audit.correlation_id.clone().unwrap_or_default();
+    let _ = state.record_request(run_id, audit);
+    let source_port = target.port_or_known_default().unwrap_or_default();
+    let mut source = match tokio::time::timeout(
+        Duration::from_millis(profile.virtual_timeout_ms),
+        TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        _ => {
+            let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+            return;
+        }
+    };
+    let mut path = target.path().to_owned();
+    if let Some(query) = target.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let mut forwarded = format!("{} {} HTTP/1.1\r\n", request.method, path);
+    let mut wrote_host = false;
+    for (name, value) in &request.headers {
+        let normalized = name.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "proxy-authorization" | "x-lab-proxy-capability"
+        ) {
+            continue;
+        }
+        if normalized == "host" {
+            wrote_host = true;
+            forwarded.push_str(&format!("Host: 127.0.0.1:{source_port}\r\n"));
+        } else {
+            forwarded.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    if !wrote_host {
+        forwarded.push_str(&format!("Host: 127.0.0.1:{source_port}\r\n"));
+    }
+    forwarded.push_str(&format!(
+        "x-lab-proxy-correlation: {correlation}\r\nConnection: close\r\n\r\n"
+    ));
+    if source.write_all(forwarded.as_bytes()).await.is_err()
+        || source.write_all(&request.body).await.is_err()
+    {
+        return;
+    }
+    let mut response = Vec::new();
+    let result = tokio::time::timeout(
+        Duration::from_millis(profile.virtual_timeout_ms.max(50)),
+        source.read_to_end(&mut response),
+    )
+    .await;
+    if !matches!(result, Ok(Ok(_))) || response.len() > MAX_PROXY_TUNNEL_BYTES.saturating_mul(16) {
+        let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+        return;
+    }
+    let _ = client.write_all(&response).await;
+}
+
+async fn proxy_connect(
+    mut client: TcpStream,
+    state: LabState,
+    run_id: &str,
+    scenario: &Scenario,
+    profile: NetworkProfile,
+    request: RawProxyRequest,
+    mut audit: AuditRecord,
+) {
+    let port = match allowed_connect_proxy_target(&state, run_id, scenario, &request.target) {
+        Ok(port) => port,
+        Err(reason) => {
+            audit.response_status = 403;
+            audit.blocked = true;
+            audit.external_target_rejected = true;
+            audit.proxy_reason = Some(reason);
+            let _ = state.record_request(run_id, audit);
+            let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+            return;
+        }
+    };
+    audit.response_status = 200;
+    audit.proxy_reason = Some("connect_established".to_owned());
+    let _ = state.record_request(run_id, audit);
+    let mut target = match TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
+        Ok(target) => target,
+        Err(_) => {
+            let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+            return;
+        }
+    };
+    if client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if matches!(profile.fault, ProxyFault::TunnelCloseAfterBytes) {
+        return;
+    }
+    let limit = profile
+        .tunnel_close_after_bytes
+        .unwrap_or(MAX_PROXY_TUNNEL_BYTES)
+        .min(MAX_PROXY_TUNNEL_BYTES);
+    let mut inbound = vec![0_u8; limit.max(1)];
+    let Ok(Ok(read)) = tokio::time::timeout(
+        Duration::from_millis(profile.virtual_timeout_ms.max(50)),
+        client.read(&mut inbound),
+    )
+    .await
+    else {
+        return;
+    };
+    if read == 0 || target.write_all(&inbound[..read]).await.is_err() {
+        return;
+    }
+    let mut outbound = vec![0_u8; limit.max(1)];
+    if let Ok(Ok(written)) = tokio::time::timeout(
+        Duration::from_millis(profile.virtual_timeout_ms.max(50)),
+        target.read(&mut outbound),
+    )
+    .await
+    {
+        let _ = client.write_all(&outbound[..written]).await;
+    }
+}
+
+fn allowed_forward_proxy_target(
+    state: &LabState,
+    run_id: &str,
+    scenario: &Scenario,
+    request: &RawProxyRequest,
+) -> Result<Url, String> {
+    let target = Url::parse(&request.target).map_err(|_| "invalid_absolute_form".to_owned())?;
+    let source = state
+        .base_url()
+        .ok_or_else(|| "source_unavailable".to_owned())?;
+    let source = Url::parse(&source).map_err(|_| "source_unavailable".to_owned())?;
+    if target.scheme() != "http"
+        || target.host_str() != Some("127.0.0.1")
+        || target.port_or_known_default() != source.port_or_known_default()
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        return Err("egress_denied".to_owned());
+    }
+    if !scenario.endpoints.iter().any(|endpoint| {
+        endpoint.request_match.path == target.path()
+            && endpoint
+                .request_match
+                .method
+                .as_str()
+                .eq_ignore_ascii_case(&request.method)
+    }) {
+        return Err("unregistered_target".to_owned());
+    }
+    if request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-lab-run-id"))
+        .is_none_or(|(_, value)| value != run_id)
+    {
+        return Err("cross_run_or_missing_run_id".to_owned());
+    }
+    Ok(target)
+}
+
+fn allowed_connect_proxy_target(
+    state: &LabState,
+    _run_id: &str,
+    _scenario: &Scenario,
+    authority: &str,
+) -> Result<u16, String> {
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "invalid_connect_authority".to_owned())?;
+    if host != "127.0.0.1" || port.contains(':') {
+        return Err("egress_denied".to_owned());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "invalid_connect_authority".to_owned())?;
+    let source = state
+        .base_url()
+        .ok_or_else(|| "source_unavailable".to_owned())?;
+    let source = Url::parse(&source).map_err(|_| "source_unavailable".to_owned())?;
+    if source.port_or_known_default() != Some(port) {
+        return Err("unregistered_target".to_owned());
+    }
+    Ok(port)
+}
+
+fn proxy_header_map(headers: &[(String, String)]) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect()
+}
+
+fn proxy_authentication_state(
+    headers: &BTreeMap<String, String>,
+    run_id: &str,
+) -> ProxyAuthenticationState {
+    let Some(value) = headers.get("proxy-authorization") else {
+        return ProxyAuthenticationState::Missing;
+    };
+    if !value.starts_with("Lab ") {
+        return ProxyAuthenticationState::WrongScheme;
+    }
+    let expected = proxy_authorization_value(run_id);
+    let capability = proxy_capability_value(run_id);
+    if value == &expected && headers.get("x-lab-proxy-capability") == Some(&capability) {
+        ProxyAuthenticationState::Valid
+    } else {
+        ProxyAuthenticationState::Invalid
+    }
+}
+
+fn proxy_capability_value(run_id: &str) -> String {
+    format!("cap-{run_id}")
+}
+
+fn proxy_authorization_value(run_id: &str) -> String {
+    format!("Lab {}", proxy_capability_value(run_id))
+}
+
+struct ProxyAuditContext<'a> {
+    run_id: &'a str,
+    scenario: &'a Scenario,
+    method: &'a str,
+    target: &'a str,
+    profile: &'a NetworkProfile,
+    authentication: ProxyAuthenticationState,
+    response_status: u16,
+    reason: Option<String>,
+    blocked: bool,
+    correlation_id: String,
+}
+
+fn proxy_audit_record(context: ProxyAuditContext<'_>) -> AuditRecord {
+    let ProxyAuditContext {
+        run_id,
+        scenario,
+        method,
+        target,
+        profile,
+        authentication,
+        response_status,
+        reason,
+        blocked,
+        correlation_id,
+    } = context;
+    AuditRecord {
+        sequence: 0,
+        run_id: Some(run_id.to_owned()),
+        scenario_id: scenario.id.clone(),
+        timestamp: Utc::now(),
+        method: method.to_owned(),
+        path: "<proxy>".to_owned(),
+        query: BTreeMap::new(),
+        headers: BTreeMap::new(),
+        redacted_headers: BTreeMap::new(),
+        body: None,
+        body_summary: None,
+        endpoint_id: None,
+        response_index: None,
+        response_sequence: None,
+        response_status,
+        before_submission: false,
+        virtual_wait_ms: 0,
+        retry_after: None,
+        consumed: false,
+        blocked,
+        external_target_rejected: blocked,
+        matched: !blocked,
+        extra: blocked,
+        mismatch_reasons: reason.clone().into_iter().collect(),
+        wire_bytes: 0,
+        decoded_bytes: 0,
+        content_encoding: None,
+        compression_limit_violation: None,
+        event_type: AuditEventType::ProxyRequest,
+        proxy_mode: Some(profile.mode),
+        proxy_target: Some(target.to_owned()),
+        proxy_authentication: authentication,
+        proxy_reason: reason,
+        correlation_id: Some(correlation_id),
+        quota_scope: None,
+        quota_remaining_before: None,
+        quota_remaining_after: None,
+        quota_consumed: false,
+        quota_rate_limited: false,
+        quota_recovery_virtual_wait_ms: None,
+        transfer_mode: None,
+        chunk_count: 0,
+        transport_fault: None,
+    }
+}
+
+fn quota_credential_identity(headers: &HeaderMap) -> String {
+    let value = ["x-api-key", "authorization", "x-lab-credential"]
+        .iter()
+        .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+        .unwrap_or("<none>");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("credential-{:016x}", hasher.finish())
+}
+
+fn quota_retry_after(profile: &QuotaProfile) -> String {
+    match profile.retry_after_mode {
+        RetryAfterMode::Seconds => profile.retry_after_ms.div_ceil(1_000).to_string(),
+        // Fixed synthetic time keeps reports/replays deterministic; clients get
+        // the exact virtual duration separately in x-lab-virtual-wait-ms.
+        RetryAfterMode::HttpDate => "Sat, 15 Aug 2026 00:00:01 GMT".to_owned(),
+    }
+}
+
+fn quota_audit_record(
+    run_id: &str,
+    scenario: &Scenario,
+    endpoint_id: &str,
+    decision: &lab_core::QuotaDecision,
+    _credential_identity: &str,
+) -> AuditRecord {
+    AuditRecord {
+        sequence: 0,
+        run_id: Some(run_id.to_owned()),
+        scenario_id: scenario.id.clone(),
+        timestamp: Utc::now(),
+        method: "QUOTA".to_owned(),
+        path: format!("<quota:{endpoint_id}>"),
+        query: BTreeMap::new(),
+        headers: BTreeMap::new(),
+        redacted_headers: BTreeMap::new(),
+        body: None,
+        body_summary: None,
+        endpoint_id: Some(endpoint_id.to_owned()),
+        response_index: None,
+        response_sequence: None,
+        response_status: if decision.rate_limited {
+            decision.profile.exhausted_status
+        } else {
+            200
+        },
+        before_submission: false,
+        virtual_wait_ms: decision.profile.retry_after_ms,
+        retry_after: decision
+            .rate_limited
+            .then(|| quota_retry_after(&decision.profile)),
+        consumed: decision.consumed,
+        blocked: false,
+        external_target_rejected: false,
+        matched: true,
+        extra: false,
+        mismatch_reasons: Vec::new(),
+        wire_bytes: 0,
+        decoded_bytes: 0,
+        content_encoding: None,
+        compression_limit_violation: None,
+        event_type: AuditEventType::QuotaDecision,
+        proxy_mode: None,
+        proxy_target: None,
+        proxy_authentication: ProxyAuthenticationState::NotApplicable,
+        proxy_reason: None,
+        correlation_id: None,
+        quota_scope: Some(decision.profile.scope),
+        quota_remaining_before: Some(decision.remaining_before),
+        quota_remaining_after: Some(decision.remaining_after),
+        quota_consumed: decision.consumed,
+        quota_rate_limited: decision.rate_limited,
+        quota_recovery_virtual_wait_ms: decision.profile.recover_after_virtual_ms,
+        transfer_mode: None,
+        chunk_count: 0,
+        transport_fault: None,
+    }
+}
+
+async fn read_proxy_request(stream: &mut TcpStream) -> Result<RawProxyRequest, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    let header_end = loop {
+        if bytes.len() > MAX_PROXY_HEADER_BYTES {
+            return Err("proxy_header_too_large".to_owned());
+        }
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        let count = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|_| "proxy_read_failed".to_owned())?;
+        if count == 0 {
+            return Err("proxy_request_incomplete".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    };
+    let head = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|_| "proxy_header_not_utf8".to_owned())?;
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "proxy_missing_request_line".to_owned())?;
+    let mut request_line = request_line.split_whitespace();
+    let method = request_line
+        .next()
+        .ok_or_else(|| "proxy_missing_method".to_owned())?
+        .to_owned();
+    let target = request_line
+        .next()
+        .ok_or_else(|| "proxy_missing_target".to_owned())?
+        .to_owned();
+    if request_line.next().is_none() {
+        return Err("proxy_missing_version".to_owned());
+    }
+    let mut headers = Vec::new();
+    let mut content_length = 0_usize;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "proxy_malformed_header".to_owned())?;
+        let value = value.trim().to_owned();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value
+                .parse::<usize>()
+                .map_err(|_| "proxy_invalid_content_length".to_owned())?;
+        }
+        headers.push((name.to_owned(), value));
+    }
+    if content_length > MAX_PROXY_BODY_BYTES {
+        return Err("proxy_body_too_large".to_owned());
+    }
+    while bytes.len().saturating_sub(header_end) < content_length {
+        let count = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|_| "proxy_body_read_failed".to_owned())?;
+        if count == 0 {
+            return Err("proxy_body_incomplete".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len().saturating_sub(header_end) > MAX_PROXY_BODY_BYTES {
+            return Err("proxy_body_too_large".to_owned());
+        }
+    }
+    Ok(RawProxyRequest {
+        method,
+        target,
+        headers,
+        body: bytes[header_end..header_end + content_length].to_vec(),
+    })
+}
+
+async fn write_proxy_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    extra_headers: Option<&str>,
+) -> Result<(), std::io::Error> {
+    let extra_headers = extra_headers.unwrap_or_default();
+    stream
+        .write_all(format!("HTTP/1.1 {status} {reason}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
 }
 
 async fn handle_request(State(state): State<LabState>, request: Request) -> Response {
@@ -444,6 +1141,15 @@ fn manifest_for_run(
     let base_url = state
         .base_url()
         .unwrap_or_else(|| "http://127.0.0.1".to_owned());
+    let source_port = Url::parse(&base_url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .unwrap_or(0);
+    let allowed_proxy_targets = if source_port == 0 {
+        Vec::new()
+    } else {
+        vec![format!("127.0.0.1:{source_port}")]
+    };
     let sources = loaded
         .scenario
         .endpoints
@@ -487,6 +1193,17 @@ fn manifest_for_run(
                 .filter(|name| is_sensitive(name))
                 .cloned()
                 .collect(),
+            authentication: endpoint
+                .request_match
+                .headers
+                .iter()
+                .filter(|(name, _)| is_sensitive(name))
+                .filter_map(|(name, rule)| {
+                    rule.equals
+                        .as_deref()
+                        .map(|value| (name.clone(), manifest_value(value, &loaded.scenario)))
+                })
+                .collect(),
             pagination_mode: endpoint.pagination.mode,
             run_header_name: "x-lab-run-id".to_owned(),
             allow_retry: endpoint.allow_retry,
@@ -494,17 +1211,95 @@ fn manifest_for_run(
             local_test_only: true,
         })
         .collect();
+    let mut proxy_authentication = BTreeMap::new();
+    let proxy_url = if loaded.scenario.network_profile.mode == NetworkMode::Direct {
+        None
+    } else {
+        proxy_authentication.insert(
+            "proxy_authorization".to_owned(),
+            proxy_authorization_value(&run.run_id),
+        );
+        proxy_authentication.insert(
+            "proxy_capability".to_owned(),
+            proxy_capability_value(&run.run_id),
+        );
+        state.proxy_url()
+    };
+    let quota_profiles = loaded
+        .scenario
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| {
+            endpoint
+                .quota
+                .iter()
+                .map(move |profile| ManifestQuotaProfile {
+                    source_id: endpoint.id.clone(),
+                    scope: profile.scope,
+                    retry_after_mode: profile.retry_after_mode,
+                    client_visible_limit: profile.success_limit,
+                })
+        })
+        .collect();
+    let first_reply = loaded
+        .scenario
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.replies.iter())
+        .next();
+    let transport_profile = ManifestTransportProfile {
+        content_encoding: first_reply
+            .and_then(|reply| {
+                reply
+                    .content_encoding_header
+                    .as_deref()
+                    .or(reply.encoding.as_deref())
+            })
+            .unwrap_or("identity")
+            .to_owned(),
+        transfer_mode: first_reply.map_or(TransferMode::ContentLength, |reply| reply.transfer_mode),
+        client_visible_decoded_limit: loaded
+            .scenario
+            .runner
+            .effective_max_decoded_response_bytes(),
+    };
     Ok(RunManifest {
-        schema_version: "1.2.1".to_owned(),
+        schema_version: "1.3.0".to_owned(),
         run_id: run.run_id,
         scenario_id: run.scenario_id,
         seed: run.seed,
         target_domain: loaded.scenario.root_domain,
         network: ManifestNetwork {
-            allowed_hosts: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
+            allowed_hosts: vec!["127.0.0.1".to_owned()],
             external_network_allowed: false,
             required_header: "x-lab-run-id".to_owned(),
         },
+        network_profile: ManifestNetworkProfile {
+            mode: loaded.scenario.network_profile.mode,
+            proxy_url,
+            proxy_authentication_field_names: if loaded.scenario.network_profile.mode
+                == NetworkMode::Direct
+            {
+                Vec::new()
+            } else {
+                vec![
+                    "proxy_authorization".to_owned(),
+                    "proxy_capability".to_owned(),
+                ]
+            },
+            proxy_authentication,
+            proxy_must_be_used: loaded.scenario.network_profile.proxy_must_be_used,
+            allowed_proxy_targets: allowed_proxy_targets.clone(),
+            connect_fixture_target: (loaded.scenario.network_profile.mode
+                == NetworkMode::ConnectProxy)
+                .then(|| allowed_proxy_targets.first().cloned())
+                .flatten(),
+            max_connections: loaded.scenario.network_profile.max_connections,
+            virtual_timeout_ms: loaded.scenario.network_profile.virtual_timeout_ms,
+            allow_retry: loaded.scenario.network_profile.allow_retry,
+        },
+        quota_profiles,
+        transport_profile,
         sources,
         submission: ManifestSubmission {
             url: format!("/api/runs/{run_id}/submission"),
@@ -574,7 +1369,7 @@ fn submit_collector_result(
     let canonical_base_url = state
         .base_url()
         .unwrap_or_else(|| "http://127.0.0.1".to_owned());
-    let collector = match validate_submission(&submission, &loaded, &canonical_base_url) {
+    let mut collector = match validate_submission(&submission, &loaded, &canonical_base_url) {
         Ok(collector) => collector,
         Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error":error})),
     };
@@ -585,6 +1380,13 @@ fn submit_collector_result(
         Ok(audit) => audit,
         Err(error) => return run_error_response(error),
     };
+    // The client cannot declare a successful virtual wait. Derive it from the
+    // immutable server audit before judging so quota assertions use the same
+    // authoritative value that is exposed in the final report.
+    let server_virtual_wait_ms = audit.iter().map(|record| record.virtual_wait_ms).sum();
+    collector.virtual_waited_ms = server_virtual_wait_ms;
+    collector.metrics.virtual_wait_ms = server_virtual_wait_ms;
+    collector.filtered = filtered_from_audit(&collector, &loaded, &audit);
     let rejected_egress = audit
         .iter()
         .filter(|record| record.external_target_rejected)
@@ -611,7 +1413,7 @@ fn submit_collector_result(
         .iter()
         .filter(|record| record.response_status == StatusCode::TOO_MANY_REQUESTS.as_u16())
         .count();
-    report.virtual_waited_ms = audit.iter().map(|record| record.virtual_wait_ms).sum();
+    report.virtual_waited_ms = server_virtual_wait_ms;
     report.metrics.virtual_wait_ms = report.virtual_waited_ms;
     let consistent = source_statuses_match_audit(&submission.source_statuses, &audit);
     report.assertions.submission_consistency = consistent;
@@ -651,8 +1453,8 @@ fn validate_submission(
     base_url: &str,
 ) -> Result<CollectorRun, String> {
     let limits = &loaded.scenario.submission;
-    if submission.schema_version != "1.2.1" {
-        return Err("submission schema_version must be 1.2.1".to_owned());
+    if !matches!(submission.schema_version.as_str(), "1.2.1" | "1.3.0") {
+        return Err("submission schema_version must be 1.2.1 or 1.3.0".to_owned());
     }
     if submission.collector.name.is_empty()
         || submission.collector.version.is_empty()
@@ -783,6 +1585,11 @@ fn source_statuses_match_audit(
                     record.matched
                         && record.consumed
                         && (200..300).contains(&record.response_status)
+                }) || audit.iter().any(|record| {
+                    record.event_type == AuditEventType::ProxyRequest
+                        && record.proxy_mode == Some(NetworkMode::ConnectProxy)
+                        && record.matched
+                        && record.response_status == 200
                 })
             }
             SourceStatus::AuthFailed | SourceStatus::Unauthorized => records
@@ -798,6 +1605,42 @@ fn source_statuses_match_audit(
             | SourceStatus::Cancelled => true,
         }
     })
+}
+
+fn filtered_from_audit(
+    collector: &CollectorRun,
+    loaded: &LoadedScenario,
+    audit: &[AuditRecord],
+) -> Vec<FilteredCandidate> {
+    audit
+        .iter()
+        .filter_map(|record| {
+            let source_id = record.endpoint_id.as_ref()?;
+            let reason = if record.transport_fault.as_deref() == Some("malformed_stream") {
+                Some(FilterReason::Malformed)
+            } else if record.compression_limit_violation.is_some()
+                || (record.content_encoding.is_some()
+                    && record.decoded_bytes
+                        > loaded
+                            .scenario
+                            .runner
+                            .effective_max_decoded_response_bytes()
+                    && matches!(
+                        collector.source_statuses.get(source_id),
+                        Some(SourceStatus::Failed)
+                    ))
+            {
+                Some(FilterReason::ResponseTooLarge)
+            } else {
+                None
+            }?;
+            Some(FilteredCandidate {
+                value: source_id.clone(),
+                reason,
+                source_name: source_id.clone(),
+            })
+        })
+        .collect()
 }
 
 fn sensitive_field(value: &Value, path: &str) -> Option<String> {
@@ -899,6 +1742,32 @@ async fn scenario_response(
             return json_response(status, json!({"error":error.message()}));
         }
     };
+    if loaded.scenario.network_profile.proxy_must_be_used
+        && !headers.contains_key("x-lab-proxy-correlation")
+    {
+        let mut record = audit_record(AuditInput {
+            run_id,
+            scenario: &loaded.scenario,
+            endpoint: None,
+            method: &method,
+            path: &path,
+            query: query.clone(),
+            headers: &headers,
+            body: &body,
+            response_index: None,
+            response_status: 403,
+            matched: false,
+            extra: true,
+            mismatch_reasons: vec!["proxy_required".to_owned()],
+        });
+        record.blocked = true;
+        record.proxy_reason = Some("proxy_required".to_owned());
+        let _ = state.record_request(run_id, record);
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error":"this source requires its local proxy"}),
+        );
+    }
     let matching_path = loaded.scenario.endpoints.iter().find(|endpoint| {
         endpoint.request_match.path == path
             && endpoint.request_match.method.as_str() == method.as_str()
@@ -949,6 +1818,74 @@ async fn scenario_response(
             status,
             json!({"error":"request did not match scenario rule"}),
         );
+    }
+    if !endpoint.quota.is_empty() {
+        let client_virtual_wait_ms = headers
+            .get("x-lab-client-virtual-wait-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let credential_identity = quota_credential_identity(&headers);
+        let decisions = match state.evaluate_quota(
+            run_id,
+            &endpoint.id,
+            &endpoint.quota,
+            &credential_identity,
+            client_virtual_wait_ms,
+        ) {
+            Ok(decisions) => decisions,
+            Err(error) => return run_error_response(error),
+        };
+        let rate_limited = decisions.iter().any(|decision| decision.rate_limited);
+        for decision in &decisions {
+            let _ = state.record_request(
+                run_id,
+                quota_audit_record(
+                    run_id,
+                    &loaded.scenario,
+                    &endpoint.id,
+                    decision,
+                    &credential_identity,
+                ),
+            );
+        }
+        if rate_limited {
+            let decision = decisions
+                .iter()
+                .find(|decision| decision.rate_limited)
+                .expect("rate-limited decision exists");
+            let status = StatusCode::from_u16(decision.profile.exhausted_status)
+                .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+            let mut record = audit_record(AuditInput {
+                run_id,
+                scenario: &loaded.scenario,
+                endpoint: Some(endpoint),
+                method: &method,
+                path: &path,
+                query: query.clone(),
+                headers: &headers,
+                body: &body,
+                response_index: None,
+                response_status: status.as_u16(),
+                matched: true,
+                extra: false,
+                mismatch_reasons: Vec::new(),
+            });
+            record.retry_after = Some(quota_retry_after(&decision.profile));
+            record.virtual_wait_ms = decision.profile.retry_after_ms;
+            let _ = state.record_request(run_id, record);
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("retry-after", quota_retry_after(&decision.profile))
+                .header(
+                    "x-lab-virtual-wait-ms",
+                    decision.profile.retry_after_ms.to_string(),
+                )
+                .header(header::CONNECTION, "close")
+                .body(Body::from("{\"error\":\"synthetic quota exhausted\"}"))
+                .expect("static quota response");
+        }
     }
     let index = match state.claim_response_index(run_id, &endpoint.id, endpoint.replies.len()) {
         Ok(Some(index)) => index,
@@ -1385,35 +2322,20 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
         bytes
     };
     let decoded_bytes = decoded.len();
-    let mut encoded = if reply
-        .encoding
-        .as_deref()
-        .is_some_and(|encoding| encoding.eq_ignore_ascii_case("gzip"))
-    {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        if encoder.write_all(&decoded).is_err() {
+    let mut encoded = match encode_response_body(reply, &decoded) {
+        Ok(encoded) => encoded,
+        Err(error) => {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error":"could not gzip local fixture"}),
+                json!({"error":format!("could not encode local fixture: {error}")}),
             );
         }
-        match encoder.finish() {
-            Ok(encoded) => encoded,
-            Err(_) => {
-                return json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error":"could not finish gzip local fixture"}),
-                );
-            }
-        }
-    } else {
-        decoded.clone()
     };
-    if reply.gzip_corrupt && !encoded.is_empty() {
+    if (reply.gzip_corrupt || reply.encoding_corrupt) && !encoded.is_empty() {
         let index = encoded.len() - 1;
         encoded[index] ^= 0xff;
     }
-    if reply.gzip_truncated && !encoded.is_empty() {
+    if (reply.gzip_truncated || reply.encoding_truncated) && !encoded.is_empty() {
         encoded.truncate(encoded.len().saturating_sub(8));
     }
     let sent = if reply.disconnect
@@ -1425,11 +2347,11 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
     } else {
         encoded
     };
-    let content_encoding = reply.encoding.as_ref().and_then(|encoding| {
-        encoding
-            .eq_ignore_ascii_case("gzip")
-            .then(|| "gzip".to_owned())
-    });
+    let content_encoding = reply
+        .content_encoding_header
+        .clone()
+        .or_else(|| reply.encoding.clone())
+        .filter(|encoding| !encoding.eq_ignore_ascii_case("identity"));
     let compression_limit_violation = compression_limit_violation(
         runner,
         content_encoding.as_deref(),
@@ -1445,6 +2367,25 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
             decoded_bytes,
             content_encoding: content_encoding.clone(),
             compression_limit_violation,
+            transfer_mode: Some(reply.transfer_mode),
+            chunk_count: if reply.transfer_mode == TransferMode::Chunked {
+                reply.chunk_count
+            } else {
+                0
+            },
+            transport_fault: (reply.malformed_chunk
+                || reply.truncated_body
+                || reply.encoding_corrupt
+                || reply.encoding_truncated)
+                .then(|| {
+                    if reply.malformed_chunk {
+                        "malformed_chunk".to_owned()
+                    } else if reply.truncated_body {
+                        "truncated".to_owned()
+                    } else {
+                        "malformed_stream".to_owned()
+                    }
+                }),
         },
     );
     if reply.first_byte_delay_ms > 0 {
@@ -1457,7 +2398,8 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
     let transport_fault = reply.disconnect
         || reply.connection_reset
         || reply.close_before_body
-        || reply.truncated_body;
+        || reply.truncated_body
+        || reply.malformed_chunk;
     if let Some(location) = &reply.redirect {
         builder = builder.header(header::LOCATION, location);
     }
@@ -1473,7 +2415,7 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
     for (name, value) in &reply.headers {
         builder = builder.header(name, value);
     }
-    if !transport_fault {
+    if !transport_fault && reply.transfer_mode == TransferMode::ContentLength {
         builder = builder.header(
             header::CONTENT_LENGTH,
             reply
@@ -1482,7 +2424,20 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
                 .to_string(),
         );
     }
-    let body = if transport_fault || reply.malformed_content_length.is_some() {
+    let body = if reply.transfer_mode == TransferMode::Chunked {
+        let chunks = response_chunks(&sent, reply.chunk_count.max(1));
+        let mut events = chunks
+            .into_iter()
+            .map(|chunk| Ok::<Bytes, io::Error>(Bytes::from(chunk)))
+            .collect::<Vec<_>>();
+        if transport_fault {
+            events.push(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "synthetic chunked transport fault",
+            )));
+        }
+        Body::from_stream(stream::iter(events))
+    } else if transport_fault || reply.malformed_content_length.is_some() {
         let error = io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "synthetic transport fault",
@@ -1508,13 +2463,54 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
     })
 }
 
+fn encode_response_body(reply: &Reply, decoded: &[u8]) -> Result<Vec<u8>, String> {
+    let encoding = reply.encoding.as_deref().unwrap_or("identity");
+    if encoding.eq_ignore_ascii_case("identity")
+        || encoding.eq_ignore_ascii_case("utf-8")
+        || encoding.eq_ignore_ascii_case("utf8")
+    {
+        return Ok(decoded.to_vec());
+    }
+    if encoding.eq_ignore_ascii_case("gzip") {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(decoded)
+            .map_err(|error| error.to_string())?;
+        return encoder.finish().map_err(|error| error.to_string());
+    }
+    if encoding.eq_ignore_ascii_case("deflate") {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(decoded)
+            .map_err(|error| error.to_string())?;
+        return encoder.finish().map_err(|error| error.to_string());
+    }
+    if encoding.eq_ignore_ascii_case("br") {
+        let mut encoder = CompressorWriter::new(Vec::new(), 4 * 1024, 5, 22);
+        encoder
+            .write_all(decoded)
+            .map_err(|error| error.to_string())?;
+        return Ok(encoder.into_inner());
+    }
+    Err("unsupported local content encoding".to_owned())
+}
+
+fn response_chunks(bytes: &[u8], requested: usize) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return vec![Vec::new()];
+    }
+    let count = requested.min(bytes.len()).max(1);
+    let chunk_size = bytes.len().div_ceil(count);
+    bytes.chunks(chunk_size).map(ToOwned::to_owned).collect()
+}
+
 fn compression_limit_violation(
     runner: &lab_core::RunnerConfig,
     encoding: Option<&str>,
     wire_bytes: usize,
     decoded_bytes: usize,
 ) -> Option<String> {
-    if !encoding.is_some_and(|value| value.eq_ignore_ascii_case("gzip")) {
+    if !encoding.is_some_and(|value| !value.eq_ignore_ascii_case("identity")) {
         return None;
     }
     if wire_bytes > runner.effective_max_wire_response_bytes() {
@@ -1780,6 +2776,24 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
         decoded_bytes: 0,
         content_encoding: None,
         compression_limit_violation: None,
+        event_type: AuditEventType::SourceRequest,
+        proxy_mode: None,
+        proxy_target: None,
+        proxy_authentication: ProxyAuthenticationState::NotApplicable,
+        proxy_reason: None,
+        correlation_id: headers
+            .get("x-lab-proxy-correlation")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        quota_scope: None,
+        quota_remaining_before: None,
+        quota_remaining_after: None,
+        quota_consumed: false,
+        quota_rate_limited: false,
+        quota_recovery_virtual_wait_ms: None,
+        transfer_mode: None,
+        chunk_count: 0,
+        transport_fault: None,
     }
 }
 

@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-88.acme.test]
+expected_observations: { api.target-88.acme.test: { source_names: [recovery-source], source_kinds: [generic_json], record_ids: [recovery-88] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { recovery-source: success }

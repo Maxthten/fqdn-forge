@@ -20,7 +20,8 @@ pub use model::*;
 pub use repository::{LoadedScenario, ScenarioRepository, ValidationIssue};
 pub use runner::{ReferenceRunner, RunnerError};
 pub use state::{
-    LabState, RejectedRequestAudit, ResponseMetrics, RunSession, RunSessionStatus, RunStateError,
+    LabState, QuotaDecision, RejectedRequestAudit, ResponseMetrics, RunSession, RunSessionStatus,
+    RunStateError,
 };
 
 pub fn report_json(report: &RunReport) -> Result<String, serde_json::Error> {

@@ -1,0 +1,5 @@
+expected_fqdns: [api.target-83.acme.test]
+expected_observations: { api.target-83.acme.test: { source_names: [chunk-source], source_kinds: [generic_json], record_ids: [chunk-83] } }
+expected_filter_reasons: []
+expected_run_status: success
+expected_source_status: { chunk-source: success }

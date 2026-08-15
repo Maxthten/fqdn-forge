@@ -1,7 +1,9 @@
-use std::{env, fs, path::PathBuf, process::ExitCode};
+use std::{env, fs, io::Read, path::PathBuf, process::ExitCode};
 
 use anyhow::Context;
+use brotli::Decompressor;
 use chrono::Utc;
+use flate2::read::{GzDecoder, ZlibDecoder};
 use lab_core::{
     CollectorRun, EgressGuard, JudgeInput, Observation, ReferenceRunner, ReportStatus,
     ScenarioRepository, SourceKind, SourceStatus, judge_run, refresh_semantic_fingerprint,
@@ -9,10 +11,15 @@ use lab_core::{
 };
 use lab_server::LocalServer;
 use reqwest::{
-    Client,
+    Client, Proxy,
     header::{HeaderMap, HeaderValue},
     redirect::Policy,
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+use url::Url;
 use uuid::Uuid;
 
 #[tokio::main]
@@ -76,8 +83,11 @@ fn scenarios_dir() -> PathBuf {
 async fn run_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
     let all = args.iter().any(|arg| arg == "--all");
     let requested = flag_value(args, "--scenario");
-    if !all && requested.is_none() {
-        anyhow::bail!("use: lab-cli run --all | --scenario <id>");
+    let group = flag_value(args, "--group");
+    if !all && requested.is_none() && group.is_none() {
+        anyhow::bail!(
+            "use: lab-cli run --all | --scenario <id> | --group network|proxy|quota|transport"
+        );
     }
     let profile = flag_value(args, "--profile").unwrap_or_else(|| "default".to_owned());
     if profile != "default" && profile != "stress" {
@@ -96,6 +106,17 @@ async fn run_command(repository: &ScenarioRepository, args: &[String]) -> anyhow
             .iter()
             .map(|loaded| loaded.scenario.id.clone())
             .collect()
+    } else if let Some(group) = group {
+        let ids = repository
+            .all()
+            .iter()
+            .filter(|loaded| scenario_in_group(&loaded.scenario.id, &group))
+            .map(|loaded| loaded.scenario.id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            anyhow::bail!("--group must be network, proxy, quota or transport");
+        }
+        ids
     } else {
         vec![requested.expect("checked above")]
     };
@@ -117,6 +138,20 @@ async fn run_command(repository: &ScenarioRepository, args: &[String]) -> anyhow
     Ok(passed)
 }
 
+fn scenario_in_group(id: &str, group: &str) -> bool {
+    let number = id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok());
+    matches!(
+        (group, number),
+        ("network", Some(61..=66))
+            | ("proxy", Some(62..=66))
+            | ("transport", Some(79..=84))
+            | ("quota", Some(85..=90))
+    )
+}
+
 async fn run_one(
     repository: &ScenarioRepository,
     id: &str,
@@ -136,7 +171,10 @@ async fn run_one(
     let started = Utc::now();
     let guard = EgressGuard::default();
     let runner = ReferenceRunner::new(guard.clone())?;
-    let control_client = Client::builder().redirect(Policy::none()).build()?;
+    let control_client = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()?;
     let created_run = create_run(
         &control_client,
         &server.base_url(),
@@ -144,9 +182,11 @@ async fn run_one(
         Some(loaded.scenario.seed),
     )
     .await?;
+    let proxy_url = server.proxy_url();
     let collector = runner
-        .run(
+        .run_with_proxy(
             &server.base_url(),
+            Some(&proxy_url),
             &loaded.scenario,
             created_run.run_id,
             profile,
@@ -232,8 +272,8 @@ async fn replay_command(repository: &ScenarioRepository, args: &[String]) -> any
         .ok_or_else(|| anyhow::anyhow!("use: lab-cli replay --report <report-path>"))?;
     let prior: lab_core::RunReport = serde_json::from_slice(&fs::read(&path)?)?;
     let strict = args.iter().any(|arg| arg == "--strict");
-    if strict && prior.schema_version != "1.2.1" {
-        eprintln!("strict replay requires a compatible 1.2.1 report schema");
+    if strict && !matches!(prior.schema_version.as_str(), "1.2.1" | "1.3.0") {
+        eprintln!("strict replay requires a compatible 1.2.1 or 1.3.0 report schema");
         return Ok(false);
     }
     let mut replay = run_one(repository, &prior.scenario_id, "default", Some(prior.seed)).await?;
@@ -299,6 +339,9 @@ async fn conformance_command(
         "external HTTP conformance {scenario}: {}",
         if passed { "passed" } else { "failed" }
     );
+    if !passed {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
     Ok(passed)
 }
 
@@ -309,7 +352,10 @@ async fn external_http_conformance(
     base_url: &str,
     scenario_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let client = Client::builder().redirect(Policy::none()).build()?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()?;
     let create: serde_json::Value = client
         .post(format!("{base_url}/api/runs"))
         .json(&serde_json::json!({"scenario_id":scenario_id}))
@@ -351,76 +397,217 @@ async fn external_http_conformance(
         .get("sources")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("manifest is missing sources"))?;
+    let network = manifest
+        .get("network_profile")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("manifest is missing network_profile"))?;
+    let max_decoded_bytes = manifest
+        .get("transport_profile")
+        .and_then(|profile| profile.get("client_visible_decoded_limit"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .ok_or_else(|| anyhow::anyhow!("manifest transport_profile is missing decoded limit"))?;
+    let network_mode = network
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("direct");
+    let proxy_values = network
+        .get("proxy_authentication")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let source_client = if network_mode == "http_proxy" {
+        let proxy_url = network
+            .get("proxy_url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("http_proxy manifest is missing proxy_url"))?;
+        let parsed = Url::parse(proxy_url)?;
+        if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+            anyhow::bail!("manifest proxy_url is not numeric IPv4 loopback");
+        }
+        Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .proxy(Proxy::http(proxy_url)?)
+            .build()?
+    } else {
+        Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()?
+    };
     let mut findings = Vec::new();
     let mut source_statuses = serde_json::Map::new();
-    for source in sources {
-        let source_id = source
-            .get("source_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
-        let source_kind = source
-            .get("source_kind")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_kind"))?;
-        let source_base = source
-            .get("base_url")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("manifest source is missing base_url"))?;
-        let path = source
-            .get("path_template")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("manifest source is missing path_template"))?;
-        let query = source
-            .get("required_query")
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let url = format!("{source_base}{path}");
-        let mut request = match source.get("method").and_then(serde_json::Value::as_str) {
-            Some("POST") => client.post(&url),
-            Some("PUT") => client.put(&url),
-            Some("DELETE") => client.delete(&url),
-            _ => client.get(&url),
+    if network_mode == "connect_proxy" {
+        let status = connect_conformance_probe(network, run_id).await?;
+        for source in sources {
+            let source_id = source
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
+            source_statuses.insert(
+                source_id.to_owned(),
+                serde_json::Value::String(status.to_owned()),
+            );
         }
-        .header("x-lab-run-id", run_id)
-        .query(&query);
-        // The run header is mandatory. A source-specific fake credential is
-        // intentionally not inferred or copied from private scenario state.
-        request = request.header("x-lab-data-profile", "default");
-        let response = request.send().await?;
-        let evidence_url = response.url().to_string();
-        if !response.status().is_success() {
-            source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
-            continue;
-        }
-        source_statuses.insert(source_id.to_owned(), serde_json::json!("succeeded"));
-        let payload: serde_json::Value = response.json().await?;
-        for item in payload
-            .get("items")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(fqdn) = item.get("host").and_then(serde_json::Value::as_str) else {
+    } else {
+        for source in sources {
+            let source_id = source
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
+            let source_kind = source
+                .get("source_kind")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_kind"))?;
+            let source_base = source
+                .get("base_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest source is missing base_url"))?;
+            let path = source
+                .get("path_template")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest source is missing path_template"))?;
+            let query = source
+                .get("required_query")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let authentication = source
+                .get("authentication")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let url = format!("{source_base}{path}");
+            let allow_retry = source
+                .get("allow_retry")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let mut virtual_wait_ms = 0_u64;
+            let mut attempts = 0_usize;
+            let response = loop {
+                attempts = attempts.saturating_add(1);
+                let mut request = match source.get("method").and_then(serde_json::Value::as_str) {
+                    Some("POST") => source_client.post(&url),
+                    Some("PUT") => source_client.put(&url),
+                    Some("DELETE") => source_client.delete(&url),
+                    _ => source_client.get(&url),
+                }
+                .header("x-lab-run-id", run_id)
+                .header("x-lab-data-profile", "default")
+                .header("x-lab-client-virtual-wait-ms", virtual_wait_ms.to_string())
+                .query(&query);
+                for (name, value) in &authentication {
+                    let value = value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("manifest source authentication value is not a string")
+                    })?;
+                    request = request.header(name, value);
+                }
+                if network_mode == "http_proxy" {
+                    if let Some(value) = proxy_values
+                        .get("proxy_authorization")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        request = request.header("proxy-authorization", value);
+                    }
+                    if let Some(value) = proxy_values
+                        .get("proxy_capability")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        request = request.header("x-lab-proxy-capability", value);
+                    }
+                }
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
+                        break None;
+                    }
+                };
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    && allow_retry
+                    && attempts < 4
+                {
+                    let waited = response
+                        .headers()
+                        .get("x-lab-virtual-wait-ms")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    virtual_wait_ms = virtual_wait_ms.saturating_add(waited.max(1));
+                    continue;
+                }
+                break Some(response);
+            };
+            let Some(response) = response else {
                 continue;
             };
-            findings.push(serde_json::json!({
-                "fqdn":fqdn,
-                "evidence":[{
-                    "source_id":source_id,
-                    "source_kind":source_kind.clone(),
-                    "record_id":item.get("id").and_then(serde_json::Value::as_str),
-                    "url":evidence_url.clone(),
-                    "observed_at":item.get("observed_at").and_then(serde_json::Value::as_str),
-                    "tags":item.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
-                    "confidence":item.get("confidence").and_then(serde_json::Value::as_f64),
-                }]
-            }));
+            let evidence_url = response.url().to_string();
+            if !response.status().is_success() {
+                let status = match response.status() {
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                        "auth_failed"
+                    }
+                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT => {
+                        "timed_out"
+                    }
+                    _ => "failed",
+                };
+                source_statuses.insert(source_id.to_owned(), serde_json::json!(status));
+                continue;
+            }
+            source_statuses.insert(source_id.to_owned(), serde_json::json!("succeeded"));
+            let response_headers = response.headers().clone();
+            let wire = match response.bytes().await {
+                Ok(wire) => wire,
+                Err(_) => {
+                    source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
+                    continue;
+                }
+            };
+            let decoded = match decode_conformance_body(&response_headers, &wire, max_decoded_bytes)
+            {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
+                    continue;
+                }
+            };
+            let payload: serde_json::Value = match serde_json::from_slice(&decoded) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
+                    continue;
+                }
+            };
+            for item in payload
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(fqdn) = item.get("host").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                findings.push(serde_json::json!({
+                    "fqdn":fqdn,
+                    "evidence":[{
+                        "source_id":source_id,
+                        "source_kind":source_kind.clone(),
+                        "record_id":item.get("id").and_then(serde_json::Value::as_str),
+                        "url":evidence_url.clone(),
+                        "observed_at":item.get("observed_at").and_then(serde_json::Value::as_str),
+                        "tags":item.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+                        "confidence":item.get("confidence").and_then(serde_json::Value::as_f64),
+                    }]
+                }));
+            }
         }
     }
     let submission = serde_json::json!({
-        "schema_version":"1.2.1",
-        "collector":{"name":"fqdn-forge-http-conformance","version":"1.2.1"},
+        "schema_version":"1.3.0",
+        "collector":{"name":"fqdn-forge-http-conformance","version":"1.3.0"},
         "target_domain":target_domain,
         "source_statuses":source_statuses,
         "findings":findings,
@@ -448,6 +635,92 @@ async fn external_http_conformance(
         anyhow::bail!("public report leaked truth");
     }
     Ok(report)
+}
+
+fn decode_conformance_body(
+    headers: &HeaderMap,
+    wire: &[u8],
+    max_decoded_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let encoding = headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity");
+    if encoding.eq_ignore_ascii_case("identity") || encoding.eq_ignore_ascii_case("utf-8") {
+        return Ok(wire.to_vec());
+    }
+    if encoding.contains(',') {
+        anyhow::bail!("conformance rejects conflicting Content-Encoding headers");
+    }
+    let mut decoded = Vec::new();
+    if encoding.eq_ignore_ascii_case("gzip") {
+        GzDecoder::new(wire).read_to_end(&mut decoded)?;
+    } else if encoding.eq_ignore_ascii_case("deflate") {
+        ZlibDecoder::new(wire).read_to_end(&mut decoded)?;
+    } else if encoding.eq_ignore_ascii_case("br") {
+        Decompressor::new(wire, 8 * 1024).read_to_end(&mut decoded)?;
+    } else {
+        anyhow::bail!("conformance rejects unsupported Content-Encoding");
+    }
+    if decoded.len() > max_decoded_bytes {
+        anyhow::bail!("conformance decoded body exceeds local safety limit");
+    }
+    Ok(decoded)
+}
+
+async fn connect_conformance_probe(
+    network: &serde_json::Map<String, serde_json::Value>,
+    run_id: &str,
+) -> anyhow::Result<&'static str> {
+    let proxy_url = network
+        .get("proxy_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("connect_proxy manifest is missing proxy_url"))?;
+    let proxy = Url::parse(proxy_url)?;
+    if proxy.scheme() != "http" || proxy.host_str() != Some("127.0.0.1") {
+        anyhow::bail!("connect proxy is not numeric IPv4 loopback");
+    }
+    let target = network
+        .get("connect_fixture_target")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("connect_proxy manifest is missing fixture target"))?;
+    let port = proxy
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("connect proxy is missing a port"))?;
+    let values = network
+        .get("proxy_authentication")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("connect_proxy manifest is missing authentication"))?;
+    let authorization = values
+        .get("proxy_authorization")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("connect_proxy authentication is missing authorization"))?;
+    let capability = values
+        .get("proxy_capability")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("connect_proxy authentication is missing capability"))?;
+    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let request = format!(
+        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nx-lab-run-id: {run_id}\r\nProxy-Authorization: {authorization}\r\nx-lab-proxy-capability: {capability}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = [0_u8; 512];
+    let count = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.read(&mut response),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("local CONNECT probe timed out"))??;
+    let response = String::from_utf8_lossy(&response[..count]);
+    Ok(if response.starts_with("HTTP/1.1 200") {
+        "succeeded"
+    } else if response.starts_with("HTTP/1.1 407") || response.starts_with("HTTP/1.1 403") {
+        "auth_failed"
+    } else if response.starts_with("HTTP/1.1 504") {
+        "timed_out"
+    } else {
+        "failed"
+    })
 }
 
 async fn serve_command(repository: ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
@@ -520,7 +793,10 @@ async fn run_negative_client(
     let server = LocalServer::spawn(repository.clone(), None)
         .await
         .map_err(anyhow::Error::msg)?;
-    let client = Client::builder().redirect(Policy::none()).build()?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()?;
     let created_run = create_run(
         &client,
         &server.base_url(),
@@ -793,7 +1069,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  serve [--scenario <id>] [--port 18080]"
+        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  serve [--scenario <id>] [--port 18080]"
     );
 }
 
@@ -813,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn every_scenario_is_a_rust_regression_test() {
         let repository = ScenarioRepository::load(scenarios_dir()).expect("load scenarios");
-        assert_eq!(repository.all().len(), 72);
+        assert_eq!(repository.all().len(), 90);
         for loaded in repository.all() {
             let report = run_one(&repository, &loaded.scenario.id, "default", None)
                 .await
@@ -912,6 +1188,7 @@ mod tests {
             .expect("start local test service");
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .expect("HTTP client");
         let base_url = server.base_url();

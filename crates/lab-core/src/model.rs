@@ -25,6 +25,10 @@ pub struct Scenario {
     /// the local scenario, never part of a collector supplied payload.
     #[serde(default)]
     pub submission: SubmissionLimits,
+    /// Local-only network behaviour exposed to an external collector through
+    /// the run manifest. It never describes a real network destination.
+    #[serde(default)]
+    pub network_profile: NetworkProfile,
     pub endpoints: Vec<Endpoint>,
 }
 
@@ -47,6 +51,10 @@ pub struct RunnerConfig {
     pub max_expansion_ratio: usize,
     #[serde(default = "default_max_decompression_time_ms")]
     pub max_decompression_time_ms: u64,
+    #[serde(default = "default_max_chunk_bytes")]
+    pub max_chunk_bytes: usize,
+    #[serde(default = "default_max_chunk_count")]
+    pub max_chunk_count: usize,
     pub cancel_after_requests: Option<usize>,
 }
 
@@ -61,6 +69,8 @@ impl Default for RunnerConfig {
             max_decoded_response_bytes: default_max_decoded_response_bytes(),
             max_expansion_ratio: default_max_expansion_ratio(),
             max_decompression_time_ms: default_max_decompression_time_ms(),
+            max_chunk_bytes: default_max_chunk_bytes(),
+            max_chunk_count: default_max_chunk_count(),
             cancel_after_requests: None,
         }
     }
@@ -122,6 +132,125 @@ const fn default_max_expansion_ratio() -> usize {
 }
 
 const fn default_max_decompression_time_ms() -> u64 {
+    1_000
+}
+
+const fn default_max_chunk_bytes() -> usize {
+    512 * 1024
+}
+
+const fn default_max_chunk_count() -> usize {
+    128
+}
+
+/// The three local network paths FQDN Forge can expose.  `http_proxy` and
+/// `connect_proxy` always point at a listener owned by this process on
+/// numeric IPv4 loopback; they are deliberately not general proxies.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Direct,
+    HttpProxy,
+    ConnectProxy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyFault {
+    #[default]
+    None,
+    ConnectTimeout,
+    ConnectionRefused,
+    ResetBeforeResponse,
+    ResetAfterHeaders,
+    TunnelCloseAfterBytes,
+    EgressDenied,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkProfile {
+    #[serde(default)]
+    pub mode: NetworkMode,
+    #[serde(default)]
+    pub proxy_must_be_used: bool,
+    #[serde(default = "default_proxy_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_proxy_timeout_ms")]
+    pub virtual_timeout_ms: u64,
+    #[serde(default)]
+    pub allow_retry: bool,
+    #[serde(default)]
+    pub fault: ProxyFault,
+    pub tunnel_close_after_bytes: Option<usize>,
+}
+
+impl Default for NetworkProfile {
+    fn default() -> Self {
+        Self {
+            mode: NetworkMode::Direct,
+            proxy_must_be_used: false,
+            max_connections: default_proxy_max_connections(),
+            virtual_timeout_ms: default_proxy_timeout_ms(),
+            allow_retry: false,
+            fault: ProxyFault::None,
+            tunnel_close_after_bytes: None,
+        }
+    }
+}
+
+const fn default_proxy_max_connections() -> usize {
+    8
+}
+
+const fn default_proxy_timeout_ms() -> u64 {
+    250
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaScope {
+    PerSource,
+    PerKey,
+    GlobalRun,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryAfterMode {
+    #[default]
+    Seconds,
+    HttpDate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaProfile {
+    pub scope: QuotaScope,
+    #[serde(default = "default_quota_success_limit")]
+    pub success_limit: usize,
+    #[serde(default = "default_quota_status")]
+    pub exhausted_status: u16,
+    #[serde(default)]
+    pub retry_after_mode: RetryAfterMode,
+    #[serde(default = "default_quota_retry_after_ms")]
+    pub retry_after_ms: u64,
+    /// When present, a client that reports this much virtual waiting through
+    /// the public test header can use the quota again. No wall-clock sleep is
+    /// required or trusted.
+    pub recover_after_virtual_ms: Option<u64>,
+}
+
+const fn default_quota_success_limit() -> usize {
+    1
+}
+
+const fn default_quota_status() -> u16 {
+    429
+}
+
+const fn default_quota_retry_after_ms() -> u64 {
     1_000
 }
 
@@ -208,6 +337,8 @@ pub struct Endpoint {
     pub request_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub omit_headers: Vec<String>,
+    #[serde(default)]
+    pub quota: Vec<QuotaProfile>,
     pub request_body: Option<Value>,
     pub extract: Option<ExtractSpec>,
     pub replies: Vec<Reply>,
@@ -402,6 +533,19 @@ pub struct Reply {
     pub content_type: Option<String>,
     pub encoding: Option<String>,
     #[serde(default)]
+    pub transfer_mode: TransferMode,
+    #[serde(default = "default_chunk_count")]
+    pub chunk_count: usize,
+    #[serde(default)]
+    pub malformed_chunk: bool,
+    #[serde(default)]
+    pub encoding_corrupt: bool,
+    #[serde(default)]
+    pub encoding_truncated: bool,
+    /// Allows a scenario to deliberately make the header disagree with the
+    /// bytes. The server still only produces local synthetic bytes.
+    pub content_encoding_header: Option<String>,
+    #[serde(default)]
     pub delay_ms: u64,
     #[serde(default)]
     pub first_byte_delay_ms: u64,
@@ -432,6 +576,18 @@ pub struct Reply {
     #[serde(default)]
     pub duplicate_page: bool,
     pub malformed_content_length: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferMode {
+    #[default]
+    ContentLength,
+    Chunked,
+}
+
+const fn default_chunk_count() -> usize {
+    2
 }
 
 impl Reply {
@@ -542,6 +698,22 @@ pub struct Assertions {
     pub timing: TimingExpectation,
     #[serde(default)]
     pub expected_rejected_egress_attempts: usize,
+    #[serde(default)]
+    pub expected_proxy_requests: Option<usize>,
+    #[serde(default)]
+    pub expected_quota_decisions: Option<usize>,
+    #[serde(default)]
+    pub require_proxy: Option<bool>,
+    #[serde(default)]
+    pub forbid_direct_source: bool,
+    #[serde(default)]
+    pub require_quota_rate_limited: bool,
+    #[serde(default)]
+    pub required_content_encoding: Option<String>,
+    #[serde(default)]
+    pub required_transfer_mode: Option<TransferMode>,
+    #[serde(default)]
+    pub required_transport_fault: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -702,6 +874,10 @@ pub struct RunManifest {
     pub seed: u64,
     pub target_domain: String,
     pub network: ManifestNetwork,
+    pub network_profile: ManifestNetworkProfile,
+    #[serde(default)]
+    pub quota_profiles: Vec<ManifestQuotaProfile>,
+    pub transport_profile: ManifestTransportProfile,
     pub sources: Vec<ManifestSource>,
     pub submission: ManifestSubmission,
 }
@@ -711,6 +887,37 @@ pub struct ManifestNetwork {
     pub allowed_hosts: Vec<String>,
     pub external_network_allowed: bool,
     pub required_header: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestNetworkProfile {
+    pub mode: NetworkMode,
+    pub proxy_url: Option<String>,
+    pub proxy_authentication_field_names: Vec<String>,
+    /// Synthetic run-local values. They are never copied into audit, report,
+    /// errors, fingerprints, or log messages.
+    pub proxy_authentication: BTreeMap<String, String>,
+    pub proxy_must_be_used: bool,
+    pub allowed_proxy_targets: Vec<String>,
+    pub connect_fixture_target: Option<String>,
+    pub max_connections: usize,
+    pub virtual_timeout_ms: u64,
+    pub allow_retry: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestQuotaProfile {
+    pub source_id: String,
+    pub scope: QuotaScope,
+    pub retry_after_mode: RetryAfterMode,
+    pub client_visible_limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestTransportProfile {
+    pub content_encoding: String,
+    pub transfer_mode: TransferMode,
+    pub client_visible_decoded_limit: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -724,6 +931,10 @@ pub struct ManifestSource {
     pub required_query: BTreeMap<String, String>,
     pub required_headers: Vec<String>,
     pub authentication_field_names: Vec<String>,
+    /// Per-run synthetic credentials needed to call this local source. These
+    /// values are never copied into audit records, reports, or fingerprints.
+    #[serde(default)]
+    pub authentication: BTreeMap<String, String>,
     pub pagination_mode: PaginationMode,
     pub run_header_name: String,
     pub allow_retry: bool,
@@ -763,6 +974,32 @@ pub struct CompressionReport {
     pub wire_bytes: usize,
     pub decoded_bytes: usize,
     pub encoding: Option<String>,
+    pub limit_violation: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NetworkReport {
+    pub mode: NetworkMode,
+    pub proxy_requests: usize,
+    pub direct_source_requests: usize,
+    pub egress_denied: bool,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct QuotaReport {
+    pub decisions: usize,
+    pub consumed: usize,
+    pub rate_limited: usize,
+    pub recovery_virtual_wait_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TransportReport {
+    pub transfer_mode: Option<TransferMode>,
+    pub chunk_count: usize,
+    pub malformed: bool,
     pub limit_violation: Option<String>,
 }
 
@@ -817,6 +1054,56 @@ pub struct AuditRecord {
     pub content_encoding: Option<String>,
     #[serde(default)]
     pub compression_limit_violation: Option<String>,
+    #[serde(default)]
+    pub event_type: AuditEventType,
+    #[serde(default)]
+    pub proxy_mode: Option<NetworkMode>,
+    #[serde(default)]
+    pub proxy_target: Option<String>,
+    #[serde(default)]
+    pub proxy_authentication: ProxyAuthenticationState,
+    #[serde(default)]
+    pub proxy_reason: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub quota_scope: Option<QuotaScope>,
+    #[serde(default)]
+    pub quota_remaining_before: Option<usize>,
+    #[serde(default)]
+    pub quota_remaining_after: Option<usize>,
+    #[serde(default)]
+    pub quota_consumed: bool,
+    #[serde(default)]
+    pub quota_rate_limited: bool,
+    #[serde(default)]
+    pub quota_recovery_virtual_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub transfer_mode: Option<TransferMode>,
+    #[serde(default)]
+    pub chunk_count: usize,
+    #[serde(default)]
+    pub transport_fault: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventType {
+    #[default]
+    SourceRequest,
+    ProxyRequest,
+    QuotaDecision,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyAuthenticationState {
+    #[default]
+    NotApplicable,
+    Missing,
+    WrongScheme,
+    Invalid,
+    Valid,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -860,6 +1147,12 @@ pub struct RunReport {
     pub replay: ReplayReport,
     #[serde(default)]
     pub compression: CompressionReport,
+    #[serde(default)]
+    pub network: NetworkReport,
+    #[serde(default)]
+    pub quota: QuotaReport,
+    #[serde(default)]
+    pub transport: TransportReport,
     /// Kept for older GUI/MCP prototypes that read `audit`.
     pub audit: Vec<AuditRecord>,
 }
@@ -880,11 +1173,29 @@ pub struct AssertionResults {
     pub source_status: bool,
     pub request_contract: bool,
     pub egress_guard: bool,
+    #[serde(default = "default_network_assertion")]
+    pub network: bool,
+    #[serde(default = "default_quota_assertion")]
+    pub quota: bool,
+    #[serde(default = "default_transport_assertion")]
+    pub transport: bool,
     #[serde(default = "default_submission_consistency")]
     pub submission_consistency: bool,
 }
 
 const fn default_submission_consistency() -> bool {
+    true
+}
+
+const fn default_network_assertion() -> bool {
+    true
+}
+
+const fn default_quota_assertion() -> bool {
+    true
+}
+
+const fn default_transport_assertion() -> bool {
     true
 }
 
@@ -898,6 +1209,9 @@ impl AssertionResults {
             && self.source_status
             && self.request_contract
             && self.egress_guard
+            && self.network
+            && self.quota
+            && self.transport
             && self.submission_consistency
     }
 
@@ -910,6 +1224,9 @@ impl AssertionResults {
             + self.source_status as usize
             + self.request_contract as usize
             + self.egress_guard as usize
+            + self.network as usize
+            + self.quota as usize
+            + self.transport as usize
             + self.submission_consistency as usize
     }
 }

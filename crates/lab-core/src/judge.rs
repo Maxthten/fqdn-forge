@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AssertionResults, Assertions, AuditRecord, CollectorRun, CompressionReport, FilterExpectation,
-    ReportStatus, RequestSummary, RunReport, RunStatus, SubmissionEvidence, SubmissionFinding,
-    Truth,
+    AssertionResults, Assertions, AuditEventType, AuditRecord, CollectorRun, CompressionReport,
+    FilterExpectation, NetworkReport, QuotaReport, ReportStatus, RequestSummary, RunReport,
+    RunStatus, SubmissionEvidence, SubmissionFinding, TransportReport, Truth,
 };
 
 pub struct JudgeInput<'a> {
@@ -74,6 +74,9 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
     let request_contract =
         request_contract_matches(audit, assertions, collector_run.virtual_waited_ms);
     let egress_guard = rejected_egress_urls.len() == assertions.expected_rejected_egress_attempts;
+    let network = network_matches(audit, assertions);
+    let quota = quota_matches(audit, assertions);
+    let transport = transport_matches(audit, assertions);
     let results = AssertionResults {
         expected_fqdns: expected_fqdns_pass,
         forbidden_fqdns: forbidden_pass,
@@ -82,6 +85,9 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         source_status: source_pass,
         request_contract,
         egress_guard,
+        network,
+        quota,
+        transport,
         submission_consistency: true,
     };
     let mut failures = Vec::new();
@@ -112,6 +118,15 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
             rejected_egress_urls.len()
         ));
     }
+    if !network {
+        failures.push("network proxy contract did not match assertions.yaml".to_owned());
+    }
+    if !quota {
+        failures.push("quota decision contract did not match assertions.yaml".to_owned());
+    }
+    if !transport {
+        failures.push("transport contract did not match assertions.yaml".to_owned());
+    }
     let requests = RequestSummary {
         total: audit.len(),
         unmatched: audit.iter().filter(|record| !record.matched).count(),
@@ -124,8 +139,8 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         ReportStatus::Failed
     };
     let mut report = RunReport {
-        schema_version: "1.2.1".to_owned(),
-        lab_version: "1.2.1".to_owned(),
+        schema_version: "1.3.0".to_owned(),
+        lab_version: "1.3.0".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_string(),
         scenario_id: scenario_id.to_owned(),
@@ -149,17 +164,93 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         failures,
         violations: Vec::new(),
         replay_command: format!(
-            "cargo run -p lab-cli -- replay --strict --report artifacts/reports/{scenario_id}-default.json"
+            "cargo run -p lab-cli -- replay --strict --report artifacts/reports/{scenario_id}-default-seed-{seed}.json"
         ),
         reproducible: true,
         submission: Default::default(),
         semantic_fingerprint: String::new(),
         replay: Default::default(),
         compression: compression_from_audit(audit),
+        network: network_from_audit(audit),
+        quota: quota_from_audit(audit),
+        transport: transport_from_audit(audit),
         audit: audit.to_vec(),
     };
     refresh_semantic_fingerprint(&mut report);
     report
+}
+
+#[must_use]
+pub fn network_from_audit(audit: &[AuditRecord]) -> NetworkReport {
+    let proxy = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::ProxyRequest)
+        .collect::<Vec<_>>();
+    let direct = audit
+        .iter()
+        .filter(|record| {
+            record.event_type == AuditEventType::SourceRequest && record.correlation_id.is_none()
+        })
+        .count();
+    NetworkReport {
+        mode: proxy
+            .iter()
+            .filter_map(|record| record.proxy_mode)
+            .next()
+            .unwrap_or_default(),
+        proxy_requests: proxy.len(),
+        direct_source_requests: direct,
+        egress_denied: proxy.iter().any(|record| record.external_target_rejected),
+        reasons: proxy
+            .iter()
+            .filter_map(|record| record.proxy_reason.clone())
+            .collect(),
+    }
+}
+
+#[must_use]
+pub fn quota_from_audit(audit: &[AuditRecord]) -> QuotaReport {
+    let decisions = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::QuotaDecision)
+        .collect::<Vec<_>>();
+    QuotaReport {
+        decisions: decisions.len(),
+        consumed: decisions
+            .iter()
+            .filter(|record| record.quota_consumed)
+            .count(),
+        rate_limited: decisions
+            .iter()
+            .filter(|record| record.quota_rate_limited)
+            .count(),
+        recovery_virtual_wait_ms: decisions
+            .iter()
+            .filter_map(|record| record.quota_recovery_virtual_wait_ms)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+#[must_use]
+pub fn transport_from_audit(audit: &[AuditRecord]) -> TransportReport {
+    let records = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::SourceRequest)
+        .collect::<Vec<_>>();
+    TransportReport {
+        transfer_mode: records
+            .iter()
+            .filter_map(|record| record.transfer_mode)
+            .next(),
+        chunk_count: records.iter().map(|record| record.chunk_count).sum(),
+        malformed: records
+            .iter()
+            .any(|record| record.transport_fault.is_some()),
+        limit_violation: records
+            .iter()
+            .find_map(|record| record.compression_limit_violation.clone()),
+    }
 }
 
 #[must_use]
@@ -259,6 +350,21 @@ fn semantic_projection(report: &RunReport) -> Value {
                 "decoded_bytes": record.decoded_bytes,
                 "content_encoding": record.content_encoding,
                 "compression_limit_violation": record.compression_limit_violation,
+                "event_type": record.event_type,
+                "proxy_mode": record.proxy_mode,
+                "proxy_target": record.proxy_target,
+                "proxy_authentication": record.proxy_authentication,
+                "proxy_reason": record.proxy_reason,
+                "correlation_id": record.correlation_id,
+                "quota_scope": record.quota_scope,
+                "quota_remaining_before": record.quota_remaining_before,
+                "quota_remaining_after": record.quota_remaining_after,
+                "quota_consumed": record.quota_consumed,
+                "quota_rate_limited": record.quota_rate_limited,
+                "quota_recovery_virtual_wait_ms": record.quota_recovery_virtual_wait_ms,
+                "transfer_mode": record.transfer_mode,
+                "chunk_count": record.chunk_count,
+                "transport_fault": record.transport_fault,
             })
         })
         .collect::<Vec<_>>();
@@ -370,14 +476,18 @@ fn request_contract_matches(
     assertions: &Assertions,
     virtual_waited_ms: u64,
 ) -> bool {
-    audit.len() == assertions.expected_requests
-        && audit.iter().filter(|record| !record.matched).count()
+    let source_audit = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::SourceRequest)
+        .collect::<Vec<_>>();
+    source_audit.len() == assertions.expected_requests
+        && source_audit.iter().filter(|record| !record.matched).count()
             == assertions.expected_unmatched_requests
         && assertions
             .endpoint_requests
             .iter()
             .all(|(endpoint, expected)| {
-                audit
+                source_audit
                     .iter()
                     .filter(|record| record.endpoint_id.as_deref() == Some(endpoint))
                     .count()
@@ -386,17 +496,17 @@ fn request_contract_matches(
         && assertions
             .required_paths
             .iter()
-            .all(|path| audit.iter().any(|record| &record.path == path))
+            .all(|path| source_audit.iter().any(|record| &record.path == path))
         && assertions
             .forbidden_paths
             .iter()
-            .all(|path| audit.iter().all(|record| &record.path != path))
+            .all(|path| source_audit.iter().all(|record| &record.path != path))
         && assertions
             .request_sequence
             .iter()
             .enumerate()
             .all(|(index, expected)| {
-                audit.get(index).is_some_and(|actual| {
+                source_audit.get(index).is_some_and(|actual| {
                     actual.endpoint_id.as_deref() == Some(&expected.endpoint)
                         && expected.response_index.is_none_or(|response_index| {
                             actual.response_index == Some(response_index)
@@ -411,6 +521,66 @@ fn request_contract_matches(
             .timing
             .max_virtual_wait_ms
             .is_none_or(|maximum| virtual_waited_ms <= maximum)
+}
+
+fn network_matches(audit: &[AuditRecord], assertions: &Assertions) -> bool {
+    let proxy = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::ProxyRequest)
+        .collect::<Vec<_>>();
+    let direct_source = audit.iter().any(|record| {
+        record.event_type == AuditEventType::SourceRequest && record.correlation_id.is_none()
+    });
+    assertions
+        .expected_proxy_requests
+        .is_none_or(|expected| proxy.len() == expected)
+        && assertions
+            .require_proxy
+            .is_none_or(|required| !required || !proxy.is_empty())
+        && (!assertions.forbid_direct_source || !direct_source)
+}
+
+fn quota_matches(audit: &[AuditRecord], assertions: &Assertions) -> bool {
+    let decisions = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::QuotaDecision)
+        .collect::<Vec<_>>();
+    assertions
+        .expected_quota_decisions
+        .is_none_or(|expected| decisions.len() == expected)
+        && (!assertions.require_quota_rate_limited
+            || decisions.iter().any(|record| record.quota_rate_limited))
+}
+
+fn transport_matches(audit: &[AuditRecord], assertions: &Assertions) -> bool {
+    let source = audit
+        .iter()
+        .filter(|record| record.event_type == AuditEventType::SourceRequest)
+        .collect::<Vec<_>>();
+    assertions
+        .required_content_encoding
+        .as_ref()
+        .is_none_or(|encoding| {
+            source.iter().any(|record| {
+                record
+                    .content_encoding
+                    .as_deref()
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(encoding))
+            })
+        })
+        && assertions.required_transfer_mode.is_none_or(|mode| {
+            source
+                .iter()
+                .any(|record| record.transfer_mode == Some(mode))
+        })
+        && assertions
+            .required_transport_fault
+            .as_ref()
+            .is_none_or(|fault| {
+                source
+                    .iter()
+                    .any(|record| record.transport_fault.as_deref() == Some(fault))
+            })
 }
 
 fn derive_run_status(
