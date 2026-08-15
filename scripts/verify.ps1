@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$Stress
+    [switch]$Stress,
+    [ValidateRange(0, 1000)][int]$Repeat = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,12 @@ Invoke-CargoStep 'negative self-test' @('run', '-p', 'lab-cli', '--', 'self-test
 if ($Stress) {
     Invoke-CargoStep 'large dataset stress verification' @(
         'run', '-p', 'lab-cli', '--', 'run', '--scenario', '019-large-dataset', '--profile', 'stress'
+    )
+}
+
+if ($Repeat -gt 0) {
+    Invoke-CargoStep "repeat verification ($Repeat rounds)" @(
+        'run', '-p', 'lab-cli', '--', 'repeat', '--count', $Repeat
     )
 }
 

@@ -1,6 +1,9 @@
 id: 006-wildcard-and-root
 name: wildcard and root
 description: Filter wildcard and excluded root values.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false

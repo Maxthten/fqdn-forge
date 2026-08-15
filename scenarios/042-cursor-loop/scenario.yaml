@@ -1,0 +1,23 @@
+id: 042-cursor-loop
+name: Cursor rollback and loop
+description: A repeated cursor is reported as a pagination-loop failure.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 42
+endpoints:
+  - id: loop-source
+    source_kind: generic_json
+    match: { method: GET, path: /v12/cursor-loop, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: cursor, parameter: cursor, next_cursor_field: next }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/first.json }
+      - { status: 200, body_file: fixtures/second.json }
+  - id: wrong-cursor
+    source_kind: generic_json
+    match: { method: GET, path: /v12/wrong-cursor, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: cursor, parameter: cursor, next_cursor_field: next }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies: [{ status: 200, wrong_cursor: true, body: { items: [], next: expected-cursor } }]

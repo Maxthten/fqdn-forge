@@ -1,0 +1,14 @@
+id: 025-search-engine-html
+name: Search Engine HTML
+description: Search-result HTML is treated as local untrusted text.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 25
+endpoints:
+  - id: search-html
+    source_kind: search_engine
+    match: { method: GET, path: /v12/search/html, query: { q: { equals: $ROOT_DOMAIN } } }
+    extract: { format: html, items_field: $, candidate_field: host, kind: tokens }
+    replies: [{ status: 200, content_type: text/html, body_file: fixtures/data.html }]

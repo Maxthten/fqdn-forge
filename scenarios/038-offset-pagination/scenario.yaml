@@ -1,0 +1,17 @@
+id: 038-offset-pagination
+name: Offset pagination
+description: Offset continuation stays scoped to one run session.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 38
+endpoints:
+  - id: offset-source
+    source_kind: generic_json
+    match: { method: GET, path: /v12/offset, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: offset, parameter: offset, next_cursor_field: next, start: 0 }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/offset-0.json }
+      - { status: 200, body_file: fixtures/offset-10.json }

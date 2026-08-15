@@ -1,0 +1,5 @@
+expected_fqdns: [time.acme.test]
+expected_observations:
+  time.acme.test: { min_count: 2, source_names: [time-old, time-new], record_ids: [old, new], requires_time: true }
+expected_run_status: success
+expected_source_status: { time-old: success, time-new: success }

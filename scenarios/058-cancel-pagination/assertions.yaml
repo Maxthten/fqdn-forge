@@ -1,0 +1,4 @@
+expected_requests: 1
+endpoint_requests: { cancelled-pages: 1 }
+required_paths: [/v12/cancel-pages]
+request_sequence: [{ endpoint: cancelled-pages, response_index: 0 }]

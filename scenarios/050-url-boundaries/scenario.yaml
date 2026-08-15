@@ -1,0 +1,14 @@
+id: 050-url-boundaries
+name: URL userinfo port and encoding
+description: URL host extraction separates credentials, ports, paths, query and fragments.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 50
+endpoints:
+  - id: url-source
+    source_kind: generic_json
+    match: { method: GET, path: /v12/url, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: url, kind: url }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

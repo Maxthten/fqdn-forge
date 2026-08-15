@@ -1,5 +1,5 @@
 expected_fqdns: [stable.acme.test]
 expected_observations: { stable.acme.test: { source_names: [working] } }
-expected_filter_reasons: []
+expected_filter_reasons: [{ value: "http://198.51.100.10/redirect", reason: blocked_egress }]
 expected_run_status: partial_success
-expected_source_status: { working: success, timeout: timed_out, disconnect: failed }
+expected_source_status: { working: success, timeout: timed_out, disconnect: failed, truncated: failed, malformed: failed, close-before-body: failed, external-redirect: blocked }

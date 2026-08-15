@@ -1,0 +1,17 @@
+id: 037-page-pagination
+name: Page pagination
+description: Numeric page progression is declared in scenario data.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 37
+endpoints:
+  - id: page-source
+    source_kind: generic_json
+    match: { method: GET, path: /v12/page, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: page, parameter: page, next_cursor_field: next, start: 1 }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/page-1.json }
+      - { status: 200, body_file: fixtures/page-2.json }

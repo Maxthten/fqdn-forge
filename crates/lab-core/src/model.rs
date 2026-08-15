@@ -4,16 +4,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A wholly local, declarative test scenario.  Scenario data describes a test
+/// station; it is deliberately not a production collector configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub version: String,
     pub root_domain: String,
     pub seed: u64,
     #[serde(default)]
     pub include_root: bool,
+    pub allow_duplicates: bool,
+    pub allow_concurrent: bool,
     #[serde(default)]
     pub runner: RunnerConfig,
     pub endpoints: Vec<Endpoint>,
@@ -26,6 +31,10 @@ pub struct RunnerConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    #[serde(default = "default_retry_after_cap_ms")]
+    pub retry_after_cap_ms: u64,
     pub cancel_after_requests: Option<usize>,
 }
 
@@ -34,6 +43,8 @@ impl Default for RunnerConfig {
         Self {
             timeout_ms: default_timeout_ms(),
             max_response_bytes: default_max_response_bytes(),
+            max_retries: default_max_retries(),
+            retry_after_cap_ms: default_retry_after_cap_ms(),
             cancel_after_requests: None,
         }
     }
@@ -45,6 +56,14 @@ const fn default_timeout_ms() -> u64 {
 
 const fn default_max_response_bytes() -> usize {
     2 * 1024 * 1024
+}
+
+const fn default_max_retries() -> usize {
+    3
+}
+
+const fn default_retry_after_cap_ms() -> u64 {
+    30_000
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -129,6 +148,8 @@ impl ValueRule {
 pub enum HttpMethod {
     Get,
     Post,
+    Put,
+    Delete,
 }
 
 impl HttpMethod {
@@ -137,6 +158,8 @@ impl HttpMethod {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
         }
     }
 }
@@ -149,6 +172,12 @@ pub struct Pagination {
     #[serde(default = "default_cursor_parameter")]
     pub parameter: String,
     pub next_cursor_field: Option<String>,
+    #[serde(default)]
+    pub in_body: bool,
+    #[serde(default = "default_page_start")]
+    pub start: u64,
+    #[serde(default = "default_page_step")]
+    pub step: u64,
 }
 
 impl Default for Pagination {
@@ -157,12 +186,23 @@ impl Default for Pagination {
             mode: PaginationMode::None,
             parameter: default_cursor_parameter(),
             next_cursor_field: None,
+            in_body: false,
+            start: default_page_start(),
+            step: default_page_step(),
         }
     }
 }
 
 fn default_cursor_parameter() -> String {
     "cursor".to_owned()
+}
+
+const fn default_page_start() -> u64 {
+    1
+}
+
+const fn default_page_step() -> u64 {
+    1
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,22 +213,45 @@ pub enum PaginationMode {
     Cursor,
     Page,
     Offset,
+    Link,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractSpec {
+    /// A dot-separated JSON path.  The legacy field name is retained so all
+    /// 1.1.1 scenario files remain valid.
     pub items_field: String,
+    /// A dot-separated path relative to each item, or a CSV header name.
     pub candidate_field: String,
     #[serde(default = "default_record_id_field")]
     pub record_id_field: String,
     pub timestamp_field: Option<String>,
     #[serde(default)]
     pub kind: ExtractKind,
+    #[serde(default)]
+    pub format: ContentFormat,
+    #[serde(default)]
+    pub tags_field: Option<String>,
+    #[serde(default)]
+    pub confidence_field: Option<String>,
+    #[serde(default)]
+    pub evidence_fields: Vec<String>,
 }
 
 fn default_record_id_field() -> String {
     "id".to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFormat {
+    #[default]
+    Auto,
+    Json,
+    Html,
+    Csv,
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,6 +261,9 @@ pub enum ExtractKind {
     Direct,
     Url,
     Tokens,
+    Html,
+    Csv,
+    Text,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,14 +274,48 @@ pub struct Reply {
     pub headers: BTreeMap<String, String>,
     pub body_file: Option<String>,
     pub body: Option<Value>,
+    pub body_text: Option<String>,
     pub generator: Option<Generator>,
+    pub content_type: Option<String>,
+    pub encoding: Option<String>,
     #[serde(default)]
     pub delay_ms: u64,
     #[serde(default)]
     pub first_byte_delay_ms: u64,
+    #[serde(default, alias = "virtual_wait")]
+    pub virtual_wait_ms: u64,
     #[serde(default)]
     pub disconnect: bool,
+    #[serde(default)]
+    pub connection_reset: bool,
+    #[serde(default)]
+    pub close_before_body: bool,
+    #[serde(default)]
+    pub truncated_body: bool,
+    #[serde(default)]
+    pub malformed_body: bool,
+    #[serde(default)]
+    pub invalid_content_type: bool,
+    pub redirect: Option<String>,
+    pub retry_after: Option<String>,
+    #[serde(alias = "oversized_body")]
+    pub oversized_bytes: Option<usize>,
+    #[serde(default)]
+    pub wrong_cursor: bool,
+    #[serde(default)]
+    pub duplicate_page: bool,
     pub malformed_content_length: Option<usize>,
+}
+
+impl Reply {
+    #[must_use]
+    pub fn content_type(&self) -> &str {
+        if self.invalid_content_type {
+            "application/x-fqdn-forge-invalid"
+        } else {
+            self.content_type.as_deref().unwrap_or("application/json")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -228,6 +328,8 @@ pub struct Generator {
     pub field: String,
     #[serde(default = "default_generator_unique")]
     pub unique: usize,
+    #[serde(default)]
+    pub seeded: bool,
 }
 
 fn default_generator_field() -> String {
@@ -242,9 +344,11 @@ const fn default_generator_unique() -> usize {
 #[serde(rename_all = "snake_case")]
 pub enum GeneratorKind {
     DomainRecords,
+    UrlRecords,
+    NestedDomainRecords,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Truth {
     #[serde(default)]
@@ -252,9 +356,13 @@ pub struct Truth {
     #[serde(default)]
     pub forbidden_fqdns: Vec<String>,
     #[serde(default)]
+    pub allow_additional_fqdns: bool,
+    pub minimum_unique_fqdns: Option<usize>,
+    #[serde(default)]
     pub expected_observations: BTreeMap<String, ObservationExpectation>,
     #[serde(default)]
     pub expected_filter_reasons: Vec<FilterExpectation>,
+    #[serde(default)]
     pub expected_run_status: RunStatus,
     #[serde(default)]
     pub expected_source_status: BTreeMap<String, SourceStatus>,
@@ -273,6 +381,9 @@ pub struct ObservationExpectation {
     pub record_ids: Vec<String>,
     #[serde(default)]
     pub requires_time: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub minimum_confidence: Option<f64>,
 }
 
 const fn default_min_count() -> usize {
@@ -337,6 +448,11 @@ pub struct Observation {
     pub source_name: String,
     pub record_id: Option<String>,
     pub observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub evidence: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -354,8 +470,17 @@ pub struct RunMetrics {
     pub unique_fqdns: usize,
     pub duplicate_candidates: usize,
     pub filtered_candidates: usize,
+    pub false_positives: usize,
+    pub false_negatives: usize,
+    pub request_count: usize,
+    pub retry_count: usize,
+    pub virtual_wait_ms: u64,
     pub elapsed_ms: u64,
     pub estimated_buffer_bytes: usize,
+    pub peak_estimated_buffer_bytes: usize,
+    pub cancelled: bool,
+    pub cancellation_reason: Option<String>,
+    pub blocked_egress: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -369,29 +494,44 @@ pub enum FilterReason {
     PaginationLoop,
     Duplicate,
     ResponseTooLarge,
+    Malformed,
+    EvidenceMissing,
+    EvidenceMismatch,
+    BlockedEgress,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceStatus {
+    Pending,
+    Running,
     Success,
+    Succeeded,
+    Partial,
     Failed,
     TimedOut,
     AuthFailed,
+    Unauthorized,
     RateLimited,
     Cancelled,
+    Blocked,
+    Completed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    #[default]
     Success,
     PartialSuccess,
     Failure,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AuditRecord {
+    #[serde(default)]
+    pub sequence: usize,
     pub run_id: Option<String>,
     pub scenario_id: String,
     pub timestamp: DateTime<Utc>,
@@ -399,10 +539,23 @@ pub struct AuditRecord {
     pub path: String,
     pub query: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub redacted_headers: BTreeMap<String, String>,
     pub body: Option<Value>,
+    pub body_summary: Option<Value>,
     pub endpoint_id: Option<String>,
     pub response_index: Option<usize>,
+    pub response_sequence: Option<usize>,
     pub response_status: u16,
+    #[serde(default)]
+    pub virtual_wait_ms: u64,
+    pub retry_after: Option<String>,
+    #[serde(default)]
+    pub consumed: bool,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub external_target_rejected: bool,
     pub matched: bool,
     pub extra: bool,
     pub mismatch_reasons: Vec<String>,
@@ -410,22 +563,33 @@ pub struct AuditRecord {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RunReport {
+    pub schema_version: String,
+    pub lab_version: String,
+    /// Kept for 1.1.1 JSON consumers.
     pub version: String,
     pub run_id: String,
     pub scenario_id: String,
     pub seed: u64,
+    pub target_domain: String,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub status: ReportStatus,
+    pub result: ReportStatus,
     pub actual_run_status: RunStatus,
     pub expected_run_status: RunStatus,
     pub source_statuses: BTreeMap<String, SourceStatus>,
+    pub truth: Truth,
     pub assertions: AssertionResults,
-    pub requests: RequestSummary,
+    pub requests: Vec<AuditRecord>,
+    pub request_summary: RequestSummary,
     pub virtual_waited_ms: u64,
     #[serde(default)]
     pub metrics: RunMetrics,
     pub failures: Vec<String>,
+    pub violations: Vec<String>,
+    pub replay_command: String,
+    pub reproducible: bool,
+    /// Kept for older GUI/MCP prototypes that read `audit`.
     pub audit: Vec<AuditRecord>,
 }
 

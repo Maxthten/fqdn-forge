@@ -1,0 +1,4 @@
+expected_requests: 2
+endpoint_requests: { offset-source: 2 }
+required_paths: [/v12/offset]
+request_sequence: [{ endpoint: offset-source, response_index: 0 }, { endpoint: offset-source, response_index: 1 }]

@@ -1,0 +1,3 @@
+expected_fqdns: [html.acme.test, text.acme.test]
+expected_run_status: success
+expected_source_status: { generic-html: success }

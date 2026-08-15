@@ -1,0 +1,14 @@
+id: 059-seed-reproducible
+name: Seed reproducibility
+description: A seed controls synthetic local target data without using system randomness.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: target-$SEED.acme.test
+seed: 59
+endpoints:
+  - id: seed-repeatable
+    source_kind: generic_json
+    match: { method: GET, path: /v12/seed/repeatable, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies: [{ status: 200, generator: { kind: domain_records, count: 3, unique: 3, seeded: true } }]

@@ -1,0 +1,18 @@
+id: 039-post-cursor-pagination
+name: POST body cursor pagination
+description: Cursor progression in a POST JSON body is validated without consuming mismatches.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 39
+endpoints:
+  - id: post-cursor
+    source_kind: custom
+    request_body: { domain: $ROOT_DOMAIN }
+    match: { method: POST, path: /v12/post-cursor, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: cursor, parameter: cursor, next_cursor_field: next, in_body: true }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/first.json }
+      - { status: 200, body_file: fixtures/second.json }

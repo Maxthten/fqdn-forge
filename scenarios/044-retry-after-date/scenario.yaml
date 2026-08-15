@@ -1,0 +1,17 @@
+id: 044-retry-after-date
+name: Retry-After HTTP date
+description: An HTTP-date Retry-After is parsed and capped virtually.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 44
+endpoints:
+  - id: retry-date
+    source_kind: generic_json
+    allow_retry: true
+    match: { method: GET, path: /v12/retry/date, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 429, retry_after: 'Wed, 21 Oct 2026 07:28:00 GMT', body_file: fixtures/error.json }
+      - { status: 200, body_file: fixtures/data.json }

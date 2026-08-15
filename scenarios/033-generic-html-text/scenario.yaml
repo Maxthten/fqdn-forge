@@ -1,0 +1,14 @@
+id: 033-generic-html-text
+name: Generic HTML links and text
+description: Generic HTML extraction is data driven and only retains in-scope names.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 33
+endpoints:
+  - id: generic-html
+    source_kind: generic_html
+    match: { method: GET, path: /v12/html/text, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: html, items_field: $, candidate_field: host, kind: html }
+    replies: [{ status: 200, content_type: text/html, body_file: fixtures/data.html }]

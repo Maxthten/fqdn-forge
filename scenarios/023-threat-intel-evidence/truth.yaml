@@ -1,0 +1,5 @@
+expected_fqdns: [intel.acme.test]
+expected_observations:
+  intel.acme.test: { source_kinds: [threat_intel], source_names: [threat-intel], record_ids: [ti-1], requires_time: true, tags: [malware], minimum_confidence: 0.9 }
+expected_run_status: success
+expected_source_status: { threat-intel: success }

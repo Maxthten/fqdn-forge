@@ -1,6 +1,9 @@
 id: 017-timeout-and-disconnect
 name: timeout and disconnect
 description: Handle synthetic timeout and truncated body safely.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false
@@ -18,4 +21,22 @@ endpoints:
   - id: disconnect
     source_kind: generic_json
     match: { method: GET, path: /generic/v1/disconnect, query: { domain: { equals: $ROOT_DOMAIN } } }
-    replies: [{ status: 200, disconnect: true, body_file: fixtures/data.json }]
+    replies: [{ status: 200, disconnect: true, connection_reset: true, body_file: fixtures/data.json }]
+  - id: truncated
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/truncated, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, truncated_body: true, body_file: fixtures/data.json }]
+  - id: malformed
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/malformed, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { items_field: items, candidate_field: host }
+    replies: [{ status: 200, malformed_body: true, body_file: fixtures/data.json }]
+  - id: close-before-body
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/close-before-body, query: { domain: { equals: $ROOT_DOMAIN } } }
+    replies: [{ status: 200, close_before_body: true }]
+  - id: external-redirect
+    source_kind: generic_json
+    match: { method: GET, path: /generic/v1/external-redirect, query: { domain: { equals: $ROOT_DOMAIN } } }
+    replies: [{ status: 302, redirect: http://198.51.100.10/redirect, body: { items: [] } }]

@@ -1,0 +1,3 @@
+expected_fqdns: [partial.acme.test]
+expected_run_status: success
+expected_source_status: { internet-partial: success }

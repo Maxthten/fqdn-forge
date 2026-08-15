@@ -1,0 +1,3 @@
+expected_fqdns: [retry-capped.acme.test]
+expected_run_status: success
+expected_source_status: { retry-invalid: success }

@@ -1,15 +1,9 @@
 # Architecture
 
-`lab-core` owns the YAML schemas, controlled `SourceKind` registry, scenario loading and static validation, domain normalization, egress guard, deterministic reference runner, metrics and truth judge. `lab-server` binds only `127.0.0.1`, hosts synthetic fixtures and implements the JSON Run Session API. `lab-cli` exposes `validate`, `list`, `run`, `self-test` and `serve`. `lab-console` remains a DTO shell; it does not introduce an HTML UI.
+`lab-core` 定义 YAML 模型、固定 SourceKind 注册表、静态校验、域名/URL 规范化、egress guard、通用参考 Runner 和真值裁判。`lab-server` 只绑定 `127.0.0.1`，按场景数据回放 fixture，并维护 RunSession。`lab-cli` 提供 validate、list、run、repeat、replay、self-test 和 serve。`lab-console` 仍只是 DTO 外壳；本版本没有 GUI、MCP 或 AI 集成。
 
-## Session isolation
+每个 RunSession 用 UUID 隔离，拥有 scenario、seed、响应序列、审计和报告。任何来源请求缺少或携带未知 `x-lab-run-id` 都不会读取 fixture 或消耗响应序列。锁只在短暂内存更新期间持有；响应体生成、延迟和 HTTP I/O 都在锁外进行。
 
-`LabState` stores `runs: Map<run_id, RunSession>` plus a separate unscoped diagnostic audit. A `RunSession` owns its scenario ID, timestamps, lifecycle state, per-endpoint response counters, redacted audit and optional report. Source endpoints resolve their rules only from the `x-lab-run-id` session; there is no global active scenario for automated execution. State locks are held only for the short in-memory read/write operation and are released before body generation, response delay or any network wait.
+Runner 使用场景声明的 JSON 路径、HTML/CSV/text 解析、请求模板、认证 header、page/offset/cursor/Link 分页、POST body 分页、Retry-After 和故障响应，不按 scenario id 分支。响应读取受大小上限约束；429 使用 virtual wait，绝不等待真实限流时间；重定向禁用且外部地址在连接前拒绝。
 
-The normal path is `POST /api/runs` → source requests with `x-lab-run-id` → `POST /api/runs/{id}/report`. `reset` and `delete` affect only that run. Deprecated global routes exist solely for an explicit `serve --scenario` developer convenience session and are marked `deprecated: true`.
-
-## Validation and verification
-
-`validate` loads all 20 scenarios without starting HTTP or using a network. It checks fixture containment, request/response sequences, pagination and retry consistency, generator limits, assertion bounds and controlled source kinds. `cargo test` runs the same 20-scenario runner logic used by `lab-cli run`, the same five negative-client routines used by `lab-cli self-test`, and concurrent session integration tests. Scenario 019 reports structured metrics for response bytes, raw records, candidates, unique FQDNs, duplicates, filters, elapsed time and a conservative buffer estimate.
-
-The reference runner sends all traffic through `EgressGuard` before request construction. It accepts only credential-free `http://127.0.0.1:<port>` URLs and disables redirects. Root domains occur only in request data, never as connection hosts. No public network, real API key, DNS query, database, cloud service, GUI or graph visualization is part of this architecture.
+V1.2 报告的机器可读顶层包括 `schema_version`、`lab_version`、`run_id`、`scenario_id`、`seed`、`target_domain`、`result`、`truth`、`assertions`、`requests`、`metrics` 和 `violations`。请求审计使用脱敏 header/body 摘要，并记录 response sequence、状态、是否匹配、是否消耗和出网拦截字段。

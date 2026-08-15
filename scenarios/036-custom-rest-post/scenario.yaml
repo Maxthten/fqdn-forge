@@ -1,0 +1,20 @@
+id: 036-custom-rest-post
+name: Custom REST body contract
+description: POST body validation and response parsing are exercised through plain HTTP.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 36
+endpoints:
+  - id: custom-post
+    source_kind: custom
+    source_label: custom-post-api
+    request_body: { query: subdomains, mode: strict }
+    match:
+      method: POST
+      path: /v12/custom/post
+      query: { domain: { equals: $ROOT_DOMAIN } }
+      json_body: { query: subdomains, mode: strict }
+    extract: { format: json, items_field: results, candidate_field: hostname }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

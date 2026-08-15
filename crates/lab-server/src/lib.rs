@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -24,6 +24,7 @@ use lab_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use url::Url;
 
 pub struct LocalServer {
     address: SocketAddr,
@@ -141,7 +142,16 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
     if let Some(response) = control_response(&state, &method, &path, &body, &base_url).await {
         return response;
     }
-    scenario_response(state, method, path, query, headers, body.to_vec()).await
+    scenario_response(
+        state,
+        method,
+        path,
+        query,
+        headers,
+        body.to_vec(),
+        &base_url,
+    )
+    .await
 }
 
 async fn control_response(
@@ -161,18 +171,23 @@ async fn control_response(
                 ));
             }
         };
-        return Some(match state.create_run(&request.scenario_id) {
-            Ok(run) => json_response(
-                StatusCode::CREATED,
-                json!({
-                    "run_id": run.run_id,
-                    "scenario_id": run.scenario_id,
-                    "base_url": base_url,
-                    "required_request_header": {"x-lab-run-id": run.run_id},
-                }),
-            ),
-            Err(_) => json_response(StatusCode::BAD_REQUEST, json!({"error":"unknown scenario"})),
-        });
+        return Some(
+            match state.create_run_with_seed(&request.scenario_id, request.seed) {
+                Ok(run) => json_response(
+                    StatusCode::CREATED,
+                    json!({
+                        "run_id": run.run_id,
+                        "scenario_id": run.scenario_id,
+                        "seed": run.seed,
+                        "base_url": base_url,
+                        "required_request_header": {"x-lab-run-id": run.run_id},
+                    }),
+                ),
+                Err(_) => {
+                    json_response(StatusCode::BAD_REQUEST, json!({"error":"unknown scenario"}))
+                }
+            },
+        );
     }
     if method == Method::GET && path == "/api/runs" {
         return Some(json_response(
@@ -252,6 +267,8 @@ async fn control_response(
 #[serde(deny_unknown_fields)]
 struct CreateRunRequest {
     scenario_id: String,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 fn run_route(path: &str) -> Option<(&str, Option<&str>)> {
@@ -340,6 +357,7 @@ fn run_summary(run: &RunSession) -> Value {
     json!({
         "run_id":run.run_id,
         "scenario_id":run.scenario_id,
+        "seed":run.seed,
         "status":run.status,
         "created_at":run.created_at,
         "last_activity_at":run.last_activity_at,
@@ -373,6 +391,7 @@ async fn scenario_response(
     query: BTreeMap<String, String>,
     headers: HeaderMap,
     body: Vec<u8>,
+    base_url: &str,
 ) -> Response {
     let run_id = match headers
         .get("x-lab-run-id")
@@ -476,8 +495,9 @@ async fn scenario_response(
         Err(error) => return run_error_response(error),
     };
     let reply = &endpoint.replies[index];
+    let template_context = TemplateContext::from_request(endpoint, &query, &body);
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let record = audit_record(AuditInput {
+    let mut record = audit_record(AuditInput {
         run_id,
         scenario: &loaded.scenario,
         endpoint: Some(endpoint),
@@ -492,6 +512,21 @@ async fn scenario_response(
         extra: false,
         mismatch_reasons: Vec::new(),
     });
+    record.retry_after = reply.retry_after.clone().or_else(|| {
+        reply
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.clone())
+    });
+    record.virtual_wait_ms = reply.virtual_wait_ms;
+    if status.is_redirection()
+        && response_location(reply)
+            .is_some_and(|location| redirect_target_is_external(base_url, location))
+    {
+        record.blocked = true;
+        record.external_target_rejected = true;
+    }
     if state.record_request(run_id, record).is_err() {
         return json_response(StatusCode::CONFLICT, json!({"error":"run was deleted"}));
     }
@@ -502,7 +537,10 @@ async fn scenario_response(
         .get("x-lab-data-profile")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("default");
-    match response_body(reply, &loaded, profile) {
+    if status == StatusCode::NO_CONTENT || reply.close_before_body {
+        return reply_response(status, reply, Vec::new()).await;
+    }
+    match response_body(reply, endpoint, &loaded, profile, run_id, &template_context) {
         Ok(bytes) => reply_response(status, reply, bytes).await,
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -521,6 +559,7 @@ fn match_request(
     run_id: &str,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    let template_context = TemplateContext::from_request(endpoint, query, body);
     for (name, rule) in &endpoint.request_match.query {
         check_rule(
             &mut reasons,
@@ -528,6 +567,7 @@ fn match_request(
             query.get(name).map(String::as_str),
             rule,
             &loaded.scenario,
+            &template_context,
         );
     }
     for name in query.keys() {
@@ -538,13 +578,24 @@ fn match_request(
             reasons.push(format!("unexpected query parameter {name}"));
         }
     }
-    if endpoint.pagination.mode != lab_core::PaginationMode::None {
+    if endpoint.pagination.mode != lab_core::PaginationMode::None
+        && endpoint.pagination.mode != lab_core::PaginationMode::Link
+    {
         let current = state
             .matched_request_count(run_id, &endpoint.id)
             .unwrap_or(0);
         if current > 0 {
-            let expected = previous_cursor(endpoint, loaded, current - 1);
-            if query.get(&endpoint.pagination.parameter) != expected.as_ref() {
+            let expected = previous_cursor(endpoint, loaded, current - 1, state, run_id);
+            let actual = if endpoint.pagination.in_body {
+                serde_json::from_slice::<Value>(body).ok().and_then(|body| {
+                    body.get(&endpoint.pagination.parameter)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            } else {
+                query.get(&endpoint.pagination.parameter).cloned()
+            };
+            if actual.as_ref() != expected.as_ref() {
                 reasons.push("pagination cursor does not match previous reply".to_owned());
             }
         }
@@ -556,6 +607,7 @@ fn match_request(
             headers.get(name).and_then(|value| value.to_str().ok()),
             rule,
             &loaded.scenario,
+            &template_context,
         );
     }
     if let Some(expected_body) = &endpoint.request_match.json_body {
@@ -564,7 +616,7 @@ fn match_request(
             Ok(_) => reasons.push("JSON body does not match".to_owned()),
             Err(_) => reasons.push("body is not valid JSON".to_owned()),
         }
-    } else if !body.is_empty() {
+    } else if !body.is_empty() && endpoint.request_body.is_none() {
         reasons.push("unexpected request body".to_owned());
     }
     reasons
@@ -576,6 +628,7 @@ fn check_rule(
     actual: Option<&str>,
     rule: &ValueRule,
     scenario: &Scenario,
+    template_context: &TemplateContext,
 ) {
     if rule.forbidden && actual.is_some() {
         reasons.push(format!("{label} is forbidden"));
@@ -586,17 +639,24 @@ fn check_rule(
         return;
     }
     if let Some(expected) = &rule.equals {
-        let expected = resolve(expected, scenario);
+        let expected = resolve(expected, scenario, template_context);
         if actual != Some(expected.as_str()) {
             reasons.push(format!("{label} has the wrong value"));
         }
     }
 }
 
-fn resolve(value: &str, scenario: &Scenario) -> String {
+fn resolve(value: &str, scenario: &Scenario, template_context: &TemplateContext) -> String {
     match value {
-        "$ROOT_DOMAIN" => scenario.root_domain.clone(),
+        "$ROOT_DOMAIN" | "$TARGET_DOMAIN" => scenario.root_domain.clone(),
         "$SEED" => scenario.seed.to_string(),
+        "$PAGE" => template_context.page.clone(),
+        "$OFFSET" => template_context.offset.clone(),
+        "$CURSOR" => template_context.cursor.clone(),
+        "$SYNTHETIC_RECORD_ID" => {
+            format!("synthetic-{}-{}", scenario.seed, template_context.page)
+        }
+        "$OBSERVATION_TIME" => format!("2025-01-{:02}T00:00:00Z", scenario.seed % 28 + 1),
         _ => value.to_owned(),
     }
 }
@@ -605,21 +665,50 @@ fn previous_cursor(
     endpoint: &Endpoint,
     loaded: &LoadedScenario,
     previous_index: usize,
+    state: &LabState,
+    run_id: &str,
 ) -> Option<String> {
     let field = endpoint.pagination.next_cursor_field.as_ref()?;
     let reply = endpoint.replies.get(previous_index)?;
-    response_body(reply, loaded, "default")
-        .ok()
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-        .and_then(|value| value.get(field).and_then(Value::as_str).map(str::to_owned))
+    let previous_request = state.audit(run_id).ok()?.into_iter().rev().find(|record| {
+        record.matched && record.endpoint_id.as_deref() == Some(endpoint.id.as_str())
+    })?;
+    let template_context = TemplateContext::from_audit(endpoint, &previous_request);
+    response_body(
+        reply,
+        endpoint,
+        loaded,
+        "default",
+        run_id,
+        &template_context,
+    )
+    .ok()
+    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+    .and_then(|value| value.get(field).and_then(Value::as_str).map(str::to_owned))
 }
 
-fn response_body(reply: &Reply, loaded: &LoadedScenario, profile: &str) -> Result<Vec<u8>, String> {
+fn response_body(
+    reply: &Reply,
+    endpoint: &Endpoint,
+    loaded: &LoadedScenario,
+    profile: &str,
+    run_id: &str,
+    template_context: &TemplateContext,
+) -> Result<Vec<u8>, String> {
     if let Some(file) = &reply.body_file {
-        return fs::read(loaded.directory.join(file)).map_err(|error| error.to_string());
+        let mut bytes = fs::read(loaded.directory.join(file)).map_err(|error| error.to_string())?;
+        materialize_bytes(&mut bytes, loaded, run_id, template_context);
+        return finalize_response_body(reply, endpoint, bytes, run_id);
+    }
+    if let Some(body) = &reply.body_text {
+        let body = materialize_text(body, loaded, run_id, template_context);
+        return finalize_response_body(reply, endpoint, body.into_bytes(), run_id);
     }
     if let Some(body) = &reply.body {
-        return serde_json::to_vec(body).map_err(|error| error.to_string());
+        let body = materialize_json(body, loaded, run_id, template_context);
+        let mut bytes = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+        materialize_bytes(&mut bytes, loaded, run_id, template_context);
+        return finalize_response_body(reply, endpoint, bytes, run_id);
     }
     if let Some(generator) = &reply.generator {
         let count = if profile == "stress" {
@@ -628,35 +717,190 @@ fn response_body(reply: &Reply, loaded: &LoadedScenario, profile: &str) -> Resul
             generator.count
         };
         let items = match generator.kind {
-            GeneratorKind::DomainRecords => (0..count).map(|index| json!({"id":format!("generated-{index}"), generator.field.clone(): format!("bulk-{}.{}", index % generator.unique + 1, loaded.scenario.root_domain)})).collect::<Vec<_>>(),
+            GeneratorKind::DomainRecords => (0..count)
+                .map(|index| {
+                    let value = if generator.seeded {
+                        format!(
+                            "bulk-{}-{}.{}",
+                            loaded.scenario.seed,
+                            index % generator.unique + 1,
+                            loaded.scenario.root_domain
+                        )
+                    } else {
+                        format!(
+                            "bulk-{}.{}",
+                            index % generator.unique + 1,
+                            loaded.scenario.root_domain
+                        )
+                    };
+                    json!({"id":format!("generated-{index}"), generator.field.clone(): value})
+                })
+                .collect::<Vec<_>>(),
+            GeneratorKind::UrlRecords => (0..count)
+                .map(|index| {
+                    let value = if generator.seeded {
+                        format!(
+                            "https://bulk-{}-{}.{}:8443/path?q={index}#fragment",
+                            loaded.scenario.seed,
+                            index % generator.unique + 1,
+                            loaded.scenario.root_domain
+                        )
+                    } else {
+                        format!(
+                            "https://bulk-{}.{}:8443/path?q={index}#fragment",
+                            index % generator.unique + 1,
+                            loaded.scenario.root_domain
+                        )
+                    };
+                    json!({"id":format!("generated-{index}"), generator.field.clone(): value})
+                })
+                .collect::<Vec<_>>(),
+            GeneratorKind::NestedDomainRecords => (0..count)
+                .map(|index| {
+                    let value = if generator.seeded {
+                        format!(
+                            "nested-{}-{}.{}",
+                            loaded.scenario.seed,
+                            index % generator.unique + 1,
+                            loaded.scenario.root_domain
+                        )
+                    } else {
+                        format!(
+                            "nested-{}.{}",
+                            index % generator.unique + 1,
+                            loaded.scenario.root_domain
+                        )
+                    };
+                    json!({"meta":{"record":{"id":format!("generated-{index}"), "host":value}}})
+                })
+                .collect::<Vec<_>>(),
         };
-        return serde_json::to_vec(&json!({"items":items})).map_err(|error| error.to_string());
+        let mut bytes =
+            serde_json::to_vec(&json!({"items":items})).map_err(|error| error.to_string())?;
+        materialize_bytes(&mut bytes, loaded, run_id, template_context);
+        return finalize_response_body(reply, endpoint, bytes, run_id);
     }
     Err("reply has no body source".to_owned())
+}
+
+fn finalize_response_body(
+    reply: &Reply,
+    endpoint: &Endpoint,
+    bytes: Vec<u8>,
+    run_id: &str,
+) -> Result<Vec<u8>, String> {
+    let bytes = with_oversize(reply, bytes);
+    if !reply.wrong_cursor && !reply.duplicate_page {
+        return Ok(bytes);
+    }
+    let mut body = serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())?;
+    if reply.wrong_cursor
+        && let Some(field) = &endpoint.pagination.next_cursor_field
+    {
+        set_json_string(&mut body, field, format!("wrong-cursor-{run_id}"));
+    }
+    if reply.duplicate_page
+        && let Some(extract) = &endpoint.extract
+    {
+        duplicate_json_array(&mut body, &extract.items_field);
+    }
+    serde_json::to_vec(&body).map_err(|error| error.to_string())
+}
+
+fn set_json_string(value: &mut Value, path: &str, replacement: String) {
+    let mut current = value;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            if let Value::Object(values) = current {
+                values.insert(segment.to_owned(), Value::String(replacement));
+            }
+            return;
+        }
+        let Value::Object(values) = current else {
+            return;
+        };
+        let Some(next) = values.get_mut(segment) else {
+            return;
+        };
+        current = next;
+    }
+}
+
+fn duplicate_json_array(value: &mut Value, path: &str) {
+    let mut current = value;
+    for segment in path.split('.') {
+        let Value::Object(values) = current else {
+            return;
+        };
+        let Some(next) = values.get_mut(segment) else {
+            return;
+        };
+        current = next;
+    }
+    if let Value::Array(values) = current {
+        let duplicate = values.clone();
+        values.extend(duplicate);
+    }
+}
+
+fn with_oversize(reply: &Reply, mut bytes: Vec<u8>) -> Vec<u8> {
+    if let Some(size) = reply.oversized_bytes
+        && bytes.len() < size
+    {
+        bytes.resize(size, b'x');
+    }
+    bytes
 }
 
 async fn reply_response(status: StatusCode, reply: &Reply, bytes: Vec<u8>) -> Response {
     if reply.first_byte_delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(reply.first_byte_delay_ms)).await;
     }
-    let sent = if reply.disconnect {
+    let sent = if reply.disconnect
+        || reply.connection_reset
+        || reply.close_before_body
+        || reply.truncated_body
+    {
         bytes[..bytes.len() / 2].to_vec()
+    } else if reply.malformed_body {
+        b"{malformed-response".to_vec()
     } else {
         bytes.clone()
     };
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, reply.content_type())
         .header(header::CONNECTION, "close");
-    let declared_length = reply.malformed_content_length.unwrap_or(bytes.len());
-    builder = builder.header(header::CONTENT_LENGTH, declared_length.to_string());
+    let transport_fault = reply.disconnect
+        || reply.connection_reset
+        || reply.close_before_body
+        || reply.truncated_body
+        || reply.malformed_content_length.is_some();
+    if let Some(location) = &reply.redirect {
+        builder = builder.header(header::LOCATION, location);
+    }
+    if reply.virtual_wait_ms > 0 {
+        builder = builder.header("x-lab-virtual-wait-ms", reply.virtual_wait_ms.to_string());
+    }
+    if let Some(retry_after) = &reply.retry_after {
+        builder = builder.header("retry-after", retry_after);
+    }
+    if let Some(encoding) = &reply.encoding {
+        builder = builder.header(header::CONTENT_ENCODING, encoding);
+    }
     for (name, value) in &reply.headers {
         builder = builder.header(name, value);
     }
-    let body = if reply.disconnect || reply.malformed_content_length.is_some() {
-        Body::from_stream(stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(
-            Bytes::from(sent),
-        )]))
+    let body = if transport_fault {
+        let error = io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "synthetic transport fault",
+        );
+        Body::from_stream(stream::iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from(sent)),
+            Err(error),
+        ]))
     } else {
         Body::from(sent)
     };
@@ -666,6 +910,168 @@ async fn reply_response(status: StatusCode, reply: &Reply, bytes: Vec<u8>) -> Re
             json!({"error":"invalid response headers"}),
         )
     })
+}
+
+fn response_location(reply: &Reply) -> Option<&str> {
+    reply.redirect.as_deref().or_else(|| {
+        reply
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.as_str())
+    })
+}
+
+fn redirect_target_is_external(base_url: &str, location: &str) -> bool {
+    let Ok(base_url) = Url::parse(base_url) else {
+        return true;
+    };
+    let Ok(target) = base_url.join(location) else {
+        return true;
+    };
+    target.scheme() != "http"
+        || target.host_str() != Some("127.0.0.1")
+        || !target.username().is_empty()
+        || target.password().is_some()
+}
+
+#[derive(Clone, Debug)]
+struct TemplateContext {
+    page: String,
+    offset: String,
+    cursor: String,
+}
+
+impl TemplateContext {
+    fn from_request(endpoint: &Endpoint, query: &BTreeMap<String, String>, body: &[u8]) -> Self {
+        let body = serde_json::from_slice::<Value>(body).ok();
+        Self::from_values(endpoint, query, body.as_ref())
+    }
+
+    fn from_audit(endpoint: &Endpoint, record: &AuditRecord) -> Self {
+        Self::from_values(endpoint, &record.query, record.body.as_ref())
+    }
+
+    fn from_values(
+        endpoint: &Endpoint,
+        query: &BTreeMap<String, String>,
+        body: Option<&Value>,
+    ) -> Self {
+        let value = |name: &str| request_value(query, body, name);
+        let pagination_value = value(&endpoint.pagination.parameter);
+        let page = if endpoint.pagination.mode == lab_core::PaginationMode::Page {
+            pagination_value
+                .clone()
+                .unwrap_or_else(|| endpoint.pagination.start.to_string())
+        } else {
+            value("page").unwrap_or_else(|| "1".to_owned())
+        };
+        let offset = if endpoint.pagination.mode == lab_core::PaginationMode::Offset {
+            pagination_value
+                .clone()
+                .unwrap_or_else(|| endpoint.pagination.start.to_string())
+        } else {
+            value("offset").unwrap_or_else(|| "0".to_owned())
+        };
+        let cursor = if endpoint.pagination.mode == lab_core::PaginationMode::Cursor {
+            pagination_value.unwrap_or_default()
+        } else {
+            value("cursor").unwrap_or_default()
+        };
+        Self {
+            page,
+            offset,
+            cursor,
+        }
+    }
+}
+
+fn request_value(
+    query: &BTreeMap<String, String>,
+    body: Option<&Value>,
+    name: &str,
+) -> Option<String> {
+    query.get(name).cloned().or_else(|| {
+        body.and_then(|value| value.get(name))
+            .and_then(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+    })
+}
+
+fn materialize_bytes(
+    bytes: &mut Vec<u8>,
+    loaded: &LoadedScenario,
+    run_id: &str,
+    template_context: &TemplateContext,
+) {
+    let text = materialize_text(
+        &String::from_utf8_lossy(bytes),
+        loaded,
+        run_id,
+        template_context,
+    );
+    *bytes = text.into_bytes();
+}
+
+fn materialize_text(
+    value: &str,
+    loaded: &LoadedScenario,
+    run_id: &str,
+    template_context: &TemplateContext,
+) -> String {
+    value
+        .replace("$TARGET_DOMAIN", &loaded.scenario.root_domain)
+        .replace("$ROOT_DOMAIN", &loaded.scenario.root_domain)
+        .replace("$SEED", &loaded.scenario.seed.to_string())
+        .replace("$RUN_ID", run_id)
+        .replace("$PAGE", &template_context.page)
+        .replace("$OFFSET", &template_context.offset)
+        .replace("$CURSOR", &template_context.cursor)
+        .replace(
+            "$SYNTHETIC_RECORD_ID",
+            &format!(
+                "synthetic-{}-{}",
+                loaded.scenario.seed, template_context.page
+            ),
+        )
+        .replace(
+            "$OBSERVATION_TIME",
+            &format!("2025-01-{:02}T00:00:00Z", loaded.scenario.seed % 28 + 1),
+        )
+}
+
+fn materialize_json(
+    value: &Value,
+    loaded: &LoadedScenario,
+    run_id: &str,
+    template_context: &TemplateContext,
+) -> Value {
+    match value {
+        Value::String(value) => {
+            Value::String(materialize_text(value, loaded, run_id, template_context))
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| materialize_json(value, loaded, run_id, template_context))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        materialize_json(value, loaded, run_id, template_context),
+                    )
+                })
+                .collect(),
+        ),
+        value => value.clone(),
+    }
 }
 
 struct AuditInput<'a> {
@@ -714,7 +1120,10 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
             }
         }
     }
+    let redacted_headers = audit_headers.clone();
+    let redacted_body = redact_body(body);
     AuditRecord {
+        sequence: 0,
         run_id: Some(run_id.to_owned()),
         scenario_id: scenario.id.clone(),
         timestamp: Utc::now(),
@@ -734,10 +1143,18 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
             })
             .collect(),
         headers: audit_headers,
-        body: redact_body(body),
+        body: redacted_body.clone(),
+        body_summary: redacted_body,
         endpoint_id: endpoint.map(|endpoint| endpoint.id.clone()),
         response_index,
+        response_sequence: response_index,
         response_status,
+        redacted_headers,
+        virtual_wait_ms: 0,
+        retry_after: None,
+        consumed: matched,
+        blocked: false,
+        external_target_rejected: false,
         matched,
         extra,
         mismatch_reasons,
@@ -828,13 +1245,13 @@ mod tests {
     use chrono::Utc;
     use lab_core::{
         AuditRecord, EgressGuard, JudgeInput, LoadedScenario, ReferenceRunner, ReportStatus,
-        RunReport, ScenarioRepository, judge_run,
+        RunReport, ScenarioRepository, SourceStatus, judge_run,
     };
     use reqwest::{Client, StatusCode};
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
     use uuid::Uuid;
 
-    use super::LocalServer;
+    use super::{LocalServer, TemplateContext, materialize_text};
 
     fn repository() -> ScenarioRepository {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
@@ -852,8 +1269,11 @@ mod tests {
             r#"id: post-json
 name: post JSON contract
 description: synthetic POST JSON body matcher
+version: "1.2"
 root_domain: acme.test
 seed: 1
+allow_duplicates: false
+allow_concurrent: true
 endpoints:
   - id: post-source
     source_kind: generic_json
@@ -893,23 +1313,26 @@ request_sequence: [{ endpoint: post-source, response_index: 0 }]
             r#"id: redirect
 name: redirect contract
 description: synthetic redirect that the runner must not follow
+version: "1.2"
 root_domain: acme.test
 seed: 2
+allow_duplicates: false
+allow_concurrent: true
 endpoints:
   - id: redirect-source
     source_kind: generic_json
     match: { method: GET, path: /redirect/v1/search, query: { domain: { equals: $ROOT_DOMAIN } } }
     extract: { items_field: items, candidate_field: host }
-    replies: [{ status: 302, headers: { location: /redirect/v1/search?domain=acme.test }, body: { items: [{ id: r1, host: redirect.acme.test }] } }]
+    replies: [{ status: 302, headers: { location: http://198.51.100.10/redirect }, body: { items: [{ id: r1, host: redirect.acme.test }] } }]
 "#,
         )
         .expect("redirect scenario");
         fs::write(
             redirect.join("truth.yaml"),
             r#"expected_fqdns: []
-expected_filter_reasons: []
+expected_filter_reasons: [{ value: http://198.51.100.10/redirect, reason: blocked_egress }]
 expected_run_status: failure
-expected_source_status: { redirect-source: failed }
+expected_source_status: { redirect-source: blocked }
 "#,
         )
         .expect("redirect truth");
@@ -980,6 +1403,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             run_id,
             scenario_id: &loaded.scenario.id,
             seed: loaded.scenario.seed,
+            target_domain: &loaded.scenario.root_domain,
             started_at: started,
             finished_at: Utc::now(),
             collector_run: &collector,
@@ -1004,6 +1428,63 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .iter()
             .filter_map(|record| record.response_index)
             .collect()
+    }
+
+    #[test]
+    fn response_templates_follow_the_current_pagination_request() {
+        let repository = repository();
+
+        let page = repository
+            .get("037-page-pagination")
+            .expect("page scenario");
+        let mut page_query = BTreeMap::new();
+        page_query.insert("page".to_owned(), "4".to_owned());
+        let page_context =
+            TemplateContext::from_request(&page.scenario.endpoints[0], &page_query, &[]);
+        assert_eq!(
+            materialize_text(
+                "$PAGE|$OFFSET|$CURSOR|$SYNTHETIC_RECORD_ID",
+                page,
+                "run-page",
+                &page_context,
+            ),
+            "4|0||synthetic-37-4"
+        );
+
+        let offset = repository
+            .get("038-offset-pagination")
+            .expect("offset scenario");
+        let mut offset_query = BTreeMap::new();
+        offset_query.insert("offset".to_owned(), "40".to_owned());
+        let offset_context =
+            TemplateContext::from_request(&offset.scenario.endpoints[0], &offset_query, &[]);
+        assert_eq!(
+            materialize_text(
+                "$PAGE|$OFFSET|$CURSOR",
+                offset,
+                "run-offset",
+                &offset_context
+            ),
+            "1|40|"
+        );
+
+        let cursor = repository
+            .get("039-post-cursor-pagination")
+            .expect("cursor scenario");
+        let cursor_context = TemplateContext::from_request(
+            &cursor.scenario.endpoints[0],
+            &BTreeMap::new(),
+            br#"{"cursor":"cursor-next"}"#,
+        );
+        assert_eq!(
+            materialize_text(
+                "$PAGE|$OFFSET|$CURSOR",
+                cursor,
+                "run-cursor",
+                &cursor_context
+            ),
+            "1|0|cursor-next"
+        );
     }
 
     #[tokio::test]
@@ -1332,7 +1813,7 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
     }
 
     #[tokio::test]
-    async fn post_body_and_redirect_contracts_are_enforced() {
+    async fn post_body_and_external_redirect_contracts_are_enforced() {
         let (repository, temporary_root) = temporary_contract_repository();
         let post = repository.get("post-json").expect("post scenario").clone();
         let redirect = repository
@@ -1369,11 +1850,23 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert!(response_indices(&requests(&client, &base_url, wrong_run).await).is_empty());
 
         let redirect_run = create_run(&client, &base_url, &redirect.scenario.id).await;
-        let report = run_report(&client, &base_url, &redirect, redirect_run).await;
-        assert_eq!(report.status, ReportStatus::Passed);
+        let guard = EgressGuard::default();
+        let collector = ReferenceRunner::new(guard.clone())
+            .expect("reference runner")
+            .run(&base_url, &redirect.scenario, redirect_run, "default")
+            .await
+            .expect("redirect run");
+        assert_eq!(
+            collector.source_statuses.get("redirect-source"),
+            Some(&SourceStatus::Blocked)
+        );
+        assert!(collector.metrics.blocked_egress);
+        assert_eq!(guard.rejected_urls(), vec!["http://198.51.100.10/redirect"]);
         let redirect_audit = requests(&client, &base_url, redirect_run).await;
         assert_eq!(redirect_audit.len(), 1);
         assert_eq!(redirect_audit[0].response_status, 302);
+        assert!(redirect_audit[0].blocked);
+        assert!(redirect_audit[0].external_target_rejected);
         server.shutdown().await;
         fs::remove_dir_all(temporary_root).expect("remove temporary scenarios");
     }

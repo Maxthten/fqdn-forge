@@ -1,0 +1,5 @@
+expected_requests: 4
+expected_unmatched_requests: 1
+endpoint_requests: { loop-source: 2, wrong-cursor: 2 }
+required_paths: [/v12/cursor-loop, /v12/wrong-cursor]
+request_sequence: [{ endpoint: loop-source, response_index: 0 }, { endpoint: loop-source, response_index: 1 }, { endpoint: wrong-cursor, response_index: 0 }]

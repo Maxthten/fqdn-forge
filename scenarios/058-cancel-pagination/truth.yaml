@@ -1,0 +1,3 @@
+expected_fqdns: [cancelled-first.acme.test]
+expected_run_status: cancelled
+expected_source_status: { cancelled-pages: cancelled }

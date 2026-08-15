@@ -1,6 +1,9 @@
 id: 005-multi-source-overlap
 name: multi source overlap
 description: Deduplicate result names while retaining observations.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false

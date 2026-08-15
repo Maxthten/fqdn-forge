@@ -1,0 +1,3 @@
+expected_fqdns: [page-one.acme.test, page-two.acme.test]
+expected_run_status: success
+expected_source_status: { page-source: success }

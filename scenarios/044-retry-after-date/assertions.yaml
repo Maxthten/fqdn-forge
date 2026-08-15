@@ -1,0 +1,4 @@
+expected_requests: 2
+endpoint_requests: { retry-date: 2 }
+required_paths: [/v12/retry/date]
+timing: { min_virtual_wait_ms: 1, max_virtual_wait_ms: 30000 }

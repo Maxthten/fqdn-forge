@@ -1,0 +1,4 @@
+expected_requests: 2
+endpoint_requests: { slow-source: 1, fast-source: 1 }
+required_paths: [/v12/slow, /v12/fast]
+timing: { min_virtual_wait_ms: 5, max_virtual_wait_ms: 5 }

@@ -1,6 +1,9 @@
 id: 004-basic-code-search
 name: code search
 description: Extract domain-like tokens from snippets.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false

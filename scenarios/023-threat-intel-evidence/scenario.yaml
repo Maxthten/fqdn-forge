@@ -1,0 +1,14 @@
+id: 023-threat-intel-evidence
+name: Threat Intel evidence
+description: Tags, confidence and observation time become source evidence.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 23
+endpoints:
+  - id: threat-intel
+    source_kind: threat_intel
+    match: { method: GET, path: /v12/threat/intel, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: records, candidate_field: domain, record_id_field: id, timestamp_field: seen_at, tags_field: tags, confidence_field: confidence, evidence_fields: [family] }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

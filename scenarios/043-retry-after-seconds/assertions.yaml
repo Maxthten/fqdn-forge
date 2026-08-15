@@ -1,0 +1,4 @@
+expected_requests: 2
+endpoint_requests: { retry-seconds: 2 }
+required_paths: [/v12/retry/seconds]
+timing: { min_virtual_wait_ms: 2000, max_virtual_wait_ms: 2000 }

@@ -1,0 +1,14 @@
+id: 034-generic-html-noise
+name: Generic HTML comments and fake domains
+description: Comments and external pseudo-domains stay out of the result set.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 34
+endpoints:
+  - id: html-noise
+    source_kind: generic_html
+    match: { method: GET, path: /v12/html/noise, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: html, items_field: $, candidate_field: host, kind: tokens }
+    replies: [{ status: 200, content_type: text/html, body_file: fixtures/data.html }]

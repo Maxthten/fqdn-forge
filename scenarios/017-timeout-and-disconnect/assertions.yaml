@@ -1,6 +1,10 @@
-expected_requests: 3
+expected_requests: 7
 endpoint_requests:
   working: 1
   timeout: 1
   disconnect: 1
-expected_rejected_egress_attempts: 0
+  truncated: 1
+  malformed: 1
+  close-before-body: 1
+  external-redirect: 1
+expected_rejected_egress_attempts: 1

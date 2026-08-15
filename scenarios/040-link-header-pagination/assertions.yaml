@@ -1,0 +1,4 @@
+expected_requests: 2
+endpoint_requests: { link-source: 2 }
+required_paths: [/v12/link]
+request_sequence: [{ endpoint: link-source, response_index: 0 }, { endpoint: link-source, response_index: 1 }]

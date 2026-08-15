@@ -1,6 +1,9 @@
 id: 013-pagination-duplicate-loop
 name: pagination duplicate loop
 description: Stop safely on a repeated cursor.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false

@@ -1,0 +1,4 @@
+expected_requests: 2
+endpoint_requests: { post-cursor: 2 }
+required_paths: [/v12/post-cursor]
+request_sequence: [{ endpoint: post-cursor, response_index: 0 }, { endpoint: post-cursor, response_index: 1 }]

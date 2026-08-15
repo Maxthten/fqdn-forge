@@ -1,0 +1,3 @@
+expected_fqdns: [posted.acme.test]
+expected_run_status: success
+expected_source_status: { custom-post: success }

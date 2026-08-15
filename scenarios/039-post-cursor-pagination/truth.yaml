@@ -1,0 +1,3 @@
+expected_fqdns: [cursor-one.acme.test, cursor-two.acme.test]
+expected_run_status: success
+expected_source_status: { post-cursor: success }

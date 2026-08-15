@@ -1,0 +1,19 @@
+id: 040-link-header-pagination
+name: Link header pagination
+description: RFC-style local Link headers drive a second scoped request.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 40
+endpoints:
+  - id: link-source
+    source_kind: generic_json
+    match: { method: GET, path: /v12/link, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: link, parameter: page }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - status: 200
+        headers: { link: '</v12/link?domain=acme.test&page=2>; rel="next"' }
+        body_file: fixtures/first.json
+      - { status: 200, body_file: fixtures/second.json }

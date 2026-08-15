@@ -1,6 +1,9 @@
 id: 019-large-dataset
 name: large dataset
 description: Deterministically generate 10,000 records, with an opt-in 100,000 record stress profile.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false

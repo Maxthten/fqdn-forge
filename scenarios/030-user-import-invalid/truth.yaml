@@ -1,0 +1,6 @@
+expected_fqdns: [valid.acme.test]
+expected_filter_reasons:
+  - { value: valid.acme.test, reason: duplicate }
+  - { value: 127.0.0.1, reason: invalid_domain }
+expected_run_status: success
+expected_source_status: { user-invalid: success }

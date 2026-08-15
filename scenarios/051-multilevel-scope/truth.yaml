@@ -1,0 +1,7 @@
+expected_fqdns: [api.sub.acme.test, a.b.sub.acme.test]
+expected_filter_reasons:
+  - { value: sub.acme.test, reason: root_excluded }
+  - { value: evil-sub.acme.test, reason: out_of_scope }
+  - { value: sub.acme.test.attacker.test, reason: out_of_scope }
+expected_run_status: success
+expected_source_status: { multilevel-scope: success }

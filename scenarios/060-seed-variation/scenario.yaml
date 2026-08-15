@@ -1,0 +1,14 @@
+id: 060-seed-variation
+name: Different seeds vary data
+description: Different explicit seeds change synthetic FQDNs and target domain deterministically.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: target-$SEED.acme.test
+seed: 60
+endpoints:
+  - id: seed-variable
+    source_kind: generic_json
+    match: { method: GET, path: /v12/seed/variable, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies: [{ status: 200, generator: { kind: domain_records, count: 2, unique: 2, seeded: true } }]

@@ -1,0 +1,3 @@
+expected_fqdns: [link-one.acme.test, link-two.acme.test]
+expected_run_status: success
+expected_source_status: { link-source: success }

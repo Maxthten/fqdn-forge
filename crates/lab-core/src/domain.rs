@@ -10,14 +10,34 @@ pub enum CandidateError {
 }
 
 pub fn normalize_domain(value: &str) -> Result<String, CandidateError> {
-    let candidate = value.trim().trim_end_matches('.');
-    if candidate.is_empty() || candidate.len() > 253 {
+    let candidate = value
+        .trim()
+        .trim_matches(|character: char| matches!(character, '`' | '"' | '\'' | ',' | ';'))
+        .trim_end_matches('.');
+    if candidate.is_empty() || candidate.len() > 253 || candidate.contains("..") {
         return Err(CandidateError::Filtered(FilterReason::InvalidDomain));
     }
     match Host::parse(candidate) {
-        Ok(Host::Domain(domain)) if domain.contains('.') => Ok(domain.to_ascii_lowercase()),
+        Ok(Host::Domain(domain)) if domain.contains('.') => {
+            let domain = domain.to_ascii_lowercase();
+            if domain.split('.').all(valid_label) {
+                Ok(domain)
+            } else {
+                Err(CandidateError::Filtered(FilterReason::InvalidDomain))
+            }
+        }
         _ => Err(CandidateError::Filtered(FilterReason::InvalidDomain)),
     }
+}
+
+fn valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
 pub fn accept_candidate(
@@ -46,16 +66,23 @@ pub fn accept_candidate(
 
 pub fn host_from_url(value: &str) -> Result<String, CandidateError> {
     let url = Url::parse(value).map_err(|_| CandidateError::Filtered(FilterReason::InvalidUrl))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url
+            .host()
+            .is_some_and(|host| matches!(host, Host::Ipv4(_) | Host::Ipv6(_)))
+    {
+        return Err(CandidateError::Filtered(FilterReason::InvalidUrl));
+    }
     url.host_str()
-        .map(str::to_owned)
         .ok_or(CandidateError::Filtered(FilterReason::InvalidUrl))
+        .and_then(normalize_domain)
 }
 
 #[must_use]
 pub fn domainish_tokens(value: &str) -> Vec<String> {
     value
         .split(|character: char| {
-            !(character.is_ascii_alphanumeric() || character == '.' || character == '-')
+            !(character.is_alphanumeric() || character == '.' || character == '-')
         })
         .filter(|token| token.contains('.'))
         .map(str::to_owned)

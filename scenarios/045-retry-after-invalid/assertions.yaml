@@ -1,0 +1,4 @@
+expected_requests: 4
+endpoint_requests: { retry-invalid: 4 }
+required_paths: [/v12/retry/invalid]
+timing: { min_virtual_wait_ms: 30000, max_virtual_wait_ms: 30000 }

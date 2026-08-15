@@ -1,0 +1,3 @@
+expected_fqdns: [corp.acme.test, vpn.acme.test]
+expected_run_status: success
+expected_source_status: { organization: success }

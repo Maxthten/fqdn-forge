@@ -1,0 +1,3 @@
+expected_fqdns: [slow.acme.test, fast.acme.test]
+expected_run_status: success
+expected_source_status: { slow-source: success, fast-source: success }

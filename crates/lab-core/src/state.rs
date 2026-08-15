@@ -27,6 +27,7 @@ struct MutableLabState {
 pub struct RunSession {
     pub run_id: String,
     pub scenario_id: String,
+    pub seed: u64,
     pub created_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
     pub status: RunSessionStatus,
@@ -86,13 +87,19 @@ impl LabState {
     }
 
     pub fn create_run(&self, scenario_id: &str) -> Result<RunSession> {
-        if self.repository.get(scenario_id).is_none() {
-            return Err(anyhow!("unknown scenario {scenario_id}"));
-        }
+        self.create_run_with_seed(scenario_id, None)
+    }
+
+    pub fn create_run_with_seed(&self, scenario_id: &str, seed: Option<u64>) -> Result<RunSession> {
+        let scenario = self
+            .repository
+            .get(scenario_id)
+            .ok_or_else(|| anyhow!("unknown scenario {scenario_id}"))?;
         let now = Utc::now();
         let run = RunSession {
             run_id: Uuid::new_v4().to_string(),
             scenario_id: scenario_id.to_owned(),
+            seed: seed.unwrap_or(scenario.scenario.seed),
             created_at: now,
             last_activity_at: now,
             status: RunSessionStatus::Active,
@@ -147,10 +154,17 @@ impl LabState {
         run_id: &str,
     ) -> std::result::Result<LoadedScenario, RunStateError> {
         let run = self.session(run_id)?;
-        self.repository
+        let mut loaded = self
+            .repository
             .get(&run.scenario_id)
             .cloned()
-            .ok_or(RunStateError::UnknownRun)
+            .ok_or(RunStateError::UnknownRun)?;
+        loaded.scenario.seed = run.seed;
+        loaded.scenario.root_domain = loaded
+            .scenario
+            .root_domain
+            .replace("$SEED", &run.seed.to_string());
+        Ok(loaded)
     }
 
     pub fn claim_response_index(
@@ -197,7 +211,7 @@ impl LabState {
     pub fn record_request(
         &self,
         run_id: &str,
-        audit: AuditRecord,
+        mut audit: AuditRecord,
     ) -> std::result::Result<(), RunStateError> {
         validate_run_id(run_id)?;
         let mut inner = self.inner.lock().expect("lab state lock poisoned");
@@ -205,6 +219,7 @@ impl LabState {
             .runs
             .get_mut(run_id)
             .ok_or(RunStateError::UnknownRun)?;
+        audit.sequence = run.audit.len() + 1;
         run.audit.push(audit);
         run.last_activity_at = Utc::now();
         Ok(())

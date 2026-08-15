@@ -1,0 +1,6 @@
+expected_fqdns: [bulk-1.acme.test]
+expected_observations:
+  bulk-1.acme.test: { min_count: 500 }
+expected_filter_reasons: [{ value: bulk-1.acme.test, reason: duplicate }]
+expected_run_status: success
+expected_source_status: { duplicate-evidence: success }

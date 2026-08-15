@@ -1,0 +1,14 @@
+id: 031-generic-json-deep
+name: Generic JSON deep path
+description: A generic source uses dot paths instead of source-specific parsing code.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 31
+endpoints:
+  - id: generic-deep
+    source_kind: generic_json
+    match: { method: GET, path: /v12/generic/deep, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: envelope.payload.nodes, candidate_field: dns.name, record_id_field: meta.id }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

@@ -1,0 +1,14 @@
+id: 029-user-import-csv
+name: User Import valid CSV
+description: Quoted CSV columns are parsed entirely from local fixture data.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 29
+endpoints:
+  - id: user-csv
+    source_kind: user_import
+    match: { method: GET, path: /v12/import/csv, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: csv, items_field: $, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, content_type: text/csv, body_file: fixtures/data.csv }]

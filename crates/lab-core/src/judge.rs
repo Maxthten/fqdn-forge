@@ -12,6 +12,7 @@ pub struct JudgeInput<'a> {
     pub run_id: Uuid,
     pub scenario_id: &'a str,
     pub seed: u64,
+    pub target_domain: &'a str,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub collector_run: &'a CollectorRun,
@@ -26,6 +27,7 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         run_id,
         scenario_id,
         seed,
+        target_domain,
         started_at,
         finished_at,
         collector_run,
@@ -44,7 +46,17 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let expected_fqdns_pass = actual_fqdns == expected_fqdns;
+    let expected_fqdns_pass = if truth.allow_additional_fqdns {
+        expected_fqdns.is_subset(&actual_fqdns)
+            && truth
+                .minimum_unique_fqdns
+                .is_none_or(|minimum| actual_fqdns.len() >= minimum)
+    } else {
+        actual_fqdns == expected_fqdns
+            && truth
+                .minimum_unique_fqdns
+                .is_none_or(|minimum| actual_fqdns.len() >= minimum)
+    };
     let forbidden_pass = truth
         .forbidden_fqdns
         .iter()
@@ -106,21 +118,32 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         ReportStatus::Failed
     };
     RunReport {
+        schema_version: "1.2".to_owned(),
+        lab_version: "1.2".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_string(),
         scenario_id: scenario_id.to_owned(),
         seed,
+        target_domain: target_domain.to_owned(),
         started_at,
         finished_at,
         status,
+        result: status,
         actual_run_status,
         expected_run_status: truth.expected_run_status,
         source_statuses: collector_run.source_statuses.clone(),
         assertions: results,
-        requests,
+        truth: truth.clone(),
+        requests: audit.to_vec(),
+        request_summary: requests,
         virtual_waited_ms: collector_run.virtual_waited_ms,
         metrics: collector_run.metrics.clone(),
         failures,
+        violations: Vec::new(),
+        replay_command: format!(
+            "cargo run -p lab-cli -- replay --report artifacts/reports/{scenario_id}-default.json"
+        ),
+        reproducible: true,
         audit: audit.to_vec(),
     }
 }
@@ -147,6 +170,17 @@ fn evidence_matches(run: &CollectorRun, truth: &Truth) -> bool {
                 observations
                     .iter()
                     .any(|observation| observation.record_id.as_deref() == Some(record_id))
+            })
+            && expected.tags.iter().all(|tag| {
+                observations
+                    .iter()
+                    .any(|observation| observation.tags.iter().any(|actual| actual == tag))
+            })
+            && expected.minimum_confidence.is_none_or(|minimum| {
+                observations
+                    .iter()
+                    .filter_map(|observation| observation.confidence)
+                    .any(|confidence| confidence >= minimum)
             })
             && (!expected.requires_time
                 || observations
@@ -214,9 +248,23 @@ fn request_contract_matches(
 fn derive_run_status(
     statuses: &std::collections::BTreeMap<String, crate::SourceStatus>,
 ) -> RunStatus {
+    if !statuses.is_empty()
+        && statuses
+            .values()
+            .all(|status| *status == crate::SourceStatus::Cancelled)
+    {
+        return RunStatus::Cancelled;
+    }
     let success = statuses
         .values()
-        .filter(|status| **status == crate::SourceStatus::Success)
+        .filter(|status| {
+            matches!(
+                status,
+                crate::SourceStatus::Success
+                    | crate::SourceStatus::Succeeded
+                    | crate::SourceStatus::Completed
+            )
+        })
         .count();
     if success == statuses.len() {
         RunStatus::Success

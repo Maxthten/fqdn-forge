@@ -1,0 +1,5 @@
+expected_fqdns: [evidence.acme.test]
+expected_observations:
+  evidence.acme.test: { min_count: 2, source_names: [evidence-a, evidence-b], record_ids: [ea, eb], tags: [malware, organization], minimum_confidence: 0.8 }
+expected_run_status: success
+expected_source_status: { evidence-a: success, evidence-b: success }

@@ -1,0 +1,14 @@
+id: 027-organization-domains
+name: Organization related domains
+description: Organization source returns synthetic associated FQDNs.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 27
+endpoints:
+  - id: organization
+    source_kind: organization
+    match: { method: GET, path: /v12/org/domains, query: { organization: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: domains, candidate_field: fqdn, record_id_field: id }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

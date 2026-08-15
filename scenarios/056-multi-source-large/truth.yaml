@@ -1,0 +1,7 @@
+expected_fqdns: []
+allow_additional_fqdns: true
+minimum_unique_fqdns: 1000
+expected_observations:
+  bulk-1.acme.test: { min_count: 2, source_names: [large-a, large-b] }
+expected_run_status: success
+expected_source_status: { large-a: success, large-b: success }

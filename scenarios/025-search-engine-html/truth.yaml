@@ -1,0 +1,3 @@
+expected_fqdns: [search.acme.test, docs.acme.test]
+expected_run_status: success
+expected_source_status: { search-html: success }

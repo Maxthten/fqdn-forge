@@ -1,0 +1,4 @@
+expected_fqdns: [loop-one.acme.test, loop-two.acme.test]
+expected_filter_reasons: [{ value: loop, reason: pagination_loop }]
+expected_run_status: failure
+expected_source_status: { loop-source: failed, wrong-cursor: failed }

@@ -1,0 +1,19 @@
+id: 053-evidence-conflict
+name: Multi-source evidence conflict
+description: Conflicting tags and confidence remain independently auditable evidence.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 53
+endpoints:
+  - id: evidence-a
+    source_kind: threat_intel
+    match: { method: GET, path: /v12/evidence/a, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host, record_id_field: id, tags_field: tags, confidence_field: score }
+    replies: [{ status: 200, body_file: fixtures/a.json }]
+  - id: evidence-b
+    source_kind: organization
+    match: { method: GET, path: /v12/evidence/b, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host, record_id_field: id, tags_field: tags, confidence_field: score }
+    replies: [{ status: 200, body_file: fixtures/b.json }]

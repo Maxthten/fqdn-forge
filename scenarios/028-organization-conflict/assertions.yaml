@@ -1,0 +1,3 @@
+expected_requests: 2
+endpoint_requests: { org-primary: 1, org-secondary: 1 }
+required_paths: [/v12/org/primary, /v12/org/secondary]

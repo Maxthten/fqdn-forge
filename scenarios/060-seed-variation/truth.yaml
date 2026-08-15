@@ -1,0 +1,5 @@
+expected_fqdns: []
+allow_additional_fqdns: true
+minimum_unique_fqdns: 2
+expected_run_status: success
+expected_source_status: { seed-variable: success }

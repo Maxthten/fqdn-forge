@@ -1,0 +1,3 @@
+expected_requests: 2
+endpoint_requests: { evidence-a: 1, evidence-b: 1 }
+required_paths: [/v12/evidence/a, /v12/evidence/b]

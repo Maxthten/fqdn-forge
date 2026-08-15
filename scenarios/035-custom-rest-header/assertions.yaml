@@ -1,0 +1,3 @@
+expected_requests: 1
+endpoint_requests: { custom-header: 1 }
+required_paths: [/v12/custom/header]

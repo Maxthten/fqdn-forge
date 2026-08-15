@@ -1,0 +1,3 @@
+expected_fqdns: [header.acme.test]
+expected_run_status: success
+expected_source_status: { custom-header: success }

@@ -1,0 +1,14 @@
+id: 047-wrong-content-type
+name: Wrong Content-Type JSON
+description: Explicit extraction format safely handles JSON served as text/plain.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 47
+endpoints:
+  - id: wrong-content-type
+    source_kind: generic_json
+    match: { method: GET, path: /v12/content-type, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies: [{ status: 200, content_type: text/plain, invalid_content_type: true, body_file: fixtures/data.json }]

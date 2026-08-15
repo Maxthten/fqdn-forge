@@ -1,0 +1,20 @@
+id: 035-custom-rest-header
+name: Custom REST header contract
+description: A custom source validates a synthetic header and keeps it redacted in audit.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 35
+endpoints:
+  - id: custom-header
+    source_kind: custom
+    source_label: custom-rest
+    request_headers: { x-custom-token: lab-custom-token }
+    match:
+      method: GET
+      path: /v12/custom/header
+      query: { domain: { equals: $ROOT_DOMAIN } }
+      headers: { x-custom-token: { equals: lab-custom-token } }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies: [{ status: 200, body_file: fixtures/data.json }]

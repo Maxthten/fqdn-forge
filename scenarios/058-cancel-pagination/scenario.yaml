@@ -1,0 +1,18 @@
+id: 058-cancel-pagination
+name: Cancellation during pagination
+description: Cancellation stops before a second page can consume its reply sequence.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 58
+runner: { cancel_after_requests: 1 }
+endpoints:
+  - id: cancelled-pages
+    source_kind: generic_json
+    match: { method: GET, path: /v12/cancel-pages, query: { domain: { equals: $ROOT_DOMAIN } } }
+    pagination: { mode: cursor, parameter: cursor, next_cursor_field: next }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 200, body_file: fixtures/first.json }
+      - { status: 200, body_file: fixtures/second.json }

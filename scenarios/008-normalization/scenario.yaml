@@ -1,6 +1,9 @@
 id: 008-normalization
 name: normalization
 description: Normalize casing, trailing dots and a Unicode/Punycode pair.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
 root_domain: acme.test
 seed: 20260814
 include_root: false

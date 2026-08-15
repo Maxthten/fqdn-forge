@@ -1,0 +1,19 @@
+id: 045-retry-after-invalid
+name: Retry-After missing invalid and capped
+description: Missing and malformed headers are deterministic; excessive waits are capped.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 45
+endpoints:
+  - id: retry-invalid
+    source_kind: generic_json
+    allow_retry: true
+    match: { method: GET, path: /v12/retry/invalid, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: json, items_field: items, candidate_field: host }
+    replies:
+      - { status: 429, retry_after: nonsense, body_file: fixtures/error.json }
+      - { status: 429, body_file: fixtures/error.json }
+      - { status: 429, retry_after: '999999', body_file: fixtures/error.json }
+      - { status: 200, body_file: fixtures/data.json }

@@ -1,0 +1,6 @@
+expected_fqdns: [shared.acme.test]
+expected_observations:
+  shared.acme.test: { min_count: 2, source_names: [org-primary, org-secondary], record_ids: [p1, s1] }
+expected_filter_reasons: [{ value: unrelated.test, reason: out_of_scope }]
+expected_run_status: success
+expected_source_status: { org-primary: success, org-secondary: success }

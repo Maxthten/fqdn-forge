@@ -1,0 +1,1 @@
+{"envelope":{"payload":{"nodes":[{"meta":{"id":"n1"},"dns":{"name":"deep.acme.test"}},{"meta":{"id":"n2"},"dns":{"name":"node.acme.test"}}]}}}

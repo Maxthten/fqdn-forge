@@ -1,0 +1,4 @@
+expected_fqdns: [linked.acme.test]
+expected_filter_reasons: [{ value: external.test, reason: out_of_scope }]
+expected_run_status: success
+expected_source_status: { search-links: success }

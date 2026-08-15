@@ -1,0 +1,14 @@
+id: 030-user-import-invalid
+name: User Import duplicate and invalid CSV
+description: Invalid rows and duplicate import evidence are deterministically handled.
+version: "1.2"
+allow_duplicates: false
+allow_concurrent: true
+root_domain: acme.test
+seed: 30
+endpoints:
+  - id: user-invalid
+    source_kind: user_import
+    match: { method: GET, path: /v12/import/invalid, query: { domain: { equals: $ROOT_DOMAIN } } }
+    extract: { format: csv, items_field: $, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, content_type: text/csv, body_file: fixtures/data.csv }]
