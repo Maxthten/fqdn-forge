@@ -1,6 +1,6 @@
-expected_fqdns: [api.s096.v14.test]
+expected_fqdns: []
+expected_observations: {}
 forbidden_fqdns: [outside.s096.v14.test]
-expected_observations: { api.s096.v14.test: { source_names: [source], source_kinds: [generic_json], record_ids: [s096] } }
 expected_filter_reasons: []
-expected_run_status: success
-expected_source_status: { source: success }
+expected_run_status: failure
+expected_source_status: { source: failed }

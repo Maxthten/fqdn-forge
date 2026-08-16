@@ -9,8 +9,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    AuditRecord, CollectorSubmission, LoadedScenario, QuotaProfile, QuotaScope, ResourceSummary,
-    RunReport, ScenarioRepository,
+    AuditEventType, AuditRecord, CollectorSubmission, FaultScriptStage, FaultScriptStep,
+    LoadedScenario, QuotaProfile, QuotaScope, ResourceSummary, RunReport, ScenarioRepository,
 };
 
 #[derive(Clone, Debug)]
@@ -50,6 +50,8 @@ pub struct RunSession {
     pub latest_report: Option<RunReport>,
     #[serde(skip_serializing)]
     pub submission: Option<CollectorSubmission>,
+    #[serde(skip_serializing)]
+    pub fault_script_cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -58,6 +60,7 @@ pub enum RunSessionStatus {
     Active,
     Submitted,
     Completed,
+    Cancelled,
     Reset,
     Expired,
 }
@@ -76,11 +79,19 @@ pub struct ResponseMetrics {
     pub response_index: usize,
     pub wire_bytes: usize,
     pub decoded_bytes: usize,
+    pub response_digest: Option<String>,
     pub content_encoding: Option<String>,
     pub compression_limit_violation: Option<String>,
     pub transfer_mode: Option<crate::TransferMode>,
     pub chunk_count: usize,
     pub transport_fault: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum FaultScriptClaim {
+    Unscripted,
+    Matched(FaultScriptStep),
+    Unexpected(String),
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +193,7 @@ impl LabState {
             audit: Vec::new(),
             latest_report: None,
             submission: None,
+            fault_script_cursor: 0,
         };
         self.inner
             .lock()
@@ -240,7 +252,7 @@ impl LabState {
             .scenario
             .root_domain
             .replace("$SEED", &run.seed.to_string());
-        Ok(loaded)
+        Ok(crate::campaign_loaded_scenario(&loaded, run.seed))
     }
 
     pub fn claim_response_index(
@@ -275,6 +287,70 @@ impl LabState {
         Ok(Some(index))
     }
 
+    /// Claims exactly the next declarative fault-script step for this run.
+    /// A mismatch never advances the cursor or the endpoint reply sequence.
+    pub fn claim_fault_script_step(
+        &self,
+        run_id: &str,
+        script: &[FaultScriptStep],
+        stage: FaultScriptStage,
+        endpoint_id: &str,
+        query: &BTreeMap<String, String>,
+        client_virtual_wait_ms: u64,
+    ) -> std::result::Result<FaultScriptClaim, RunStateError> {
+        if script.is_empty() {
+            return Ok(FaultScriptClaim::Unscripted);
+        }
+        validate_run_id(run_id)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or(RunStateError::UnknownRun)?;
+        if !matches!(
+            run.status,
+            RunSessionStatus::Active | RunSessionStatus::Reset
+        ) {
+            return Err(RunStateError::RunNotAcceptingSourceRequests);
+        }
+        let Some(step) = script.get(run.fault_script_cursor).cloned() else {
+            return Ok(FaultScriptClaim::Unexpected(
+                "fault script exhausted".to_owned(),
+            ));
+        };
+        if step.stage != stage {
+            // A proxy step is consumed at the proxy boundary and its paired
+            // source step is consumed only after forwarding.  Seeing the
+            // other boundary while that transition is in progress is normal.
+            return Ok(FaultScriptClaim::Unscripted);
+        }
+        if step.endpoint != endpoint_id {
+            return Ok(FaultScriptClaim::Unexpected(format!(
+                "expected endpoint {} for step {}",
+                step.endpoint, step.id
+            )));
+        }
+        if step
+            .query
+            .iter()
+            .any(|(key, value)| query.get(key) != Some(value))
+        {
+            return Ok(FaultScriptClaim::Unexpected(format!(
+                "request query does not match step {}",
+                step.id
+            )));
+        }
+        if client_virtual_wait_ms < step.minimum_virtual_wait_ms {
+            return Ok(FaultScriptClaim::Unexpected(format!(
+                "step {} requires at least {}ms virtual wait",
+                step.id, step.minimum_virtual_wait_ms
+            )));
+        }
+        run.fault_script_cursor += 1;
+        run.last_activity_at = Utc::now();
+        Ok(FaultScriptClaim::Matched(step))
+    }
+
     pub fn matched_request_count(
         &self,
         run_id: &str,
@@ -286,7 +362,12 @@ impl LabState {
         Ok(run
             .audit
             .iter()
-            .filter(|record| record.endpoint_id.as_deref() == Some(endpoint_id) && record.matched)
+            .filter(|record| {
+                record.endpoint_id.as_deref() == Some(endpoint_id)
+                    && record.matched
+                    && record.event_type == crate::AuditEventType::SourceRequest
+                    && record.response_index.is_some()
+            })
             .count())
     }
 
@@ -335,6 +416,7 @@ impl LabState {
         };
         record.wire_bytes = metrics.wire_bytes;
         record.decoded_bytes = metrics.decoded_bytes;
+        record.response_digest = metrics.response_digest;
         record.content_encoding = metrics.content_encoding;
         record.compression_limit_violation = metrics.compression_limit_violation;
         record.transfer_mode = metrics.transfer_mode;
@@ -371,15 +453,15 @@ impl LabState {
         for profile in profiles {
             let key = quota_key(profile.scope, endpoint_id, credential_identity);
             let mut used = run.quota_counts.get(&key).copied().unwrap_or_default();
-            if used >= profile.success_limit
+            let recovered = used >= profile.success_limit
                 && profile
                     .recover_after_virtual_ms
-                    .is_some_and(|minimum| client_virtual_wait_ms >= minimum)
-            {
+                    .is_some_and(|minimum| client_virtual_wait_ms >= minimum);
+            if recovered {
                 used = 0;
             }
             let remaining_before = profile.success_limit.saturating_sub(used);
-            let rate_limited = used >= profile.success_limit;
+            let rate_limited = used >= profile.success_limit && !recovered;
             permitted &= !rate_limited;
             decisions.push(QuotaDecision {
                 profile: profile.clone(),
@@ -414,6 +496,77 @@ impl LabState {
         self.reset_and_rotate(run_id).map(|_| ())
     }
 
+    /// Stops future source/proxy work for a run while retaining the immutable
+    /// audit so the external client can submit a terminal cancelled status.
+    pub fn cancel(
+        &self,
+        run_id: &str,
+        virtual_wait_ms: u64,
+    ) -> std::result::Result<(), RunStateError> {
+        validate_run_id(run_id)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or(RunStateError::UnknownRun)?;
+        if !matches!(
+            run.status,
+            RunSessionStatus::Active | RunSessionStatus::Reset
+        ) {
+            return Err(RunStateError::RunNotAcceptingSourceRequests);
+        }
+        run.audit.push(AuditRecord {
+            sequence: run.audit.len() + 1,
+            run_id: Some(run.run_id.clone()),
+            scenario_id: run.scenario_id.clone(),
+            timestamp: Utc::now(),
+            method: "CANCEL".to_owned(),
+            path: "<lifecycle:cancel>".to_owned(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            redacted_headers: BTreeMap::new(),
+            body: None,
+            body_summary: None,
+            endpoint_id: None,
+            response_index: None,
+            script_step_id: None,
+            response_sequence: None,
+            response_status: 200,
+            before_submission: true,
+            virtual_wait_ms,
+            retry_after: None,
+            consumed: false,
+            blocked: false,
+            external_target_rejected: false,
+            matched: true,
+            extra: false,
+            mismatch_reasons: Vec::new(),
+            wire_bytes: 0,
+            response_digest: None,
+            decoded_bytes: 0,
+            content_encoding: None,
+            compression_limit_violation: None,
+            event_type: AuditEventType::Lifecycle,
+            proxy_mode: None,
+            proxy_target: None,
+            proxy_authentication: crate::ProxyAuthenticationState::NotApplicable,
+            proxy_reason: Some("cancelled".to_owned()),
+            correlation_id: None,
+            quota_scope: None,
+            quota_remaining_before: None,
+            quota_remaining_after: None,
+            quota_consumed: false,
+            quota_rate_limited: false,
+            quota_recovery_virtual_wait_ms: None,
+            transfer_mode: None,
+            chunk_count: 0,
+            transport_fault: None,
+        });
+        run.status = RunSessionStatus::Cancelled;
+        run.last_activity_at = Utc::now();
+        Ok(())
+    }
+
     /// A reset creates a fresh capability epoch.  Callers that need to continue
     /// through the public control API can use the returned token; stale run and
     /// proxy capabilities are deliberately no longer accepted.
@@ -434,6 +587,7 @@ impl LabState {
             run.quota_counts.clear();
             run.latest_report = None;
             run.submission = None;
+            run.fault_script_cursor = 0;
             run.access_token = Uuid::new_v4().to_string();
             run.last_activity_at = Utc::now();
             run.status = RunSessionStatus::Reset;
@@ -494,7 +648,7 @@ impl LabState {
             }
             if !matches!(
                 run.status,
-                RunSessionStatus::Active | RunSessionStatus::Reset
+                RunSessionStatus::Active | RunSessionStatus::Reset | RunSessionStatus::Cancelled
             ) {
                 return Err(RunStateError::RunNotAcceptingSubmission);
             }

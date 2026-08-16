@@ -1,7 +1,7 @@
 id: 101-proxy-target-canonicalization
 name: Proxy target canonicalization
 description: Positive local reference scenario for exact numeric-loopback proxy allowlisting.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s101.v14.test
 seed: 101
 include_root: false
@@ -9,6 +9,7 @@ allow_duplicates: false
 allow_concurrent: true
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [http_proxy], quota_scope: [none], transport: [identity], fault_class: [egress], execution_style: [single], assertion_focus: [audit, isolation, redaction] }
 composition: { fault_stages: [proxy_connection], event_order: [{ before: external_target_rejected, after: next_valid_request }] }
+network_profile: { mode: http_proxy, proxy_must_be_used: true }
 endpoints:
   - id: source
     source_kind: generic_json

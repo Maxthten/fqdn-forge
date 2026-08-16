@@ -174,6 +174,7 @@ pub fn judge_run(input: JudgeInput<'_>) -> RunReport {
         network: network_from_audit(audit),
         quota: quota_from_audit(audit),
         transport: transport_from_audit(audit),
+        fault_script: Default::default(),
         provenance: Default::default(),
         diagnostics: Default::default(),
         audit: audit.to_vec(),
@@ -314,6 +315,9 @@ pub fn semantic_projection(report: &RunReport) -> Value {
     let mut findings = report.findings.clone();
     findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
     for finding in &mut findings {
+        for evidence in &mut finding.evidence {
+            evidence.url = replay_stable_evidence_url(evidence.url.take());
+        }
         finding.evidence.sort_by(|left, right| {
             (
                 &left.source_id,
@@ -342,6 +346,7 @@ pub fn semantic_projection(report: &RunReport) -> Value {
                 "body": record.body_summary,
                 "endpoint_id": record.endpoint_id,
                 "response_index": record.response_index,
+                "script_step_id": record.script_step_id,
                 "response_status": record.response_status,
                 "before_submission": record.before_submission,
                 "consumed": record.consumed,
@@ -349,15 +354,14 @@ pub fn semantic_projection(report: &RunReport) -> Value {
                 "blocked_egress": record.external_target_rejected,
                 "virtual_wait_ms": record.virtual_wait_ms,
                 "wire_bytes": record.wire_bytes,
+                "response_digest": record.response_digest,
                 "decoded_bytes": record.decoded_bytes,
                 "content_encoding": record.content_encoding,
                 "compression_limit_violation": record.compression_limit_violation,
                 "event_type": record.event_type,
                 "proxy_mode": record.proxy_mode,
-                "proxy_target": record.proxy_target,
                 "proxy_authentication": record.proxy_authentication,
                 "proxy_reason": record.proxy_reason,
-                "correlation_id": record.correlation_id,
                 "quota_scope": record.quota_scope,
                 "quota_remaining_before": record.quota_remaining_before,
                 "quota_remaining_after": record.quota_remaining_after,
@@ -389,7 +393,21 @@ pub fn semantic_projection(report: &RunReport) -> Value {
             "accepted": report.submission.accepted,
             "finding_count": report.submission.finding_count,
         },
+        "fault_script": report.fault_script,
+        "provenance": report.provenance,
     })
+}
+
+fn replay_stable_evidence_url(url: Option<String>) -> Option<String> {
+    let url = url?;
+    let Ok(mut parsed) = url::Url::parse(&url) else {
+        return Some(url);
+    };
+    if parsed.scheme() == "http" && parsed.host_str() == Some("127.0.0.1") {
+        let _ = parsed.set_port(None);
+        return Some(parsed.to_string());
+    }
+    Some(url)
 }
 
 fn first_difference(path: &str, left: &Value, right: &Value) -> Option<String> {
@@ -579,7 +597,7 @@ fn transport_matches(audit: &[AuditRecord], assertions: &Assertions) -> bool {
             .required_transport_fault
             .as_ref()
             .is_none_or(|fault| {
-                source
+                audit
                     .iter()
                     .any(|record| record.transport_fault.as_deref() == Some(fault))
             })
@@ -636,4 +654,23 @@ fn source_status_equivalent(actual: crate::SourceStatus, expected: crate::Source
             Success | Succeeded | Completed
         )
     ) || actual == expected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_stable_evidence_url;
+
+    #[test]
+    fn replay_projection_ignores_ephemeral_loopback_port() {
+        assert_eq!(
+            replay_stable_evidence_url(Some(
+                "http://127.0.0.1:3549/v14/112?domain=s112.v14.test".to_owned()
+            )),
+            Some("http://127.0.0.1/v14/112?domain=s112.v14.test".to_owned())
+        );
+        assert_eq!(
+            replay_stable_evidence_url(Some("https://example.test:8443/source".to_owned())),
+            Some("https://example.test:8443/source".to_owned())
+        );
+    }
 }

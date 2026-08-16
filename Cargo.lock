@@ -810,15 +810,17 @@ dependencies = [
 
 [[package]]
 name = "lab-cli"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "brotli",
  "chrono",
+ "csv",
  "flate2",
  "lab-core",
  "lab-server",
  "reqwest",
+ "scraper",
  "serde_json",
  "tokio",
  "url",
@@ -827,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "lab-console"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "lab-core",
  "serde",
@@ -835,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "lab-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "brotli",
@@ -857,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "lab-server"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "axum",
  "brotli",

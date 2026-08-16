@@ -21,16 +21,17 @@ pub use model::*;
 pub use repository::{LoadedScenario, ScenarioRepository, ValidationIssue};
 pub use runner::{ReferenceRunner, RunnerError};
 pub use state::{
-    LabState, QuotaDecision, RejectedRequestAudit, ResponseMetrics, RunSession, RunSessionStatus,
-    RunStateError,
+    FaultScriptClaim, LabState, QuotaDecision, RejectedRequestAudit, ResponseMetrics, RunSession,
+    RunSessionStatus, RunStateError,
 };
 pub use v14::{
     Baseline, BaselineComparison, CampaignDefinition, CampaignManifest, CampaignReport,
-    CoverageException, CoverageReport, DifferenceSummary, SoakAction, SoakPreset, SoakReport,
-    V14_SCHEMA_VERSION, baseline_from_reports, campaign_definition, campaign_definitions,
-    campaign_manifest, compare_baseline, coverage_check, coverage_markdown, coverage_report,
-    diagnostics_for, enrich_report, fixture_digest, provenance_for, report_differences, run_soak,
-    scenario_revision_digest, stable_digest, validate_v14_scenario,
+    CoverageException, CoverageReport, DifferenceSummary, SoakAction, SoakBaseline, SoakPreset,
+    SoakReport, V14_SCHEMA_VERSION, baseline_from_reports, campaign_definition,
+    campaign_definitions, campaign_loaded_scenario, campaign_manifest, compare_baseline,
+    coverage_check, coverage_markdown, coverage_report, diagnostics_for, enrich_report,
+    fault_script_report, fixture_digest, provenance_for, report_differences, run_soak,
+    scenario_revision_digest, soak_baseline_from_report, stable_digest, validate_v14_scenario,
 };
 
 pub fn report_json(report: &RunReport) -> Result<String, serde_json::Error> {

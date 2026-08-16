@@ -1,7 +1,7 @@
 id: 108-text-html-csv-mutation-campaign
 name: Text HTML CSV mutation campaign
 description: Fixed campaign base scenario for bounded textual shape mutations.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s108.v14.test
 seed: 10801
 include_root: false

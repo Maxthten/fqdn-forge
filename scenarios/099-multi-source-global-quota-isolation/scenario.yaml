@@ -1,7 +1,7 @@
 id: 099-multi-source-global-quota-isolation
 name: Multi-source global quota isolation
 description: Static global quota isolation regression for local source state.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s099.v14.test
 seed: 99
 include_root: false
@@ -9,9 +9,23 @@ allow_duplicates: false
 allow_concurrent: true
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [global_run], transport: [identity], fault_class: [rate_limit], execution_style: [concurrent], assertion_focus: [finding, audit, isolation] }
 composition: { fault_stages: [source_request, lifecycle], event_order: [{ before: quota_decision, after: source_isolation }] }
+fault_script:
+  - { id: source-a-rate-limit, stage: source, endpoint: source-a, response_index: 0 }
+  - { id: source-a-retry, stage: source, endpoint: source-a, response_index: 1, minimum_virtual_wait_ms: 1000 }
+  - { id: source-b-success, stage: source, endpoint: source-b, response_index: 0 }
 endpoints:
-  - id: source
+  - id: source-a
     source_kind: generic_json
-    match: { method: GET, path: /v14/099, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    allow_retry: true
+    quota: [{ scope: global_run, success_limit: 4, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 1000 }]
+    match: { method: GET, path: /v14/099/a, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
     extract: { items_field: items, candidate_field: host, record_id_field: id }
-    replies: [{ status: 200, body: { items: [{ id: s099, host: api.s099.v14.test }] } }]
+    replies:
+      - { status: 429, retry_after: "1", virtual_wait_ms: 1000, body: { error: synthetic_rate_limit } }
+      - { status: 200, body: { items: [{ id: s099a, host: api.s099.v14.test }] } }
+  - id: source-b
+    source_kind: generic_json
+    quota: [{ scope: global_run, success_limit: 4, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 1000 }]
+    match: { method: GET, path: /v14/099/b, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
+    extract: { items_field: items, candidate_field: host, record_id_field: id }
+    replies: [{ status: 200, body: { items: [{ id: s099b, host: api.s099.v14.test }] } }]

@@ -123,7 +123,7 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     if !matches!(
         loaded.scenario.version.as_str(),
-        "1.2" | "1.2.1" | "1.3.0" | V14_SCHEMA_VERSION
+        "1.2" | "1.2.1" | "1.3.0" | "1.4.0" | V14_SCHEMA_VERSION
     ) {
         issues.push(issue_at(
             id,
@@ -133,7 +133,7 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
                 "scenario version {} is unsupported for the V1.4 repository",
                 loaded.scenario.version
             ),
-            "set version to 1.2, 1.2.1, 1.3.0 or 1.4.0",
+            "set version to 1.2, 1.2.1, 1.3.0, 1.4.0 or 1.4.1",
         ));
     }
     let limits = &loaded.scenario.submission;
@@ -205,7 +205,7 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
             issues.push(issue(id, format!("duplicate endpoint id {}", endpoint.id)));
         }
         for quota in &endpoint.quota {
-            if quota.success_limit == 0
+            if (quota.success_limit == 0 && quota.recover_after_virtual_ms.is_none())
                 || quota.retry_after_ms == 0
                 || !(400..=599).contains(&quota.exhausted_status)
             {
@@ -565,14 +565,29 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
             "lower expected_unmatched_requests or raise expected_requests",
         ));
     }
-    for problem in validate_v14_scenario(loaded) {
-        issues.push(issue_at(
-            id,
-            "scenario.yaml",
-            "coverage_tags/composition",
-            problem,
-            "use only controlled V1.4 coverage labels and bounded declarative composition metadata",
-        ));
+    let scenario_number = id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok());
+    if scenario_number.is_some_and(|number| (91..=114).contains(&number)) {
+        if loaded.scenario.version != V14_SCHEMA_VERSION {
+            issues.push(issue_at(
+                id,
+                "scenario.yaml",
+                "version",
+                "V1.4.1 scenarios 091-114 must use version 1.4.1",
+                "set version to 1.4.1",
+            ));
+        }
+        for problem in validate_v14_scenario(loaded) {
+            issues.push(issue_at(
+                id,
+                "scenario.yaml",
+                "coverage_tags/composition",
+                problem,
+                "add the required finite fault-script/HTTP behavior and matching assertions",
+            ));
+        }
     }
     if let Some(number) = id
         .split('-')
@@ -652,8 +667,8 @@ fn validate_loaded(loaded: &LoadedScenario) -> Vec<ValidationIssue> {
                 id,
                 "scenario.yaml",
                 "version",
-                "V1.4 scenarios must use version 1.4.0",
-                "set version to 1.4.0",
+                "V1.4.1 scenarios must use version 1.4.1",
+                "set version to 1.4.1",
             ));
         }
         let assertion_count = 1

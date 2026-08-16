@@ -1,14 +1,17 @@
 id: 096-connect-tunnel-truncated-payload
 name: CONNECT tunnel truncated payload
 description: Local tunnel transport boundary regression with no external socket target.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s096.v14.test
 seed: 96
+network_profile: { mode: connect_proxy, proxy_must_be_used: true, fault: tunnel_close_after_bytes, tunnel_close_after_bytes: 8 }
 include_root: false
 allow_duplicates: false
 allow_concurrent: true
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [connect_proxy], quota_scope: [none], transport: [truncated], fault_class: [disconnect], execution_style: [single], assertion_focus: [finding, audit, resource] }
 composition: { fault_stages: [proxy_connection, response_transport], event_order: [{ before: tunnel_open, after: tunnel_close }] }
+fault_script:
+  - { id: connect-truncated, stage: proxy, endpoint: source, proxy_fault: tunnel_close_after_bytes }
 endpoints:
   - id: source
     source_kind: generic_json

@@ -254,6 +254,14 @@ impl ReferenceRunner {
             .await
             {
                 Ok(Ok(response)) => response,
+                Ok(Err(_))
+                    if (endpoint.allow_retry || scenario.network_profile.allow_retry)
+                        && retries < scenario.runner.max_retries =>
+                {
+                    retries += 1;
+                    run.metrics.retry_count = run.metrics.retry_count.saturating_add(1);
+                    continue;
+                }
                 Ok(Err(_)) => return (SourceStatus::Failed, request_count),
                 Err(_) => return (SourceStatus::TimedOut, request_count),
             };
@@ -290,22 +298,38 @@ impl ReferenceRunner {
                 }
                 return (SourceStatus::Failed, request_count);
             }
-            if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                if endpoint.allow_retry && retries < scenario.runner.max_retries {
+            if matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ) {
+                if (endpoint.allow_retry || scenario.network_profile.allow_retry)
+                    && retries < scenario.runner.max_retries
+                {
                     retries += 1;
                     run.metrics.retry_count = run.metrics.retry_count.saturating_add(1);
-                    let wait = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|value| value.to_str().ok())
-                        .map(parse_retry_after_ms)
-                        .unwrap_or(0)
-                        .min(scenario.runner.retry_after_cap_ms);
+                    let wait = if virtual_wait > 0 {
+                        0
+                    } else {
+                        response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|value| value.to_str().ok())
+                            .map(parse_retry_after_ms)
+                            .unwrap_or(0)
+                            .min(scenario.runner.retry_after_cap_ms)
+                    };
                     run.virtual_waited_ms = run.virtual_waited_ms.saturating_add(wait);
                     client_virtual_wait_ms = client_virtual_wait_ms.saturating_add(wait);
                     continue;
                 }
-                return (SourceStatus::RateLimited, request_count);
+                return (
+                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                        SourceStatus::RateLimited
+                    } else {
+                        SourceStatus::Failed
+                    },
+                    request_count,
+                );
             }
             if matches!(
                 response.status(),
@@ -610,7 +634,31 @@ async fn connect_proxy_probe(
     };
     let response = String::from_utf8_lossy(&response[..count]);
     if response.starts_with("HTTP/1.1 200") {
-        SourceStatus::Success
+        let Some(endpoint) = scenario.endpoints.first() else {
+            return SourceStatus::Failed;
+        };
+        let path = endpoint.request_match.path.clone();
+        let target_domain = scenario
+            .root_domain
+            .replace("$SEED", &scenario.seed.to_string());
+        let request = format!(
+            "GET {path}?domain={target_domain} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\nx-lab-run-id: {run_id}\r\nx-lab-proxy-correlation: connect-{run_id}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).await.is_err() {
+            return SourceStatus::Failed;
+        }
+        let mut tunnel_response = [0_u8; 4096];
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(scenario.network_profile.virtual_timeout_ms.max(50)),
+            stream.read(&mut tunnel_response),
+        )
+        .await
+        {
+            Ok(Ok(read)) if read > 0 => SourceStatus::Success,
+            Ok(Ok(_)) => SourceStatus::Failed,
+            Ok(Err(_)) => SourceStatus::Failed,
+            Err(_) => SourceStatus::TimedOut,
+        }
     } else if response.starts_with("HTTP/1.1 407") || response.starts_with("HTTP/1.1 403") {
         SourceStatus::AuthFailed
     } else {

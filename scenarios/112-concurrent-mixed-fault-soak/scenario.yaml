@@ -1,7 +1,7 @@
 id: 112-concurrent-mixed-fault-soak
 name: Concurrent mixed fault soak
 description: Fixed local scenario anchoring concurrent deterministic soak actions.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s112.v14.test
 seed: 112
 include_root: false
@@ -9,9 +9,14 @@ allow_duplicates: false
 allow_concurrent: true
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [proxy_auth], network_profile: [http_proxy], quota_scope: [per_source], transport: [chunked], fault_class: [lifecycle], execution_style: [soak], assertion_focus: [audit, isolation, resource, determinism] }
 composition: { fault_stages: [proxy_connection, source_request, lifecycle], event_order: [{ before: concurrent_run, after: resource_zero }] }
+network_profile: { mode: http_proxy, proxy_must_be_used: true }
+fault_script:
+  - { id: soak-proxy-source, stage: proxy, endpoint: source }
+  - { id: soak-source, stage: source, endpoint: source, response_index: 0 }
 endpoints:
   - id: source
     source_kind: generic_json
     match: { method: GET, path: /v14/112, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
     extract: { items_field: items, candidate_field: host, record_id_field: id }
-    replies: [{ status: 200, body: { items: [{ id: s112, host: api.s112.v14.test }] } }]
+    quota: [{ scope: per_source, success_limit: 2, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 1000 }]
+    replies: [{ status: 200, transfer_mode: chunked, chunk_count: 2, body: { items: [{ id: s112, host: api.s112.v14.test }] } }]

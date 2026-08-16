@@ -3,9 +3,9 @@ expected_unmatched_requests: 0
 endpoint_requests: { source: 1 }
 required_paths: [/v14/100]
 forbidden_paths: [/api/runs, /truth, /external, /dns]
-request_sequence: [{ endpoint: source, response_index: 0 }]
-timing: { min_virtual_wait_ms: 0, max_virtual_wait_ms: 0 }
+request_sequence: [{ endpoint: source }]
+timing: { min_virtual_wait_ms: 2000, max_virtual_wait_ms: 2000 }
 expected_proxy_requests: 0
-expected_quota_decisions: 0
+expected_quota_decisions: 1
 require_proxy: false
-required_transfer_mode: content_length
+require_quota_rate_limited: true

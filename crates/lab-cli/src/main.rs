@@ -1,16 +1,28 @@
-use std::{env, fs, io::Read, path::PathBuf, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::Read,
+    path::PathBuf,
+    process::{Command, ExitCode},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use anyhow::Context;
 use brotli::Decompressor;
 use chrono::Utc;
+use csv::ReaderBuilder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use lab_core::{
-    AuditEventType, Baseline, CollectorRun, EgressGuard, JudgeInput, Observation, ReferenceRunner,
-    ReportStatus, ScenarioRepository, SoakPreset, SourceKind, SourceStatus, V14_SCHEMA_VERSION,
-    baseline_from_reports, campaign_definitions, campaign_manifest, compare_baseline,
-    coverage_check, coverage_markdown, coverage_report, enrich_report, judge_run,
-    refresh_semantic_fingerprint, report_differences, report_json, run_soak, semantic_difference,
-    semantic_fingerprint,
+    AuditEventType, Baseline, CollectorRun, EgressGuard, JudgeInput, NetworkMode, Observation,
+    ReferenceRunner, ReportStatus, ScenarioRepository, SoakAction, SoakPreset, SoakReport,
+    SourceKind, SourceStatus, V14_SCHEMA_VERSION, baseline_from_reports, campaign_definitions,
+    campaign_loaded_scenario, campaign_manifest, compare_baseline, coverage_check,
+    coverage_markdown, coverage_report, enrich_report, judge_run, refresh_semantic_fingerprint,
+    report_differences, report_json, semantic_difference, semantic_fingerprint,
+    soak_baseline_from_report,
 };
 use lab_server::LocalServer;
 use reqwest::{
@@ -18,9 +30,12 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     redirect::Policy,
 };
+use scraper::{Html, Selector};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::Barrier,
+    task::JoinSet,
 };
 use url::Url;
 use uuid::Uuid;
@@ -74,7 +89,7 @@ async fn run() -> anyhow::Result<bool> {
         "campaign" => campaign_command(&repository, &args).await,
         "coverage" => coverage_command(&repository, &args).await,
         "baseline" => baseline_command(&repository, &args).await,
-        "soak" => soak_command(&repository, &args),
+        "soak" => soak_command(&repository, &args).await,
         "proxy-regression" => proxy_regression_command(&repository).await,
         "serve" => serve_command(repository, &args).await,
         _ => {
@@ -182,9 +197,23 @@ async fn run_one(
     if let Some(seed) = seed_override {
         loaded.scenario.seed = seed;
     }
+    loaded = campaign_loaded_scenario(&loaded, loaded.scenario.seed);
     let server = LocalServer::spawn(repository.clone(), None)
         .await
         .map_err(anyhow::Error::msg)?;
+    if matches!(
+        id,
+        "102-proxy-authority-header-ambiguity"
+            | "105-stale-capability-after-reset-delete"
+            | "106-concurrent-cross-run-lifecycle"
+    ) {
+        let result =
+            external_http_conformance_with_seed(&server.base_url(), id, Some(loaded.scenario.seed))
+                .await
+                .and_then(|report| serde_json::from_value(report).map_err(Into::into));
+        server.shutdown().await;
+        return result;
+    }
     let started = Utc::now();
     let guard = EgressGuard::default();
     let runner = ReferenceRunner::new(guard.clone())?;
@@ -200,6 +229,12 @@ async fn run_one(
     )
     .await?;
     let proxy_url = server.proxy_url();
+    if loaded.scenario.network_profile.initial_proxy_auth_challenge
+        && loaded.scenario.network_profile.mode == NetworkMode::HttpProxy
+    {
+        proxy_auth_challenge_probe(&server.proxy_url(), &server.base_url(), created_run.run_id)
+            .await?;
+    }
     let collector = runner
         .run_with_proxy(
             &server.base_url(),
@@ -296,7 +331,7 @@ async fn replay_command(repository: &ScenarioRepository, args: &[String]) -> any
             "1.2.1" | "1.3.0" | V14_SCHEMA_VERSION
         )
     {
-        eprintln!("strict replay requires a compatible 1.2.1, 1.3.0 or 1.4.0 report schema");
+        eprintln!("strict replay requires a compatible 1.2.1, 1.3.0, 1.4.0 or 1.4.1 report schema");
         return Ok(false);
     }
     if repository.get(&prior.scenario_id).is_none() {
@@ -306,7 +341,7 @@ async fn replay_command(repository: &ScenarioRepository, args: &[String]) -> any
         );
         return Ok(false);
     }
-    let mut replay = run_one(repository, &prior.scenario_id, "default", Some(prior.seed)).await?;
+    let mut replay = replay_report_for_prior(repository, &prior).await?;
     let legacy_provenance = prior.provenance.scenario_revision_digest.is_empty()
         || prior.provenance.fixture_digest.is_empty();
     let provenance_status = if !strict {
@@ -321,7 +356,7 @@ async fn replay_command(repository: &ScenarioRepository, args: &[String]) -> any
         || prior.provenance.campaign_id != replay.provenance.campaign_id
         || prior.provenance.campaign_seed != replay.provenance.campaign_seed
     {
-        "fixture_or_campaign_changed".to_owned()
+        "fixture_or_mutation_changed".to_owned()
     } else {
         "matched".to_owned()
     };
@@ -395,6 +430,36 @@ async fn replay_command(repository: &ScenarioRepository, args: &[String]) -> any
     Ok(matched && replay.status == ReportStatus::Passed)
 }
 
+async fn replay_report_for_prior(
+    repository: &ScenarioRepository,
+    prior: &lab_core::RunReport,
+) -> anyhow::Result<lab_core::RunReport> {
+    let uses_public_submission = prior.submission.received
+        && prior
+            .submission
+            .collector_name
+            .as_deref()
+            .is_some_and(|name| {
+                name.starts_with("fqdn-forge-public-")
+                    || name.starts_with("fqdn-forge-http-conformance")
+            });
+    if !uses_public_submission {
+        return run_one(repository, &prior.scenario_id, "default", Some(prior.seed)).await;
+    }
+    let server = LocalServer::spawn(repository.clone(), None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let result = external_http_conformance_with_seed(
+        &server.base_url(),
+        &prior.scenario_id,
+        Some(prior.seed),
+    )
+    .await
+    .and_then(|report| serde_json::from_value(report).map_err(Into::into));
+    server.shutdown().await;
+    result
+}
+
 async fn conformance_command(
     repository: &ScenarioRepository,
     args: &[String],
@@ -425,13 +490,30 @@ async fn external_http_conformance(
     base_url: &str,
     scenario_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    external_http_conformance_with_seed(base_url, scenario_id, None).await
+}
+
+async fn external_http_conformance_with_seed(
+    base_url: &str,
+    scenario_id: &str,
+    seed: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
     let client = Client::builder()
         .redirect(Policy::none())
         .no_proxy()
         .build()?;
+    match scenario_id {
+        "105-stale-capability-after-reset-delete" => {
+            return public_lifecycle_105_conformance(&client, base_url, seed).await;
+        }
+        "106-concurrent-cross-run-lifecycle" => {
+            return public_lifecycle_106_conformance(&client, base_url, seed).await;
+        }
+        _ => {}
+    }
     let create: serde_json::Value = client
         .post(format!("{base_url}/api/runs"))
-        .json(&serde_json::json!({"scenario_id":scenario_id}))
+        .json(&serde_json::json!({"scenario_id":scenario_id,"seed":seed}))
         .send()
         .await?
         .error_for_status()?
@@ -484,6 +566,10 @@ async fn external_http_conformance(
         .get("mode")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("direct");
+    let network_allows_retry = network
+        .get("allow_retry")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let proxy_values = network
         .get("proxy_authentication")
         .and_then(serde_json::Value::as_object)
@@ -509,19 +595,29 @@ async fn external_http_conformance(
             .no_proxy()
             .build()?
     };
+    if network_mode == "http_proxy"
+        && network
+            .get("initial_proxy_auth_challenge")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        let source = sources
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("proxy-auth conformance needs one manifest source"))?;
+        proxy_auth_challenge_from_manifest(network, source, run_id).await?;
+    }
     let mut findings = Vec::new();
     let mut source_statuses = serde_json::Map::new();
     if network_mode == "connect_proxy" {
-        let status = connect_conformance_probe(network, run_id).await?;
         for source in sources {
             let source_id = source
                 .get("source_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
-            source_statuses.insert(
-                source_id.to_owned(),
-                serde_json::Value::String(status.to_owned()),
-            );
+            let (status, mut source_findings) =
+                connect_conformance_probe(network, source, run_id, max_decoded_bytes).await?;
+            source_statuses.insert(source_id.to_owned(), serde_json::Value::String(status));
+            findings.append(&mut source_findings);
         }
     } else {
         for source in sources {
@@ -529,158 +625,38 @@ async fn external_http_conformance(
                 .get("source_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
-            let source_kind = source
-                .get("source_kind")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_kind"))?;
-            let source_base = source
-                .get("base_url")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("manifest source is missing base_url"))?;
-            let path = source
-                .get("path_template")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("manifest source is missing path_template"))?;
-            let query = source
-                .get("required_query")
-                .and_then(serde_json::Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let authentication = source
-                .get("authentication")
-                .and_then(serde_json::Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let url = format!("{source_base}{path}");
-            let allow_retry = source
-                .get("allow_retry")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let mut virtual_wait_ms = 0_u64;
-            let mut attempts = 0_usize;
-            let response = loop {
-                attempts = attempts.saturating_add(1);
-                let mut request = match source.get("method").and_then(serde_json::Value::as_str) {
-                    Some("POST") => source_client.post(&url),
-                    Some("PUT") => source_client.put(&url),
-                    Some("DELETE") => source_client.delete(&url),
-                    _ => source_client.get(&url),
-                }
-                .header("x-lab-run-id", run_id)
-                .header("x-lab-data-profile", "default")
-                .header("x-lab-client-virtual-wait-ms", virtual_wait_ms.to_string())
-                .query(&query);
-                for (name, value) in &authentication {
-                    let value = value.as_str().ok_or_else(|| {
-                        anyhow::anyhow!("manifest source authentication value is not a string")
-                    })?;
-                    request = request.header(name, value);
-                }
-                if network_mode == "http_proxy" {
-                    if let Some(value) = proxy_values
-                        .get("proxy_authorization")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        request = request.header("proxy-authorization", value);
-                    }
-                    if let Some(value) = proxy_values
-                        .get("proxy_capability")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        request = request.header("x-lab-proxy-capability", value);
-                    }
-                }
-                let response = match request.send().await {
-                    Ok(response) => response,
-                    Err(_) => {
-                        source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
-                        break None;
-                    }
-                };
-                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    && allow_retry
-                    && attempts < 4
-                {
-                    let waited = response
-                        .headers()
-                        .get("x-lab-virtual-wait-ms")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    virtual_wait_ms = virtual_wait_ms.saturating_add(waited.max(1));
-                    continue;
-                }
-                break Some(response);
-            };
-            let Some(response) = response else {
-                continue;
-            };
-            let evidence_url = response.url().to_string();
-            if !response.status().is_success() {
-                let status = match response.status() {
-                    reqwest::StatusCode::TOO_MANY_REQUESTS => "rate_limited",
-                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                        "auth_failed"
-                    }
-                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT => {
-                        "timed_out"
-                    }
-                    _ => "failed",
-                };
-                source_statuses.insert(source_id.to_owned(), serde_json::json!(status));
-                continue;
+            let (mut status, mut source_findings) = collect_manifest_source(
+                &source_client,
+                source,
+                network_mode,
+                network_allows_retry,
+                scenario_id == "100-cancel-during-quota-recovery",
+                &proxy_values,
+                run_id,
+                max_decoded_bytes,
+            )
+            .await?;
+            if scenario_id == "100-cancel-during-quota-recovery" && status == "rate_limited" {
+                client
+                    .post(format!("{base_url}/api/runs/{run_id}/cancel"))
+                    .header(run_access_header, run_access_token)
+                    .header("x-lab-client-virtual-wait-ms", "2000")
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                status = "cancelled".to_owned();
             }
-            source_statuses.insert(source_id.to_owned(), serde_json::json!("succeeded"));
-            let response_headers = response.headers().clone();
-            let wire = match response.bytes().await {
-                Ok(wire) => wire,
-                Err(_) => {
-                    source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
-                    continue;
-                }
-            };
-            let decoded = match decode_conformance_body(&response_headers, &wire, max_decoded_bytes)
-            {
-                Ok(decoded) => decoded,
-                Err(_) => {
-                    source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
-                    continue;
-                }
-            };
-            let payload: serde_json::Value = match serde_json::from_slice(&decoded) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    source_statuses.insert(source_id.to_owned(), serde_json::json!("failed"));
-                    continue;
-                }
-            };
-            for item in payload
-                .get("items")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let Some(fqdn) = item.get("host").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                findings.push(serde_json::json!({
-                    "fqdn":fqdn,
-                    "evidence":[{
-                        "source_id":source_id,
-                        "source_kind":source_kind.clone(),
-                        "record_id":item.get("id").and_then(serde_json::Value::as_str),
-                        "url":evidence_url.clone(),
-                        "observed_at":item.get("observed_at").and_then(serde_json::Value::as_str),
-                        "tags":item.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
-                        "confidence":item.get("confidence").and_then(serde_json::Value::as_f64),
-                    }]
-                }));
-            }
+            source_statuses.insert(source_id.to_owned(), serde_json::Value::String(status));
+            findings.append(&mut source_findings);
         }
     }
+    let collector_name = seed.map_or_else(
+        || "fqdn-forge-http-conformance".to_owned(),
+        |seed| format!("fqdn-forge-http-conformance-seed-{seed}"),
+    );
     let submission = serde_json::json!({
-        "schema_version":"1.4.0",
-        "collector":{"name":"fqdn-forge-http-conformance","version":"1.4.0"},
+        "schema_version":V14_SCHEMA_VERSION,
+        "collector":{"name":collector_name,"version":V14_SCHEMA_VERSION},
         "target_domain":target_domain,
         "source_statuses":source_statuses,
         "findings":findings,
@@ -707,7 +683,316 @@ async fn external_http_conformance(
     if report.get("truth").is_some() {
         anyhow::bail!("public report leaked truth");
     }
+    let cleanup = client
+        .delete(format!("{base_url}/api/runs/{run_id}"))
+        .header(run_access_header, run_access_token)
+        .send()
+        .await?;
+    if cleanup.status() != reqwest::StatusCode::NO_CONTENT {
+        anyhow::bail!("public conformance could not clean up its completed run");
+    }
     Ok(report)
+}
+
+/// Drives an advertised source exclusively through fields returned by the
+/// public manifest.  Pagination and virtual retry time are state local to one
+/// source, so a rejected request cannot accidentally advance another source.
+#[allow(clippy::too_many_arguments)]
+async fn collect_manifest_source(
+    client: &Client,
+    source: &serde_json::Value,
+    network_mode: &str,
+    network_allows_retry: bool,
+    stop_on_rate_limit: bool,
+    proxy_values: &serde_json::Map<String, serde_json::Value>,
+    run_id: &str,
+    max_decoded_bytes: usize,
+) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
+    let source_id = source
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
+    let source_kind = source
+        .get("source_kind")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_kind"))?;
+    let base_url = source
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest source is missing base_url"))?;
+    let path = source
+        .get("path_template")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest source is missing path_template"))?;
+    let authentication = source
+        .get("authentication")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut query = source
+        .get("required_query")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_owned())))
+        .collect::<BTreeMap<_, _>>();
+    let pagination_mode = source
+        .get("pagination_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    let pagination_parameter = source
+        .get("pagination_parameter")
+        .and_then(serde_json::Value::as_str);
+    let next_page_field = source
+        .get("next_page_field")
+        .and_then(serde_json::Value::as_str);
+    if pagination_mode == "page"
+        && let Some(parameter) = pagination_parameter
+    {
+        query
+            .entry(parameter.to_owned())
+            .or_insert_with(|| "1".to_owned());
+    }
+    let allow_retry = network_allows_retry
+        || source
+            .get("allow_retry")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    let url = format!("{base_url}{path}");
+    let mut findings = Vec::new();
+    let mut virtual_wait_ms = 0_u64;
+    let mut attempts = 0_usize;
+    let mut seen_tokens = Vec::new();
+    loop {
+        attempts = attempts.saturating_add(1);
+        if attempts > 8 {
+            return Ok(("failed".to_owned(), findings));
+        }
+        let mut request = match source.get("method").and_then(serde_json::Value::as_str) {
+            Some("POST") => client.post(&url),
+            Some("PUT") => client.put(&url),
+            Some("DELETE") => client.delete(&url),
+            _ => client.get(&url),
+        }
+        .header("x-lab-run-id", run_id)
+        .header("x-lab-data-profile", "default")
+        .header("x-lab-client-virtual-wait-ms", virtual_wait_ms.to_string())
+        .query(&query);
+        for (name, value) in &authentication {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow::anyhow!("manifest source authentication value is not a string")
+            })?;
+            request = request.header(name, value);
+        }
+        if network_mode == "http_proxy" {
+            for (manifest_name, header_name) in [
+                ("proxy_authorization", "proxy-authorization"),
+                ("proxy_capability", "x-lab-proxy-capability"),
+            ] {
+                if let Some(value) = proxy_values
+                    .get(manifest_name)
+                    .and_then(serde_json::Value::as_str)
+                {
+                    request = request.header(header_name, value);
+                }
+            }
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) if allow_retry && attempts < 4 => continue,
+            Err(_) => return Ok(("failed".to_owned(), findings)),
+        };
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && stop_on_rate_limit {
+            return Ok(("rate_limited".to_owned(), findings));
+        }
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && allow_retry
+            && attempts < 4
+        {
+            virtual_wait_ms =
+                virtual_wait_ms.saturating_add(retry_after_virtual_ms(response.headers()));
+            continue;
+        }
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && allow_retry
+            && attempts < 4
+        {
+            continue;
+        }
+        if !response.status().is_success() {
+            let status = match response.status() {
+                reqwest::StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => "auth_failed",
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT => {
+                    "timed_out"
+                }
+                _ => "failed",
+            };
+            return Ok((status.to_owned(), findings));
+        }
+        let evidence_url = response.url().to_string();
+        let response_headers = response.headers().clone();
+        let wire = match response.bytes().await {
+            Ok(wire) => wire,
+            Err(_) => return Ok(("failed".to_owned(), findings)),
+        };
+        let decoded = match decode_conformance_body(&response_headers, &wire, max_decoded_bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => return Ok(("failed".to_owned(), findings)),
+        };
+        let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+            for (fqdn, record_id) in public_text_response_records(&response_headers, &decoded) {
+                findings.push(serde_json::json!({
+                    "fqdn":fqdn,
+                    "evidence":[{
+                        "source_id":source_id,
+                        "source_kind":source_kind.clone(),
+                        "record_id":record_id,
+                        "url":evidence_url,
+                        "observed_at":serde_json::Value::Null,
+                        "tags":[],
+                        "confidence":serde_json::Value::Null,
+                    }]
+                }));
+            }
+            return Ok(("succeeded".to_owned(), findings));
+        };
+        for item in payload
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(fqdn) = item.get("host").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            findings.push(serde_json::json!({
+                "fqdn":fqdn,
+                "evidence":[{
+                    "source_id":source_id,
+                    "source_kind":source_kind.clone(),
+                    "record_id":item.get("id").and_then(serde_json::Value::as_str),
+                    "url":evidence_url,
+                    "observed_at":item.get("observed_at").and_then(serde_json::Value::as_str),
+                    "tags":item.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "confidence":item.get("confidence").and_then(serde_json::Value::as_f64),
+                }]
+            }));
+        }
+        let next_token = next_page_field
+            .and_then(|field| payload.get(field))
+            .and_then(|value| match value {
+                serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            });
+        let Some(token) = next_token else {
+            return Ok(("succeeded".to_owned(), findings));
+        };
+        let Some(parameter) = pagination_parameter else {
+            return Ok(("failed".to_owned(), findings));
+        };
+        if seen_tokens.iter().any(|seen| seen == &token) {
+            return Ok(("failed".to_owned(), findings));
+        }
+        seen_tokens.push(token.clone());
+        query.insert(parameter.to_owned(), token);
+    }
+}
+
+/// Parses bounded text, HTML, and CSV replies that a source advertised over
+/// the public manifest. This remains entirely response-driven: it neither
+/// loads campaign fixtures nor consults scenario truth.
+fn public_text_response_records(
+    headers: &HeaderMap,
+    decoded: &[u8],
+) -> Vec<(String, Option<String>)> {
+    let Ok(body) = std::str::from_utf8(decoded) else {
+        return Vec::new();
+    };
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("text/csv") {
+        return public_csv_response_records(body);
+    }
+    if content_type.starts_with("text/html") {
+        return public_html_response_records(body);
+    }
+    body.split_whitespace()
+        .take(256)
+        .filter_map(public_response_candidate)
+        .map(|fqdn| (fqdn, None))
+        .collect()
+}
+
+fn public_csv_response_records(body: &str) -> Vec<(String, Option<String>)> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(body.as_bytes());
+    let Ok(headers) = reader.headers().cloned() else {
+        return Vec::new();
+    };
+    let host_index = headers.iter().position(|header| header == "host");
+    let record_id_index = headers.iter().position(|header| header == "id");
+    let Some(host_index) = host_index else {
+        return Vec::new();
+    };
+    reader
+        .records()
+        .take(64)
+        .filter_map(Result::ok)
+        .filter_map(|record| {
+            let fqdn = record.get(host_index).and_then(public_response_candidate)?;
+            let record_id = record_id_index
+                .and_then(|index| record.get(index))
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            Some((fqdn, record_id))
+        })
+        .collect()
+}
+
+fn public_html_response_records(body: &str) -> Vec<(String, Option<String>)> {
+    let document = Html::parse_fragment(body);
+    let Ok(selector) = Selector::parse("a[href]") else {
+        return Vec::new();
+    };
+    document
+        .select(&selector)
+        .take(64)
+        .filter_map(|anchor| anchor.value().attr("href"))
+        .filter_map(public_response_candidate)
+        .map(|fqdn| (fqdn, None))
+        .collect()
+}
+
+fn public_response_candidate(value: &str) -> Option<String> {
+    let value = value.trim_matches(|character: char| "\"'<>),;".contains(character));
+    let candidate = Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| value.to_owned());
+    lab_core::normalize_domain(&candidate).ok()
+}
+
+fn retry_after_virtual_ms(headers: &HeaderMap) -> u64 {
+    let Some(value) = headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return 1;
+    };
+    if let Ok(seconds) = value.parse::<u64>() {
+        return seconds.saturating_mul(1_000).max(1);
+    }
+    // HTTP-date is intentionally parsed, but the loopback virtual clock uses
+    // the bounded V1.4 retry quantum rather than wall-clock time.
+    chrono::DateTime::parse_from_rfc2822(value)
+        .map(|_| 2_000)
+        .unwrap_or(1)
 }
 
 fn decode_conformance_body(
@@ -743,8 +1028,10 @@ fn decode_conformance_body(
 
 async fn connect_conformance_probe(
     network: &serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Value,
     run_id: &str,
-) -> anyhow::Result<&'static str> {
+    max_decoded_bytes: usize,
+) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
     let proxy_url = network
         .get("proxy_url")
         .and_then(serde_json::Value::as_str)
@@ -785,15 +1072,234 @@ async fn connect_conformance_probe(
     .await
     .map_err(|_| anyhow::anyhow!("local CONNECT probe timed out"))??;
     let response = String::from_utf8_lossy(&response[..count]);
-    Ok(if response.starts_with("HTTP/1.1 200") {
-        "succeeded"
-    } else if response.starts_with("HTTP/1.1 407") || response.starts_with("HTTP/1.1 403") {
-        "auth_failed"
-    } else if response.starts_with("HTTP/1.1 504") {
-        "timed_out"
+    if !response.starts_with("HTTP/1.1 200") {
+        let status = if response.starts_with("HTTP/1.1 407") || response.starts_with("HTTP/1.1 403")
+        {
+            "auth_failed"
+        } else if response.starts_with("HTTP/1.1 504") {
+            "timed_out"
+        } else {
+            "failed"
+        };
+        return Ok((status.to_owned(), Vec::new()));
+    }
+    let source_id = source
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CONNECT source is missing source_id"))?;
+    let source_kind = source
+        .get("source_kind")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("CONNECT source is missing source_kind"))?;
+    let base_url = source
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CONNECT source is missing base_url"))?;
+    let path = source
+        .get("path_template")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CONNECT source is missing path_template"))?;
+    let mut url = Url::parse(&format!("{base_url}{path}"))?;
+    if let Some(query) = source
+        .get("required_query")
+        .and_then(serde_json::Value::as_object)
+    {
+        url.query_pairs_mut().extend_pairs(
+            query
+                .iter()
+                .filter_map(|(name, value)| value.as_str().map(|value| (name.as_str(), value))),
+        );
+    }
+    let host = format!(
+        "127.0.0.1:{}",
+        url.port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("CONNECT source URL is missing a port"))?
+    );
+    let request_path = if let Some(query) = url.query() {
+        format!("{}?{query}", url.path())
     } else {
-        "failed"
-    })
+        url.path().to_owned()
+    };
+    let mut request = format!(
+        "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nx-lab-run-id: {run_id}\r\nx-lab-data-profile: default\r\nx-lab-client-virtual-wait-ms: 0\r\nConnection: close\r\n"
+    );
+    if let Some(authentication) = source
+        .get("authentication")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, value) in authentication {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow::anyhow!("CONNECT source authentication value is not a string")
+            })?;
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    request.push_str("\r\n");
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return Ok(("failed".to_owned(), Vec::new()));
+    }
+    let mut wire = Vec::new();
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream.read_to_end(&mut wire),
+        )
+        .await,
+        Ok(Ok(_))
+    ) {
+        return Ok(("failed".to_owned(), Vec::new()));
+    }
+    let Some(headers_end) = wire.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(("failed".to_owned(), Vec::new()));
+    };
+    let response_head = std::str::from_utf8(&wire[..headers_end])?;
+    let mut lines = response_head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Ok(("failed".to_owned(), Vec::new()));
+    }
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (Ok(name), Ok(value)) = (
+            name.parse::<reqwest::header::HeaderName>(),
+            value.trim().parse::<HeaderValue>(),
+        ) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
+    let decoded =
+        match decode_conformance_body(&headers, &wire[headers_end + 4..], max_decoded_bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => return Ok(("failed".to_owned(), Vec::new())),
+        };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return Ok(("succeeded".to_owned(), Vec::new()));
+    };
+    let evidence_url: String = url.into();
+    let findings = payload
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let fqdn = item.get("host").and_then(serde_json::Value::as_str)?;
+            Some(serde_json::json!({
+                "fqdn":fqdn,
+                "evidence":[{
+                    "source_id":source_id,
+                    "source_kind":source_kind.clone(),
+                    "record_id":item.get("id").and_then(serde_json::Value::as_str),
+                    "url":evidence_url,
+                    "observed_at":item.get("observed_at").and_then(serde_json::Value::as_str),
+                    "tags":item.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "confidence":item.get("confidence").and_then(serde_json::Value::as_f64),
+                }]
+            }))
+        })
+        .collect();
+    Ok(("succeeded".to_owned(), findings))
+}
+
+async fn proxy_auth_challenge_probe(
+    proxy_url: &str,
+    source_url: &str,
+    run_id: Uuid,
+) -> anyhow::Result<()> {
+    let proxy = Url::parse(proxy_url)?;
+    let source = Url::parse(source_url)?;
+    let port = proxy
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("proxy URL has no port"))?;
+    let target = format!(
+        "http://127.0.0.1:{}{}",
+        source.port_or_known_default().unwrap_or_default(),
+        "/v14/094?domain=s094.v14.test"
+    );
+    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-lab-run-id: {run_id}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = [0_u8; 256];
+    let count = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.read(&mut response),
+    )
+    .await??;
+    let response = String::from_utf8_lossy(&response[..count]);
+    if !response.starts_with("HTTP/1.1 407") {
+        anyhow::bail!("proxy auth challenge did not return 407");
+    }
+    Ok(())
+}
+
+async fn proxy_auth_challenge_from_manifest(
+    network: &serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Value,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    let proxy_url = network
+        .get("proxy_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("proxy-auth manifest is missing proxy_url"))?;
+    let proxy = Url::parse(proxy_url)?;
+    if proxy.scheme() != "http" || proxy.host_str() != Some("127.0.0.1") {
+        anyhow::bail!("proxy-auth manifest proxy is not numeric IPv4 loopback");
+    }
+    let base_url = source
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("proxy-auth manifest source is missing base_url"))?;
+    let path = source
+        .get("path_template")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("proxy-auth manifest source is missing path_template"))?;
+    let mut target = Url::parse(&format!("{base_url}{path}"))?;
+    if let Some(query) = source
+        .get("required_query")
+        .and_then(serde_json::Value::as_object)
+    {
+        target.query_pairs_mut().extend_pairs(
+            query
+                .iter()
+                .filter_map(|(name, value)| value.as_str().map(|value| (name.as_str(), value))),
+        );
+    }
+    let target: String = target.into();
+    let source = Url::parse(base_url)?;
+    let host = format!(
+        "127.0.0.1:{}",
+        source
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("proxy-auth source has no port"))?
+    );
+    let port = proxy
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("proxy-auth proxy has no port"))?;
+    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nx-lab-run-id: {run_id}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = [0_u8; 256];
+    let count = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.read(&mut response),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("proxy-auth loopback challenge timed out"))??;
+    if !std::str::from_utf8(&response[..count])?.starts_with("HTTP/1.1 407") {
+        anyhow::bail!("proxy-auth loopback challenge did not return 407");
+    }
+    Ok(())
 }
 
 async fn campaign_command(
@@ -837,9 +1343,23 @@ async fn campaign_command(
             let current =
                 execute_campaign(repository, &prior.manifest.campaign_id, prior.manifest.seed)
                     .await?;
-            let matched = prior.manifest.fixture_digest == current.manifest.fixture_digest
+            let prior_integrity = prior.report.semantic_fingerprint
+                == semantic_fingerprint(&prior.report)
+                && prior.manifest.scenario_id == prior.report.scenario_id
+                && prior.report.provenance.campaign_id.as_deref()
+                    == Some(prior.manifest.campaign_id.as_str())
+                && prior.report.provenance.campaign_seed == Some(prior.manifest.seed)
+                && prior.report.provenance.campaign_operators == prior.manifest.operators
+                && prior.report.provenance.fixture_digest == prior.manifest.fixture_digest
+                && prior.report.provenance.actual_truth_digest == prior.manifest.truth_digest;
+            let matched = prior_integrity
+                && prior.manifest.fixture_digest == current.manifest.fixture_digest
                 && prior.manifest.truth_digest == current.manifest.truth_digest
-                && prior.report.semantic_fingerprint == current.report.semantic_fingerprint;
+                && prior.report.semantic_fingerprint == current.report.semantic_fingerprint
+                && prior.report.provenance.actual_response_digest
+                    == current.report.provenance.actual_response_digest
+                && prior.report.provenance.actual_truth_digest
+                    == current.report.provenance.actual_truth_digest;
             println!(
                 "campaign replay: {}",
                 if matched { "matched" } else { "mismatch" }
@@ -864,6 +1384,7 @@ async fn execute_campaign(
     let mut report = run_one(repository, &manifest.scenario_id, "default", Some(seed)).await?;
     report.provenance.campaign_id = Some(manifest.campaign_id.clone());
     report.provenance.campaign_seed = Some(seed);
+    report.provenance.campaign_operators = manifest.operators.clone();
     report.provenance.fixture_digest = manifest.fixture_digest.clone();
     report.replay_command = manifest.reproduction_command.clone();
     report.diagnostics.recommended_replay_command = manifest.reproduction_command.clone();
@@ -928,7 +1449,10 @@ async fn baseline_command(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("artifacts/baselines/{profile}.json")));
             let reports = run_baseline_suite(repository).await?;
-            let baseline = baseline_from_reports(&profile, &reports);
+            let mut baseline = baseline_from_reports(&profile, &reports);
+            let soak =
+                run_public_soak_for_repository(repository, SoakPreset::Smoke, 11_100).await?;
+            baseline.public_soak = Some(soak_baseline_from_report(&soak));
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -972,6 +1496,21 @@ async fn baseline_command(
                     passed = false;
                 }
             }
+            match &baseline.public_soak {
+                Some(expected) => {
+                    let actual =
+                        run_public_soak_for_repository(repository, expected.preset, expected.seed)
+                            .await?;
+                    if !soak_baseline_matches(expected, &actual) {
+                        eprintln!("baseline mismatch for public soak summary");
+                        passed = false;
+                    }
+                }
+                None => {
+                    eprintln!("baseline is missing its required public soak summary");
+                    passed = false;
+                }
+            }
             Ok(passed)
         }
         _ => {
@@ -992,19 +1531,45 @@ async fn run_baseline_suite(
         "097-source-503-then-chunked-success",
         "099-multi-source-global-quota-isolation",
         "101-proxy-target-canonicalization",
-        "107-json-structural-mutation-campaign",
-        "110-transport-framing-mutation-campaign",
         "111-mixed-lifecycle-soak",
+        "112-concurrent-mixed-fault-soak",
         "114-coverage-and-baseline-integrity",
     ];
     let mut reports = Vec::with_capacity(ids.len());
     for id in ids {
         reports.push(run_one(repository, id, "default", None).await?);
     }
+    for (campaign, seed) in [
+        ("107-json-structural-mutation-campaign", 10_701),
+        ("108-text-html-csv-mutation-campaign", 10_801),
+        ("109-pagination-token-mutation-campaign", 10_901),
+        ("110-transport-framing-mutation-campaign", 11_001),
+    ] {
+        reports.push(execute_campaign(repository, campaign, seed).await?.report);
+    }
     Ok(reports)
 }
 
-fn soak_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
+const PUBLIC_SOAK_ACTIONS_PER_LIFECYCLE: usize = 13;
+const PUBLIC_SOAK_SCENARIO_POOL: &[&str] = &[
+    "091-pagination-second-page-rate-limit",
+    "094-proxy-auth-then-source-rate-limit",
+    "096-connect-tunnel-truncated-payload",
+    "099-multi-source-global-quota-isolation",
+    "101-proxy-target-canonicalization",
+    "105-stale-capability-after-reset-delete",
+    "106-concurrent-cross-run-lifecycle",
+    "107-json-structural-mutation-campaign",
+    "111-mixed-lifecycle-soak",
+    "112-concurrent-mixed-fault-soak",
+];
+const PUBLIC_SOAK_LIFECYCLE_SCENARIOS: &[&str] = &[
+    "111-mixed-lifecycle-soak",
+    "112-concurrent-mixed-fault-soak",
+    "107-json-structural-mutation-campaign",
+];
+
+async fn soak_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
     if args.get(1).map(String::as_str) != Some("run") {
         println!(
             "use: lab-cli soak run --preset smoke|standard|release [--seed <number>] [--output <path>]"
@@ -1028,7 +1593,7 @@ fn soak_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Res
                 format!("artifacts/soak/{:?}-seed-{seed}.json", preset).to_ascii_lowercase(),
             )
         });
-    let report = run_soak(repository.clone(), preset, seed)?;
+    let report = run_public_soak_for_repository(repository, preset, seed).await?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1042,6 +1607,1368 @@ fn soak_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Res
     );
     println!("soak report: {}", output.display());
     Ok(passed)
+}
+
+async fn run_public_soak_for_repository(
+    repository: &ScenarioRepository,
+    preset: SoakPreset,
+    seed: u64,
+) -> anyhow::Result<SoakReport> {
+    cleanup_public_soak_replay_artifacts()?;
+    let server = LocalServer::spawn(repository.clone(), None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let result = run_public_http_soak(&server, preset, seed).await;
+    server.shutdown().await;
+    let mut report = result?;
+    report
+        .invariants
+        .insert("server_shutdown_completed".to_owned(), true);
+    Ok(report)
+}
+
+fn soak_baseline_matches(expected: &lab_core::SoakBaseline, actual: &SoakReport) -> bool {
+    actual.operations >= expected.minimum_operations
+        && actual.concurrency == expected.concurrency
+        && actual.action_counts == expected.action_counts
+        && actual.outcome_counts == expected.outcome_counts
+        && expected
+            .invariants
+            .keys()
+            .all(|name| actual.invariants.get(name) == Some(&true))
+        && actual.last_failure.is_none()
+}
+
+/// Release soak uses the same loopback control, source, proxy, submission and
+/// report interfaces exposed to a collector.  The only state read is the final
+/// resource summary after every public lifecycle task has finished.
+async fn run_public_http_soak(
+    server: &LocalServer,
+    preset: SoakPreset,
+    seed: u64,
+) -> anyhow::Result<SoakReport> {
+    let base_url = server.base_url();
+    let concurrency = preset.concurrency().min(preset.operations());
+    let cycles_per_lane = preset
+        .operations()
+        .div_ceil(concurrency * PUBLIC_SOAK_ACTIONS_PER_LIFECYCLE);
+    let start = Arc::new(Barrier::new(concurrency));
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let mut workers = JoinSet::new();
+    for lane in 0..concurrency {
+        let start = Arc::clone(&start);
+        let next_index = Arc::clone(&next_index);
+        let base_url = base_url.clone();
+        workers.spawn(async move {
+            let client = Client::builder()
+                .redirect(Policy::none())
+                .no_proxy()
+                .build()?;
+            start.wait().await;
+            let mut actions =
+                Vec::with_capacity(cycles_per_lane * PUBLIC_SOAK_ACTIONS_PER_LIFECYCLE);
+            let mut lane_failure = None;
+            for cycle in 0..cycles_per_lane {
+                let cycle_result = async {
+                    if lane == 0 && cycle == 0 {
+                        run_public_soak_connect_probe(
+                            &client,
+                            &base_url,
+                            &next_index,
+                            &mut actions,
+                            lane,
+                            seed,
+                        )
+                        .await?;
+                        run_public_soak_script_fault_probe(
+                            &client,
+                            &base_url,
+                            &next_index,
+                            &mut actions,
+                            lane,
+                            seed,
+                        )
+                        .await?;
+                    }
+                    let scenario_id = PUBLIC_SOAK_LIFECYCLE_SCENARIOS
+                        [(lane + cycle) % PUBLIC_SOAK_LIFECYCLE_SCENARIOS.len()];
+                    let lifecycle_seed = seed
+                        .wrapping_add((lane as u64).wrapping_mul(10_000))
+                        .wrapping_add(cycle as u64);
+                    run_public_soak_lifecycle(
+                        &client,
+                        &base_url,
+                        scenario_id,
+                        lifecycle_seed,
+                        &next_index,
+                        &mut actions,
+                        lane,
+                        cycle == 0,
+                        lane == 0 && cycle == 0,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = cycle_result {
+                    lane_failure = Some(error.to_string());
+                    break;
+                }
+            }
+            Ok::<(Vec<SoakAction>, Option<String>), anyhow::Error>((actions, lane_failure))
+        });
+    }
+
+    let mut actions = Vec::new();
+    let mut last_failure = None;
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(Ok((mut lane_actions, lane_failure))) => {
+                actions.append(&mut lane_actions);
+                if last_failure.is_none() {
+                    last_failure = lane_failure;
+                }
+            }
+            Ok(Err(error)) if last_failure.is_none() => last_failure = Some(error.to_string()),
+            Err(error) if last_failure.is_none() => {
+                last_failure = Some(format!("public soak worker failed: {error}"));
+            }
+            _ => {}
+        }
+    }
+    actions.sort_by_key(|action| action.index);
+    let action_counts = soak_counts(&actions, |action| &action.endpoint);
+    let outcome_counts = soak_counts(&actions, |action| &action.outcome);
+    let resources = server.resource_summary();
+    let expected_minimum = preset.operations();
+    let trace_coverage = public_soak_trace_coverage(&actions);
+    let evidence_endpoints = ["source", "proxy", "connect", "submission", "report"];
+    let all_actions_have_evidence = actions.iter().all(|action| {
+        !evidence_endpoints.contains(&action.endpoint.as_str()) || action.audit_count > 0
+    });
+    let invariants = BTreeMap::from([
+        (
+            "public_actions_at_least_preset".to_owned(),
+            actions.len() >= expected_minimum,
+        ),
+        ("has_source_actions".to_owned(), trace_coverage["source"]),
+        ("has_proxy_actions".to_owned(), trace_coverage["proxy"]),
+        ("has_connect_actions".to_owned(), trace_coverage["connect"]),
+        (
+            "has_submission_actions".to_owned(),
+            trace_coverage["submission"],
+        ),
+        ("has_replay_actions".to_owned(), trace_coverage["replay"]),
+        (
+            "release_trace_coverage_complete".to_owned(),
+            trace_coverage.values().all(|covered| *covered),
+        ),
+        (
+            "trace_has_public_endpoint_evidence".to_owned(),
+            all_actions_have_evidence,
+        ),
+        (
+            "trace_uses_no_internal_helpers".to_owned(),
+            actions
+                .iter()
+                .all(|action| action.endpoint != "internal-test-helper"),
+        ),
+        (
+            "trace_run_identifiers_are_redacted_and_present".to_owned(),
+            actions.iter().all(|action| {
+                action
+                    .run_id
+                    .as_deref()
+                    .is_some_and(|run_id| run_id.len() == 8)
+            }),
+        ),
+        (
+            "no_live_runs".to_owned(),
+            resources.active_runs == 0 && resources.reset_runs == 0,
+        ),
+        (
+            "no_active_proxy_connections".to_owned(),
+            resources.active_proxy_connections == 0,
+        ),
+        (
+            "no_quota_state_entries".to_owned(),
+            resources.quota_state_entries == 0,
+        ),
+        (
+            "trace_is_ordered_and_complete".to_owned(),
+            actions.windows(2).all(|pair| pair[0].index < pair[1].index)
+                && actions.iter().all(|action| action.run_id.is_some()),
+        ),
+        (
+            "temporary_replay_artifacts_cleaned".to_owned(),
+            public_soak_replay_artifacts_clean(),
+        ),
+    ]);
+    Ok(SoakReport {
+        schema_version: V14_SCHEMA_VERSION.to_owned(),
+        preset,
+        seed,
+        operations: actions.len(),
+        concurrency,
+        action_trace: actions,
+        scenario_pool: PUBLIC_SOAK_SCENARIO_POOL
+            .iter()
+            .map(|scenario| (*scenario).to_owned())
+            .collect(),
+        trace_coverage,
+        action_counts,
+        outcome_counts,
+        resources,
+        invariants,
+        last_failure,
+        reproduction_command: format!(
+            "cargo run -p lab-cli -- soak run --preset {} --seed {seed}",
+            match preset {
+                SoakPreset::Smoke => "smoke",
+                SoakPreset::Standard => "standard",
+                SoakPreset::Release => "release",
+            }
+        ),
+    })
+}
+
+fn soak_counts<F>(actions: &[SoakAction], key: F) -> BTreeMap<String, usize>
+where
+    F: Fn(&SoakAction) -> &String,
+{
+    actions.iter().fold(BTreeMap::new(), |mut counts, action| {
+        *counts.entry(key(action).clone()).or_default() += 1;
+        counts
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_public_soak_action(
+    actions: &mut Vec<SoakAction>,
+    next_index: &AtomicUsize,
+    lane: usize,
+    operation: &str,
+    endpoint: &str,
+    scenario_id: &str,
+    run: &CreatedRun,
+    seed: u64,
+    outcome: &str,
+    audit_count: usize,
+) {
+    actions.push(SoakAction {
+        index: next_index.fetch_add(1, Ordering::Relaxed) + 1,
+        lane,
+        operation: operation.to_owned(),
+        scenario_id: scenario_id.to_owned(),
+        outcome: outcome.to_owned(),
+        run_id: Some(run.run_id.to_string()[..8].to_owned()),
+        endpoint: endpoint.to_owned(),
+        seed,
+        audit_count,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_public_soak_lifecycle(
+    client: &Client,
+    base_url: &str,
+    scenario_id: &str,
+    seed: u64,
+    next_index: &AtomicUsize,
+    actions: &mut Vec<SoakAction>,
+    lane: usize,
+    strict_replay: bool,
+    strict_replay_mismatch: bool,
+) -> anyhow::Result<()> {
+    let mut run = create_run(client, base_url, scenario_id, Some(seed)).await?;
+    let result = async {
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "create",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let old_manifest = public_manifest(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "manifest",
+            "manifest",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let (source_statuses, findings, source_endpoint) =
+            collect_public_manifest(client, &old_manifest, &run.run_id.to_string()).await?;
+        if !public_source_succeeded(&source_statuses) {
+            anyhow::bail!("public soak source did not reach a successful terminal status");
+        }
+        let source_audit_count = fetch_audit(client, base_url, &run).await?.len();
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            if source_endpoint == "proxy" {
+                "source_proxy"
+            } else {
+                "source_direct"
+            },
+            &source_endpoint,
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            source_audit_count,
+        );
+        let mut submission = public_submission_payload(&old_manifest, source_statuses, findings)?;
+        submission["collector"]["name"] =
+            serde_json::Value::String(format!("fqdn-forge-public-soak-seed-{seed}"));
+        let mut invalid_submission = submission.clone();
+        invalid_submission["fake_token"] = serde_json::Value::String("redacted".to_owned());
+        submit_public_rejected(client, base_url, &run, &invalid_submission).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "submission_invalid",
+            "submission",
+            scenario_id,
+            &run,
+            seed,
+            "expected_rejected",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        submit_public(client, base_url, &run, &submission).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "submission_valid",
+            "submission",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        let report = public_report(client, base_url, &run).await?;
+        if report.status != ReportStatus::Passed || report.requests.is_empty() {
+            anyhow::bail!("public soak submission did not produce a complete passed report");
+        }
+        if report
+            .requests
+            .iter()
+            .any(|audit| audit.run_id != Some(run.run_id.to_string()))
+        {
+            anyhow::bail!("public soak report contains cross-run audit evidence");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "report",
+            "report",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            report.requests.len(),
+        );
+        if strict_replay {
+            run_strict_public_soak_replay(&report, true).await?;
+            record_public_soak_action(
+                actions,
+                next_index,
+                lane,
+                "replay_strict",
+                "replay",
+                scenario_id,
+                &run,
+                seed,
+                "matched",
+                report.requests.len(),
+            );
+        }
+        if strict_replay_mismatch {
+            run_strict_public_soak_replay(&report, false).await?;
+            record_public_soak_action(
+                actions,
+                next_index,
+                lane,
+                "replay_intentional_mismatch",
+                "replay",
+                scenario_id,
+                &run,
+                seed,
+                "expected_mismatch",
+                report.requests.len(),
+            );
+        }
+
+        let stale_access_token = run.access_token.clone();
+        let reset: serde_json::Value = client
+            .post(format!("{base_url}/api/runs/{}/reset", run.run_id))
+            .header("x-lab-run-access-token", &run.access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        run.access_token = reset
+            .get("run_access_token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("reset response is missing replacement capability"))?
+            .to_owned();
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "reset",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let stale_manifest_response = client
+            .get(format!("{base_url}/api/runs/{}/manifest", run.run_id))
+            .header("x-lab-run-access-token", stale_access_token)
+            .send()
+            .await?;
+        if stale_manifest_response.status().is_success() {
+            anyhow::bail!("reset left the old run-control capability usable");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "stale_after_reset_control",
+            "stale_probe",
+            scenario_id,
+            &run,
+            seed,
+            "expected_rejected",
+            0,
+        );
+        let (stale_statuses, _, _) =
+            collect_public_manifest(client, &old_manifest, &run.run_id.to_string()).await?;
+        if public_source_succeeded(&stale_statuses) {
+            anyhow::bail!("reset left the old source or proxy capability usable");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "stale_after_reset_source",
+            "stale_probe",
+            scenario_id,
+            &run,
+            seed,
+            "expected_rejected",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        let new_manifest = public_manifest(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "manifest_after_reset",
+            "manifest",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let (new_statuses, _, new_source_endpoint) =
+            collect_public_manifest(client, &new_manifest, &run.run_id.to_string()).await?;
+        if !public_source_succeeded(&new_statuses) {
+            anyhow::bail!("new source/proxy capability did not work after reset");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "source_after_reset",
+            &new_source_endpoint,
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        delete_public_run(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "delete",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        ensure_post_delete_rejections(
+            client,
+            base_url,
+            &run,
+            &old_manifest,
+            &new_manifest,
+            &submission,
+        )
+        .await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "stale_after_delete",
+            "stale_probe",
+            scenario_id,
+            &run,
+            seed,
+            "expected_rejected",
+            0,
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = delete_public_run(client, base_url, &run).await;
+    }
+    result
+}
+
+async fn run_public_soak_script_fault_probe(
+    client: &Client,
+    base_url: &str,
+    next_index: &AtomicUsize,
+    actions: &mut Vec<SoakAction>,
+    lane: usize,
+    seed: u64,
+) -> anyhow::Result<()> {
+    let scenario_id = "111-mixed-lifecycle-soak";
+    let run = create_run(client, base_url, scenario_id, Some(seed)).await?;
+    let result = async {
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "create",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let manifest = public_manifest(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "manifest",
+            "manifest",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let (statuses, _, endpoint) =
+            collect_public_manifest(client, &manifest, &run.run_id.to_string()).await?;
+        if !public_source_succeeded(&statuses) {
+            anyhow::bail!("script-fault soak probe did not complete its initial source request");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "source_direct",
+            &endpoint,
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        let (fault_statuses, _, _) =
+            collect_public_manifest(client, &manifest, &run.run_id.to_string()).await?;
+        if public_source_succeeded(&fault_statuses) {
+            anyhow::bail!("script-fault soak probe accepted an out-of-order source request");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "source_script_fault",
+            &endpoint,
+            scenario_id,
+            &run,
+            seed,
+            "expected_rejected",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        delete_public_run(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "delete",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = delete_public_run(client, base_url, &run).await;
+    }
+    result
+}
+
+async fn run_public_soak_connect_probe(
+    client: &Client,
+    base_url: &str,
+    next_index: &AtomicUsize,
+    actions: &mut Vec<SoakAction>,
+    lane: usize,
+    seed: u64,
+) -> anyhow::Result<()> {
+    let scenario_id = "096-connect-tunnel-truncated-payload";
+    let run = create_run(client, base_url, scenario_id, Some(seed)).await?;
+    let result = async {
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "create",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let manifest = public_manifest(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "manifest",
+            "manifest",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        let (statuses, _, endpoint) =
+            collect_public_manifest(client, &manifest, &run.run_id.to_string()).await?;
+        if endpoint != "connect" || public_source_succeeded(&statuses) {
+            anyhow::bail!("CONNECT soak probe did not expose the expected truncated tunnel result");
+        }
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "connect_truncated",
+            "connect",
+            scenario_id,
+            &run,
+            seed,
+            "expected_rejected",
+            fetch_audit(client, base_url, &run).await?.len(),
+        );
+        delete_public_run(client, base_url, &run).await?;
+        record_public_soak_action(
+            actions,
+            next_index,
+            lane,
+            "delete",
+            "control",
+            scenario_id,
+            &run,
+            seed,
+            "success",
+            0,
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = delete_public_run(client, base_url, &run).await;
+    }
+    result
+}
+
+fn public_soak_trace_coverage(actions: &[SoakAction]) -> BTreeMap<String, bool> {
+    let has_endpoint = |endpoint: &str| actions.iter().any(|action| action.endpoint == endpoint);
+    BTreeMap::from([
+        ("control".to_owned(), has_endpoint("control")),
+        ("manifest".to_owned(), has_endpoint("manifest")),
+        ("source".to_owned(), has_endpoint("source")),
+        ("proxy".to_owned(), has_endpoint("proxy")),
+        ("connect".to_owned(), has_endpoint("connect")),
+        ("submission".to_owned(), has_endpoint("submission")),
+        ("report".to_owned(), has_endpoint("report")),
+        ("replay".to_owned(), has_endpoint("replay")),
+        ("stale_probe".to_owned(), has_endpoint("stale_probe")),
+        (
+            "valid_submission".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.operation == "submission_valid"),
+        ),
+        (
+            "invalid_submission".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.operation == "submission_invalid"),
+        ),
+        (
+            "expected_rejection".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.outcome == "expected_rejected"),
+        ),
+        (
+            "strict_replay_matched".to_owned(),
+            actions.iter().any(|action| action.outcome == "matched"),
+        ),
+        (
+            "strict_replay_mismatch".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.outcome == "expected_mismatch"),
+        ),
+        (
+            "script_fault".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.operation == "source_script_fault"),
+        ),
+        (
+            "campaign_or_dynamic_fixture".to_owned(),
+            actions.iter().any(|action| {
+                action.scenario_id == "107-json-structural-mutation-campaign"
+                    && action.endpoint == "source"
+            }),
+        ),
+        (
+            "reset_stale_rejection".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.operation == "stale_after_reset_source"),
+        ),
+        (
+            "delete_stale_rejection".to_owned(),
+            actions
+                .iter()
+                .any(|action| action.operation == "stale_after_delete"),
+        ),
+        (
+            "multiple_lanes".to_owned(),
+            actions
+                .iter()
+                .map(|action| action.lane)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                >= 2,
+        ),
+    ])
+}
+
+async fn run_strict_public_soak_replay(
+    report: &lab_core::RunReport,
+    expected_match: bool,
+) -> anyhow::Result<()> {
+    let directory = PathBuf::from("artifacts/soak/replay");
+    fs::create_dir_all(&directory)?;
+    let stem = format!("public-soak-replay-{}-{}", report.seed, Uuid::new_v4());
+    let input_path = directory.join(format!("{stem}.json"));
+    let mut replay_input = report.clone();
+    if !expected_match {
+        replay_input.virtual_waited_ms = replay_input.virtual_waited_ms.saturating_add(1);
+    }
+    let result = async {
+        fs::write(&input_path, report_json(&replay_input)?)?;
+        let executable = env::current_exe()?;
+        let replay_path = input_path.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(executable)
+                .args(["replay", "--strict", "--report"])
+                .arg(replay_path)
+                .output()
+        })
+        .await
+        .context("strict replay process did not complete")??;
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let matched = output.status.success() && transcript.contains("replay result: matched");
+        let explained_mismatch = !output.status.success()
+            && transcript.contains("replay result: mismatch")
+            && (transcript.contains("first semantic difference:")
+                || transcript.contains("provenance:"));
+        if expected_match && !matched {
+            anyhow::bail!("strict replay did not match the public report: {transcript}");
+        }
+        if !expected_match && !explained_mismatch {
+            anyhow::bail!("strict replay did not reject the controlled public-report mismatch");
+        }
+        Ok(())
+    }
+    .await;
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&stem) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    result
+}
+
+fn public_soak_replay_artifacts_clean() -> bool {
+    fs::read_dir("artifacts/soak/replay").map_or(true, |entries| {
+        entries.flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("public-soak-replay-")
+        })
+    })
+}
+
+fn cleanup_public_soak_replay_artifacts() -> anyhow::Result<()> {
+    let directory = PathBuf::from("artifacts/soak/replay");
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("public-soak-replay-")
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+async fn public_manifest(
+    client: &Client,
+    base_url: &str,
+    run: &CreatedRun,
+) -> anyhow::Result<serde_json::Value> {
+    client
+        .get(format!("{base_url}/api/runs/{}/manifest", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .map_err(Into::into)
+}
+
+async fn submit_public(
+    client: &Client,
+    base_url: &str,
+    run: &CreatedRun,
+    submission: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let response = client
+        .post(format!("{base_url}/api/runs/{}/submission", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .json(submission)
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::CREATED {
+        anyhow::bail!(
+            "public submission did not receive HTTP 201 (received {})",
+            response.status()
+        );
+    }
+    Ok(())
+}
+
+async fn submit_public_rejected(
+    client: &Client,
+    base_url: &str,
+    run: &CreatedRun,
+    submission: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let response = client
+        .post(format!("{base_url}/api/runs/{}/submission", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .json(submission)
+        .send()
+        .await?;
+    if response.status().is_success() {
+        anyhow::bail!("intentionally invalid public submission was accepted");
+    }
+    Ok(())
+}
+
+async fn delete_public_run(
+    client: &Client,
+    base_url: &str,
+    run: &CreatedRun,
+) -> anyhow::Result<()> {
+    let response = client
+        .delete(format!("{base_url}/api/runs/{}", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::NO_CONTENT {
+        anyhow::bail!("public soak could not delete a lifecycle run");
+    }
+    Ok(())
+}
+
+async fn public_report(
+    client: &Client,
+    base_url: &str,
+    run: &CreatedRun,
+) -> anyhow::Result<lab_core::RunReport> {
+    let response: serde_json::Value = client
+        .get(format!("{base_url}/api/runs/{}/report", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    serde_json::from_value(
+        response
+            .get("report")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("public report response is missing report"))?,
+    )
+    .map_err(Into::into)
+}
+
+fn public_submission_payload(
+    manifest: &serde_json::Value,
+    source_statuses: serde_json::Map<String, serde_json::Value>,
+    findings: Vec<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let target_domain = manifest
+        .get("target_domain")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest is missing target_domain"))?;
+    Ok(serde_json::json!({
+        "schema_version": V14_SCHEMA_VERSION,
+        "collector":{"name":"fqdn-forge-public-soak","version":V14_SCHEMA_VERSION},
+        "target_domain":target_domain,
+        "source_statuses":source_statuses,
+        "findings":findings,
+    }))
+}
+
+fn public_source_succeeded(source_statuses: &serde_json::Map<String, serde_json::Value>) -> bool {
+    !source_statuses.is_empty()
+        && source_statuses
+            .values()
+            .all(|status| status.as_str() == Some("succeeded"))
+}
+
+async fn collect_public_manifest(
+    client: &Client,
+    manifest: &serde_json::Value,
+    run_id: &str,
+) -> anyhow::Result<(
+    serde_json::Map<String, serde_json::Value>,
+    Vec<serde_json::Value>,
+    String,
+)> {
+    let sources = manifest
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("manifest is missing sources"))?;
+    let network = manifest
+        .get("network_profile")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("manifest is missing network_profile"))?;
+    let max_decoded_bytes = manifest
+        .get("transport_profile")
+        .and_then(|profile| profile.get("client_visible_decoded_limit"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .ok_or_else(|| anyhow::anyhow!("manifest transport_profile is missing decoded limit"))?;
+    let network_mode = network
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("direct");
+    let network_allows_retry = network
+        .get("allow_retry")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let proxy_values = network
+        .get("proxy_authentication")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut source_statuses = serde_json::Map::new();
+    let mut findings = Vec::new();
+    if network_mode == "connect_proxy" {
+        for source in sources {
+            let source_id = source
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
+            let (status, mut source_findings) =
+                connect_conformance_probe(network, source, run_id, max_decoded_bytes).await?;
+            source_statuses.insert(source_id.to_owned(), serde_json::Value::String(status));
+            findings.append(&mut source_findings);
+        }
+        return Ok((source_statuses, findings, "connect".to_owned()));
+    }
+    let source_client = source_client_for_manifest(network)?;
+    for source in sources {
+        let source_id = source
+            .get("source_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("manifest source is missing source_id"))?;
+        let (status, mut source_findings) = collect_manifest_source(
+            &source_client,
+            source,
+            network_mode,
+            network_allows_retry,
+            false,
+            &proxy_values,
+            run_id,
+            max_decoded_bytes,
+        )
+        .await?;
+        source_statuses.insert(source_id.to_owned(), serde_json::Value::String(status));
+        findings.append(&mut source_findings);
+    }
+    let endpoint = if network_mode == "http_proxy" {
+        "proxy"
+    } else {
+        "source"
+    };
+    let _ = client;
+    Ok((source_statuses, findings, endpoint.to_owned()))
+}
+
+fn source_client_for_manifest(
+    network: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Client> {
+    let network_mode = network
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("direct");
+    if network_mode != "http_proxy" {
+        return Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(Into::into);
+    }
+    let proxy_url = network
+        .get("proxy_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("http_proxy manifest is missing proxy_url"))?;
+    let parsed = Url::parse(proxy_url)?;
+    if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+        anyhow::bail!("manifest proxy_url is not numeric IPv4 loopback");
+    }
+    Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .proxy(Proxy::http(proxy_url)?)
+        .build()
+        .map_err(Into::into)
+}
+
+async fn ensure_post_delete_rejections(
+    client: &Client,
+    base_url: &str,
+    run: &CreatedRun,
+    old_manifest: &serde_json::Value,
+    new_manifest: &serde_json::Value,
+    submission: &serde_json::Value,
+) -> anyhow::Result<()> {
+    for path in ["manifest", "report"] {
+        let response = client
+            .get(format!("{base_url}/api/runs/{}/{path}", run.run_id))
+            .header("x-lab-run-access-token", &run.access_token)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            anyhow::bail!("delete left the {path} endpoint accessible");
+        }
+    }
+    let submission_response = client
+        .post(format!("{base_url}/api/runs/{}/submission", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .json(submission)
+        .send()
+        .await?;
+    if submission_response.status().is_success() {
+        anyhow::bail!("delete left the submission endpoint accessible");
+    }
+    for manifest in [old_manifest, new_manifest] {
+        let (statuses, _, _) =
+            collect_public_manifest(client, manifest, &run.run_id.to_string()).await?;
+        if public_source_succeeded(&statuses) {
+            anyhow::bail!("delete left a source or proxy capability usable");
+        }
+    }
+    Ok(())
+}
+
+async fn public_lifecycle_105_conformance(
+    client: &Client,
+    base_url: &str,
+    seed: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut run = create_run(
+        client,
+        base_url,
+        "105-stale-capability-after-reset-delete",
+        seed,
+    )
+    .await?;
+    let result = async {
+        let old_manifest = public_manifest(client, base_url, &run).await?;
+        let (old_statuses, _, _) =
+            collect_public_manifest(client, &old_manifest, &run.run_id.to_string()).await?;
+        if !public_source_succeeded(&old_statuses) {
+            anyhow::bail!("105 old source/proxy capability was not initially usable");
+        }
+        let stale_access_token = run.access_token.clone();
+        let reset: serde_json::Value = client
+            .post(format!("{base_url}/api/runs/{}/reset", run.run_id))
+            .header("x-lab-run-access-token", &run.access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        run.access_token = reset
+            .get("run_access_token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("105 reset did not return a new capability"))?
+            .to_owned();
+        let stale_control = client
+            .get(format!("{base_url}/api/runs/{}/manifest", run.run_id))
+            .header("x-lab-run-access-token", stale_access_token)
+            .send()
+            .await?;
+        if stale_control.status().is_success() {
+            anyhow::bail!("105 stale control capability remained valid after reset");
+        }
+        let (stale_statuses, _, _) =
+            collect_public_manifest(client, &old_manifest, &run.run_id.to_string()).await?;
+        if public_source_succeeded(&stale_statuses) {
+            anyhow::bail!("105 stale source/proxy capability remained valid after reset");
+        }
+        let new_manifest = public_manifest(client, base_url, &run).await?;
+        let (source_statuses, findings, _) =
+            collect_public_manifest(client, &new_manifest, &run.run_id.to_string()).await?;
+        if !public_source_succeeded(&source_statuses) {
+            anyhow::bail!("105 replacement source/proxy capability was not usable");
+        }
+        let submission = public_submission_payload(&new_manifest, source_statuses, findings)?;
+        let deleted = client
+            .delete(format!("{base_url}/api/runs/{}", run.run_id))
+            .header("x-lab-run-access-token", &run.access_token)
+            .send()
+            .await?;
+        if deleted.status() != reqwest::StatusCode::NO_CONTENT {
+            anyhow::bail!("105 delete did not return HTTP 204");
+        }
+        ensure_post_delete_rejections(
+            client,
+            base_url,
+            &run,
+            &old_manifest,
+            &new_manifest,
+            &submission,
+        )
+        .await?;
+        let probe = create_run(
+            client,
+            base_url,
+            "105-stale-capability-after-reset-delete",
+            seed,
+        )
+        .await?;
+        let probe_result = async {
+            let manifest = public_manifest(client, base_url, &probe).await?;
+            let (statuses, findings, _) =
+                collect_public_manifest(client, &manifest, &probe.run_id.to_string()).await?;
+            if !public_source_succeeded(&statuses) {
+                anyhow::bail!("105 replacement run observed lifecycle contamination");
+            }
+            let probe_submission = public_submission_payload(&manifest, statuses, findings)?;
+            submit_public(client, base_url, &probe, &probe_submission).await?;
+            let report = public_report(client, base_url, &probe).await?;
+            if report.status != ReportStatus::Passed {
+                anyhow::bail!("105 fresh run did not produce a passed report");
+            }
+            serde_json::to_value(report).map_err(Into::into)
+        }
+        .await;
+        let deleted_probe = client
+            .delete(format!("{base_url}/api/runs/{}", probe.run_id))
+            .header("x-lab-run-access-token", &probe.access_token)
+            .send()
+            .await?;
+        if deleted_probe.status() != reqwest::StatusCode::NO_CONTENT {
+            anyhow::bail!("105 replacement run could not be deleted");
+        }
+        probe_result
+    }
+    .await;
+    if result.is_err() {
+        let _ = client
+            .delete(format!("{base_url}/api/runs/{}", run.run_id))
+            .header("x-lab-run-access-token", &run.access_token)
+            .send()
+            .await;
+    }
+    result
+}
+
+async fn public_lifecycle_106_conformance(
+    client: &Client,
+    base_url: &str,
+    seed: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    let a = create_run(client, base_url, "106-concurrent-cross-run-lifecycle", seed).await?;
+    let mut b = create_run(
+        client,
+        base_url,
+        "106-concurrent-cross-run-lifecycle",
+        seed.map(|value| value.wrapping_add(1)),
+    )
+    .await?;
+    let result = async {
+        let (a_manifest, _) = tokio::try_join!(
+            public_manifest(client, base_url, &a),
+            public_manifest(client, base_url, &b)
+        )?;
+        let a_run_id = a.run_id.to_string();
+        let b_run_id = b.run_id.to_string();
+        let (cross_statuses, _, _) =
+            collect_public_manifest(client, &a_manifest, &b_run_id).await?;
+        if public_source_succeeded(&cross_statuses) {
+            anyhow::bail!("106 accepted a cross-run source capability");
+        }
+        let reset: serde_json::Value = client
+            .post(format!("{base_url}/api/runs/{}/reset", b.run_id))
+            .header("x-lab-run-access-token", &b.access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        b.access_token = reset
+            .get("run_access_token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("106 reset did not return a new capability"))?
+            .to_owned();
+        let b_manifest = public_manifest(client, base_url, &b).await?;
+        let ((a_statuses, a_findings, _), (b_statuses, b_findings, _)) = tokio::try_join!(
+            collect_public_manifest(client, &a_manifest, &a_run_id),
+            collect_public_manifest(client, &b_manifest, &b_run_id)
+        )?;
+        if !public_source_succeeded(&a_statuses) || !public_source_succeeded(&b_statuses) {
+            anyhow::bail!("106 concurrent runs did not each complete their own source request");
+        }
+        let a_submission = public_submission_payload(&a_manifest, a_statuses, a_findings)?;
+        let b_submission = public_submission_payload(&b_manifest, b_statuses, b_findings)?;
+        submit_public(client, base_url, &a, &a_submission).await?;
+        let a_report = public_report(client, base_url, &a).await?;
+        if a_report.status != ReportStatus::Passed {
+            anyhow::bail!("106 first run did not produce a passed report");
+        }
+        let cross_submission = client
+            .post(format!("{base_url}/api/runs/{}/submission", b.run_id))
+            .header("x-lab-run-access-token", &b.access_token)
+            .json(&a_submission)
+            .send()
+            .await?;
+        if cross_submission.status().is_success() {
+            anyhow::bail!("106 accepted a cross-run submission payload");
+        }
+        let cross_report = client
+            .get(format!("{base_url}/api/runs/{}/report", a.run_id))
+            .header("x-lab-run-access-token", &b.access_token)
+            .send()
+            .await?;
+        if cross_report.status().is_success() {
+            anyhow::bail!("106 accepted a cross-run report capability");
+        }
+        let a_audit = fetch_audit(client, base_url, &a).await?;
+        if a_audit
+            .iter()
+            .any(|record| record.run_id.as_deref() != Some(&a_run_id))
+        {
+            anyhow::bail!("106 first run audit contains cross-run ownership");
+        }
+        let a_deleted = client
+            .delete(format!("{base_url}/api/runs/{}", a.run_id))
+            .header("x-lab-run-access-token", &a.access_token)
+            .send()
+            .await?;
+        if a_deleted.status() != reqwest::StatusCode::NO_CONTENT {
+            anyhow::bail!("106 first run could not be deleted");
+        }
+        let b_manifest_after_a_delete = public_manifest(client, base_url, &b).await?;
+        if b_manifest_after_a_delete
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(&b_run_id)
+        {
+            anyhow::bail!("106 second run manifest was contaminated by first-run deletion");
+        }
+        submit_public(client, base_url, &b, &b_submission).await?;
+        let b_report = public_report(client, base_url, &b).await?;
+        if b_report.status != ReportStatus::Passed {
+            anyhow::bail!("106 second run could not complete while the first run reset/delete");
+        }
+        let b_audit = fetch_audit(client, base_url, &b).await?;
+        if b_audit
+            .iter()
+            .any(|record| record.run_id.as_deref() != Some(&b_run_id))
+        {
+            anyhow::bail!("106 second run audit contains cross-run ownership");
+        }
+        serde_json::to_value(b_report).map_err(Into::into)
+    }
+    .await;
+    for run in [&a, &b] {
+        let _ = client
+            .delete(format!("{base_url}/api/runs/{}", run.run_id))
+            .header("x-lab-run-access-token", &run.access_token)
+            .send()
+            .await;
+    }
+    result
 }
 
 async fn proxy_regression_command(repository: &ScenarioRepository) -> anyhow::Result<bool> {
@@ -1073,48 +3000,53 @@ async fn raw_proxy_adversarial_regression(repository: &ScenarioRepository) -> an
             .redirect(Policy::none())
             .no_proxy()
             .build()?;
-        let run = create_run(
-            &client,
-            &server.base_url(),
-            "062-proxy-http-forward-success",
-            Some(62),
-        )
-        .await?;
-        let manifest: serde_json::Value = client
-            .get(format!("{}/api/runs/{}/manifest", server.base_url(), run.run_id))
-            .header("x-lab-run-access-token", &run.access_token)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        for scenario_id in [
+            "101-proxy-target-canonicalization",
+            "102-proxy-authority-header-ambiguity",
+            "103-proxy-encoded-and-userinfo-targets",
+            "104-proxy-framing-and-header-limits",
+        ] {
+            raw_proxy_scenario_regression(
+                &client,
+                &server.base_url(),
+                &server.proxy_url(),
+                scenario_id,
+            )
             .await?;
+        }
+        Ok(true)
+    }
+    .await;
+    server.shutdown().await;
+    result
+}
+
+async fn raw_proxy_scenario_regression(
+    client: &Client,
+    base_url: &str,
+    proxy_url: &str,
+    scenario_id: &str,
+) -> anyhow::Result<()> {
+    let seed = scenario_id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let run = create_run(client, base_url, scenario_id, seed).await?;
+    let result = async {
+        let manifest = public_manifest(client, base_url, &run).await?;
         let source = manifest
             .get("sources")
             .and_then(serde_json::Value::as_array)
             .and_then(|sources| sources.first())
             .ok_or_else(|| anyhow::anyhow!("proxy regression manifest has no source"))?;
-        let source_base = source
-            .get("base_url")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("proxy regression source has no base_url"))?;
-        let source_path = source
-            .get("path_template")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("proxy regression source has no path_template"))?;
-        let mut target = Url::parse(&format!("{source_base}{source_path}"))?;
-        if let Some(query) = source
-            .get("required_query")
-            .and_then(serde_json::Value::as_object)
-        {
-            target
-                .query_pairs_mut()
-                .extend_pairs(query.iter().filter_map(|(key, value)| {
-                    value.as_str().map(|value| (key.as_str(), value))
-                }));
-        }
-        let target: String = target.into();
-        let source = Url::parse(source_base)?;
-        let source_port = source
+        let target = public_source_target(source)?;
+        let source_url = Url::parse(
+            source
+                .get("base_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("proxy regression source has no base_url"))?,
+        )?;
+        let source_port = source_url
             .port_or_known_default()
             .ok_or_else(|| anyhow::anyhow!("proxy regression source has no port"))?;
         let authority = format!("127.0.0.1:{source_port}");
@@ -1131,103 +3063,77 @@ async fn raw_proxy_adversarial_regression(repository: &ScenarioRepository) -> an
             .get("proxy_capability")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("proxy regression capability is missing"))?;
-        let proxy_port = Url::parse(&server.proxy_url())?
+        let proxy_port = Url::parse(proxy_url)?
             .port_or_known_default()
             .ok_or_else(|| anyhow::anyhow!("local proxy has no port"))?;
-        let base_headers = format!(
+        let headers = format!(
             "x-lab-run-id: {}\r\nProxy-Authorization: {authorization}\r\nx-lab-proxy-capability: {capability}\r\nConnection: close\r\n",
             run.run_id
         );
-        let request = |candidate: String, host: String, extra: &str| {
-            format!(
-                "GET {candidate} HTTP/1.1\r\nHost: {host}\r\n{base_headers}{extra}\r\n"
-            )
+        let http_request = |candidate: String, host: String, extra: &str| {
+            format!("GET {candidate} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}\r\n")
         };
-        let cases = vec![
-            (
-                "hostname",
-                request(
+        let connect_request = |candidate: String, host: String, extra: &str| {
+            format!("CONNECT {candidate} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}\r\n")
+        };
+        let cases = match scenario_id {
+            "101-proxy-target-canonicalization" => vec![
+                http_request(
                     target.replacen("127.0.0.1", "localhost", 1),
                     format!("localhost:{source_port}"),
                     "",
                 ),
-            ),
-            (
-                "short-ipv4",
-                request(
+                http_request(
                     target.replacen("127.0.0.1", "127.1", 1),
                     format!("127.1:{source_port}"),
                     "",
                 ),
-            ),
-            (
-                "zero-ipv4",
-                request(
-                    target.replacen("127.0.0.1", "0.0.0.0", 1),
-                    format!("0.0.0.0:{source_port}"),
+            ],
+            "102-proxy-authority-header-ambiguity" => {
+                let connect_target = manifest
+                    .get("network_profile")
+                    .and_then(|profile| profile.get("connect_fixture_target"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CONNECT manifest is missing fixture target"))?;
+                vec![connect_request(
+                    connect_target.to_owned(),
+                    "127.0.0.1:1".to_owned(),
                     "",
-                ),
-            ),
-            (
-                "ipv6",
-                request(
-                    target.replacen("127.0.0.1", "[::1]", 1),
-                    format!("[::1]:{source_port}"),
-                    "",
-                ),
-            ),
-            (
-                "non-http-scheme",
-                request(target.replacen("http:", "https:", 1), authority.clone(), ""),
-            ),
-            (
-                "userinfo",
-                request(
+                )]
+            }
+            "103-proxy-encoded-and-userinfo-targets" => vec![
+                http_request(
                     target.replacen("http://", "http://user@", 1),
                     authority.clone(),
                     "",
                 ),
-            ),
-            (
-                "encoded-host",
-                request(
+                http_request(
                     target.replacen("127.0.0.1", "127%2e0%2e0%2e1", 1),
                     authority.clone(),
                     "",
                 ),
-            ),
-            (
-                "fragment",
-                request(format!("{target}#forbidden"), authority.clone(), ""),
-            ),
-            (
-                "host-mismatch",
-                request(target.clone(), "127.0.0.1:1".to_owned(), ""),
-            ),
-            (
-                "duplicate-host",
-                request(
+            ],
+            "104-proxy-framing-and-header-limits" => vec![
+                http_request(
                     target.clone(),
                     authority.clone(),
                     "Host: 127.0.0.1:1\r\n",
                 ),
-            ),
-            (
-                "content-length-transfer-encoding-conflict",
-                request(
+                http_request(
                     target.clone(),
                     authority.clone(),
                     "Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
                 ),
-            ),
-        ];
-        for (name, raw) in &cases {
+            ],
+            _ => anyhow::bail!("unsupported proxy regression scenario {scenario_id}"),
+        };
+        for raw in &cases {
             let status = raw_proxy_status(proxy_port, raw).await?;
             if status != 400 && status != 403 {
-                anyhow::bail!("proxy regression case {name} returned unexpected HTTP status {status}");
+                anyhow::bail!("{scenario_id} raw proxy rejection returned HTTP {status}");
             }
         }
-        let audit = fetch_audit(&client, &server.base_url(), &run).await?;
+        let audit = fetch_audit(client, base_url, &run).await?;
         let rejected = audit
             .iter()
             .filter(|record| record.event_type == AuditEventType::ProxyRequest)
@@ -1244,26 +3150,79 @@ async fn raw_proxy_adversarial_regression(repository: &ScenarioRepository) -> an
                 .any(|record| record.event_type == AuditEventType::QuotaDecision)
         {
             anyhow::bail!(
-                "rejected proxy targets must be blocked before source forwarding or quota consumption"
+                "{scenario_id} malformed proxy traffic reached source or consumed quota"
             );
         }
-        let status = raw_proxy_status(proxy_port, &request(target, authority, "")).await?;
-        if status != 200 {
-            anyhow::bail!("a correct proxy request must remain usable after rejected inputs");
+        if scenario_id == "102-proxy-authority-header-ambiguity" {
+            let network = manifest
+                .get("network_profile")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("CONNECT manifest is missing network profile"))?;
+            let (status, _) = connect_conformance_probe(
+                network,
+                source,
+                &run.run_id.to_string(),
+                manifest
+                    .get("transport_profile")
+                    .and_then(|profile| profile.get("client_visible_decoded_limit"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|limit| usize::try_from(limit).ok())
+                    .ok_or_else(|| anyhow::anyhow!("CONNECT manifest is missing decoded limit"))?,
+            )
+            .await?;
+            if status != "succeeded" {
+                anyhow::bail!("{scenario_id} valid CONNECT probe was not healthy");
+            }
+        } else {
+            let status = raw_proxy_status(proxy_port, &http_request(target, authority, "")).await?;
+            if status != 200 {
+                anyhow::bail!("{scenario_id} valid proxy request returned HTTP {status}");
+            }
         }
-        let audit = fetch_audit(&client, &server.base_url(), &run).await?;
-        let source_requests = audit
+        let audit = fetch_audit(client, base_url, &run).await?;
+        if audit
             .iter()
             .filter(|record| record.event_type == AuditEventType::SourceRequest)
-            .count();
-        if source_requests != 1 {
-            anyhow::bail!("the correct proxy request did not produce exactly one source request");
+            .count()
+            != 1
+        {
+            anyhow::bail!("{scenario_id} valid proxy request did not produce exactly one source request");
         }
-        Ok(true)
+        Ok(())
     }
     .await;
-    server.shutdown().await;
+    let cleanup = client
+        .delete(format!("{base_url}/api/runs/{}", run.run_id))
+        .header("x-lab-run-access-token", &run.access_token)
+        .send()
+        .await?;
+    if cleanup.status() != reqwest::StatusCode::NO_CONTENT {
+        anyhow::bail!("{scenario_id} raw proxy regression could not delete its run");
+    }
     result
+}
+
+fn public_source_target(source: &serde_json::Value) -> anyhow::Result<String> {
+    let source_base = source
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("proxy regression source has no base_url"))?;
+    let source_path = source
+        .get("path_template")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("proxy regression source has no path_template"))?;
+    let mut target = Url::parse(&format!("{source_base}{source_path}"))?;
+    if let Some(query) = source
+        .get("required_query")
+        .and_then(serde_json::Value::as_object)
+    {
+        target.query_pairs_mut().extend_pairs(
+            query
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|value| (key.as_str(), value))),
+        );
+    }
+    Ok(target.into())
 }
 
 async fn raw_proxy_status(proxy_port: u16, request: &str) -> anyhow::Result<u16> {

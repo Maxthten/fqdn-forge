@@ -1,7 +1,7 @@
 id: 114-coverage-and-baseline-integrity
 name: Coverage and baseline integrity
 description: Fixed scenario for computed coverage metadata and logical baseline provenance.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s114.v14.test
 seed: 114
 include_root: false

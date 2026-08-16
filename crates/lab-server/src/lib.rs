@@ -25,13 +25,14 @@ use flate2::{
 };
 use futures_util::stream;
 use lab_core::{
-    AuditEventType, AuditRecord, CollectorRun, CollectorSubmission, Endpoint, FilterReason,
-    FilteredCandidate, GeneratorKind, LabState, LoadedScenario, ManifestNetwork,
-    ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource, ManifestSubmission,
-    ManifestTransportProfile, NetworkMode, NetworkProfile, ProxyAuthenticationState, ProxyFault,
-    QuotaProfile, Reply, ResponseMetrics, RetryAfterMode, RunManifest, RunReport, RunSession,
-    RunStateError, Scenario, ScenarioRepository, SourceStatus, SubmissionLimits, SubmissionReport,
-    TransferMode, ValueRule, accept_candidate, judge_run, refresh_semantic_fingerprint,
+    AuditEventType, AuditRecord, CollectorRun, CollectorSubmission, Endpoint, FaultScriptClaim,
+    FaultScriptStage, FilterReason, FilteredCandidate, GeneratorKind, LabState, LoadedScenario,
+    ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource,
+    ManifestSubmission, ManifestTransportProfile, NetworkMode, NetworkProfile, PaginationMode,
+    ProxyAuthenticationState, ProxyFault, QuotaProfile, Reply, ResponseMetrics, RetryAfterMode,
+    RunManifest, RunReport, RunSession, RunStateError, Scenario, ScenarioRepository, SourceStatus,
+    SubmissionLimits, SubmissionReport, TransferMode, ValueRule, accept_candidate, judge_run,
+    refresh_semantic_fingerprint, stable_digest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -152,6 +153,13 @@ impl LocalServer {
         let _ = self.state.set_report(&run_id, report);
     }
 
+    /// Internal state is exposed only for the terminal leak/invariant check of
+    /// a public loopback soak; test actions themselves use HTTP/proxy routes.
+    #[must_use]
+    pub fn resource_summary(&self) -> lab_core::ResourceSummary {
+        self.state.resource_summary()
+    }
+
     pub async fn shutdown(mut self) {
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
@@ -230,7 +238,10 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         }
     };
     let profile = loaded.scenario.network_profile.clone();
-    let auth = proxy_authentication_state(&headers, run_id);
+    let auth = match state.session(run_id) {
+        Ok(run) => proxy_authentication_state(&headers, &run),
+        Err(_) => ProxyAuthenticationState::Invalid,
+    };
     let is_connect = request.method.eq_ignore_ascii_case("CONNECT");
     let correlation_id = Uuid::new_v4().to_string();
     let mut audit = proxy_audit_record(ProxyAuditContext {
@@ -358,6 +369,78 @@ async fn proxy_forward(
         .iter()
         .find(|endpoint| endpoint.request_match.path == target.path())
         .map(|endpoint| endpoint.id.clone());
+    let endpoint_id = audit.endpoint_id.clone().unwrap_or_default();
+    let script_claim = match state.claim_fault_script_step(
+        run_id,
+        &scenario.fault_script,
+        FaultScriptStage::Proxy,
+        &endpoint_id,
+        &parse_query(target.query()),
+        0,
+    ) {
+        Ok(claim) => claim,
+        Err(_) => {
+            let _ = write_proxy_response(&mut client, 409, "Conflict", None).await;
+            return;
+        }
+    };
+    match script_claim {
+        FaultScriptClaim::Unscripted => {}
+        FaultScriptClaim::Unexpected(reason) => {
+            audit.response_status = 409;
+            audit.blocked = true;
+            audit.proxy_reason = Some("unexpected_script_step".to_owned());
+            audit
+                .mismatch_reasons
+                .push(format!("unexpected_script_step: {reason}"));
+            let _ = state.record_request(run_id, audit);
+            let _ = write_proxy_response(&mut client, 409, "Conflict", None).await;
+            return;
+        }
+        FaultScriptClaim::Matched(step) => {
+            audit.script_step_id = Some(step.id);
+            if step.proxy_fault != ProxyFault::None {
+                audit.proxy_reason = Some(format!("fault_script_{:?}", step.proxy_fault));
+                match step.proxy_fault {
+                    ProxyFault::ResetBeforeResponse => {
+                        let _ = state.record_request(run_id, audit);
+                        return;
+                    }
+                    ProxyFault::ResetAfterHeaders => {
+                        audit.response_status = 502;
+                        let _ = state.record_request(run_id, audit);
+                        let _ = client
+                            .write_all(
+                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    ProxyFault::ConnectionRefused => {
+                        audit.response_status = 502;
+                        let _ = state.record_request(run_id, audit);
+                        let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+                        return;
+                    }
+                    ProxyFault::ConnectTimeout => {
+                        audit.response_status = 504;
+                        let _ = state.record_request(run_id, audit);
+                        let _ =
+                            write_proxy_response(&mut client, 504, "Gateway Timeout", None).await;
+                        return;
+                    }
+                    ProxyFault::EgressDenied => {
+                        audit.response_status = 403;
+                        audit.blocked = true;
+                        let _ = state.record_request(run_id, audit);
+                        let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+                        return;
+                    }
+                    ProxyFault::TunnelCloseAfterBytes | ProxyFault::None => {}
+                }
+            }
+        }
+    }
     if matches!(profile.fault, ProxyFault::EgressDenied) {
         // The target has already passed the numeric-loopback allowlist, so
         // this is a scenario-selected local proxy fault rather than a client
@@ -453,8 +536,49 @@ async fn proxy_connect(
             return;
         }
     };
+    let endpoint_id = scenario
+        .endpoints
+        .first()
+        .map(|endpoint| endpoint.id.as_str())
+        .unwrap_or_default();
+    let mut scripted_fault = ProxyFault::None;
+    match state.claim_fault_script_step(
+        run_id,
+        &scenario.fault_script,
+        FaultScriptStage::Proxy,
+        endpoint_id,
+        &BTreeMap::new(),
+        0,
+    ) {
+        Ok(FaultScriptClaim::Unscripted) => {}
+        Ok(FaultScriptClaim::Matched(step)) => {
+            audit.script_step_id = Some(step.id);
+            scripted_fault = step.proxy_fault;
+        }
+        Ok(FaultScriptClaim::Unexpected(reason)) => {
+            audit.response_status = 409;
+            audit.blocked = true;
+            audit.proxy_reason = Some("unexpected_script_step".to_owned());
+            audit
+                .mismatch_reasons
+                .push(format!("unexpected_script_step: {reason}"));
+            let _ = state.record_request(run_id, audit);
+            let _ = write_proxy_response(&mut client, 409, "Conflict", None).await;
+            return;
+        }
+        Err(_) => {
+            let _ = write_proxy_response(&mut client, 409, "Conflict", None).await;
+            return;
+        }
+    }
     audit.response_status = 200;
-    audit.proxy_reason = Some("connect_established".to_owned());
+    if scripted_fault != ProxyFault::None || profile.fault != ProxyFault::None {
+        audit.proxy_reason = Some("tunnel_truncated".to_owned());
+        audit.transport_fault = Some("truncated".to_owned());
+    } else {
+        audit.proxy_reason = Some("connect_established".to_owned());
+    }
+    let correlation = audit.correlation_id.clone().unwrap_or_default();
     let _ = state.record_request(run_id, audit);
     let mut target = match TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
         Ok(target) => target,
@@ -486,7 +610,18 @@ async fn proxy_connect(
     else {
         return;
     };
-    if read == 0 || target.write_all(&inbound[..read]).await.is_err() {
+    if read == 0 {
+        return;
+    }
+    let mut forwarded = inbound[..read].to_vec();
+    if let Some(headers_end) = forwarded
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+    {
+        let proxy_header = format!("\r\nx-lab-proxy-correlation: {correlation}").into_bytes();
+        forwarded.splice(headers_end..headers_end, proxy_header);
+    }
+    if target.write_all(&forwarded).await.is_err() {
         return;
     }
     let mut outbound = vec![0_u8; limit.max(1)];
@@ -666,7 +801,7 @@ fn proxy_header_map(headers: &[(String, String)]) -> BTreeMap<String, String> {
 
 fn proxy_authentication_state(
     headers: &BTreeMap<String, String>,
-    run_id: &str,
+    run: &RunSession,
 ) -> ProxyAuthenticationState {
     let Some(value) = headers.get("proxy-authorization") else {
         return ProxyAuthenticationState::Missing;
@@ -674,21 +809,34 @@ fn proxy_authentication_state(
     if !value.starts_with("Lab ") {
         return ProxyAuthenticationState::WrongScheme;
     }
-    let expected = proxy_authorization_value(run_id);
-    let capability = proxy_capability_value(run_id);
-    if value == &expected && headers.get("x-lab-proxy-capability") == Some(&capability) {
+    let expected = proxy_authorization_value(&run.run_id, &run.access_token);
+    let capability = proxy_capability_value(&run.run_id, &run.access_token);
+    let legacy_capability = legacy_proxy_capability_value(&run.run_id);
+    let legacy_authorization = format!("Lab {legacy_capability}");
+    if (value == &expected && headers.get("x-lab-proxy-capability") == Some(&capability))
+        || (value == &legacy_authorization
+            && headers.get("x-lab-proxy-capability") == Some(&legacy_capability))
+    {
         ProxyAuthenticationState::Valid
     } else {
         ProxyAuthenticationState::Invalid
     }
 }
 
-fn proxy_capability_value(run_id: &str) -> String {
+fn proxy_capability_value(run_id: &str, access_token: &str) -> String {
+    format!("cap-{run_id}-{access_token}")
+}
+
+fn proxy_authorization_value(run_id: &str, access_token: &str) -> String {
+    format!("Lab {}", proxy_capability_value(run_id, access_token))
+}
+
+fn legacy_proxy_capability_value(run_id: &str) -> String {
     format!("cap-{run_id}")
 }
 
-fn proxy_authorization_value(run_id: &str) -> String {
-    format!("Lab {}", proxy_capability_value(run_id))
+fn source_capability_value(run_id: &str, access_token: &str) -> String {
+    format!("src-{run_id}-{access_token}")
 }
 
 struct ProxyAuditContext<'a> {
@@ -731,6 +879,7 @@ fn proxy_audit_record(context: ProxyAuditContext<'_>) -> AuditRecord {
         body_summary: None,
         endpoint_id: None,
         response_index: None,
+        script_step_id: None,
         response_sequence: None,
         response_status,
         before_submission: false,
@@ -743,6 +892,7 @@ fn proxy_audit_record(context: ProxyAuditContext<'_>) -> AuditRecord {
         extra: blocked,
         mismatch_reasons: reason.clone().into_iter().collect(),
         wire_bytes: 0,
+        response_digest: None,
         decoded_bytes: 0,
         content_encoding: None,
         compression_limit_violation: None,
@@ -804,6 +954,7 @@ fn quota_audit_record(
         body_summary: None,
         endpoint_id: Some(endpoint_id.to_owned()),
         response_index: None,
+        script_step_id: None,
         response_sequence: None,
         response_status: if decision.rate_limited {
             decision.profile.exhausted_status
@@ -811,7 +962,10 @@ fn quota_audit_record(
             200
         },
         before_submission: false,
-        virtual_wait_ms: decision.profile.retry_after_ms,
+        // This decision advertises a required delay; it is not proof that a
+        // client actually waited.  Actual virtual elapsed time is recorded on
+        // the following source request from its explicit loopback header.
+        virtual_wait_ms: 0,
         retry_after: decision
             .rate_limited
             .then(|| quota_retry_after(&decision.profile)),
@@ -822,6 +976,7 @@ fn quota_audit_record(
         extra: false,
         mismatch_reasons: Vec::new(),
         wire_bytes: 0,
+        response_digest: None,
         decoded_bytes: 0,
         content_encoding: None,
         compression_limit_violation: None,
@@ -1197,6 +1352,17 @@ fn run_control_response(
             ),
             Err(error) => run_error_response(error),
         },
+        (&Method::POST, Some("cancel")) => {
+            let virtual_wait_ms = headers
+                .get("x-lab-client-virtual-wait-ms")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            match state.cancel(run_id, virtual_wait_ms) {
+                Ok(()) => json_response(StatusCode::OK, json!({"run_id":run_id,"cancelled":true})),
+                Err(error) => run_error_response(error),
+            }
+        }
         (&Method::POST, Some("submission")) => {
             submit_collector_result(state, run_id, &run, body, base_url)
         }
@@ -1224,8 +1390,10 @@ fn run_access_is_required(method: &Method, action: Option<&str>) -> bool {
         (
             &Method::GET,
             None | Some("requests") | Some("manifest") | Some("report")
-        ) | (&Method::POST, Some("reset") | Some("submission"))
-            | (&Method::DELETE, None)
+        ) | (
+            &Method::POST,
+            Some("reset") | Some("cancel") | Some("submission")
+        ) | (&Method::DELETE, None)
     )
 }
 
@@ -1271,46 +1439,8 @@ fn manifest_for_run(
         .scenario
         .endpoints
         .iter()
-        .map(|endpoint| ManifestSource {
-            source_id: endpoint.id.clone(),
-            source_kind: endpoint.source_kind,
-            source_label: endpoint
-                .source_label
-                .clone()
-                .unwrap_or_else(|| endpoint.id.clone()),
-            base_url: base_url.clone(),
-            method: endpoint.request_match.method,
-            path_template: endpoint.request_match.path.clone(),
-            required_query: endpoint
-                .request_match
-                .query
-                .iter()
-                .filter(|(_, rule)| rule.requires_value() && !rule.optional)
-                .map(|(name, rule)| {
-                    (
-                        name.clone(),
-                        rule.equals
-                            .as_deref()
-                            .map(|value| manifest_value(value, &loaded.scenario))
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect(),
-            required_headers: endpoint
-                .request_match
-                .headers
-                .iter()
-                .filter(|(_, rule)| rule.requires_value() && !rule.optional)
-                .map(|(name, _)| name.clone())
-                .collect(),
-            authentication_field_names: endpoint
-                .request_match
-                .headers
-                .keys()
-                .filter(|name| is_sensitive(name))
-                .cloned()
-                .collect(),
-            authentication: endpoint
+        .map(|endpoint| {
+            let mut authentication = endpoint
                 .request_match
                 .headers
                 .iter()
@@ -1320,12 +1450,56 @@ fn manifest_for_run(
                         .as_deref()
                         .map(|value| (name.clone(), manifest_value(value, &loaded.scenario)))
                 })
-                .collect(),
-            pagination_mode: endpoint.pagination.mode,
-            run_header_name: "x-lab-run-id".to_owned(),
-            allow_retry: endpoint.allow_retry,
-            allow_redirect: false,
-            local_test_only: true,
+                .collect::<BTreeMap<_, _>>();
+            authentication.insert(
+                "x-lab-source-capability".to_owned(),
+                source_capability_value(&run.run_id, &run.access_token),
+            );
+            ManifestSource {
+                source_id: endpoint.id.clone(),
+                source_kind: endpoint.source_kind,
+                source_label: endpoint
+                    .source_label
+                    .clone()
+                    .unwrap_or_else(|| endpoint.id.clone()),
+                base_url: base_url.clone(),
+                method: endpoint.request_match.method,
+                path_template: endpoint.request_match.path.clone(),
+                required_query: endpoint
+                    .request_match
+                    .query
+                    .iter()
+                    .filter(|(_, rule)| rule.requires_value() && !rule.optional)
+                    .map(|(name, rule)| {
+                        (
+                            name.clone(),
+                            rule.equals
+                                .as_deref()
+                                .map(|value| manifest_value(value, &loaded.scenario))
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+                required_headers: endpoint
+                    .request_match
+                    .headers
+                    .iter()
+                    .filter(|(_, rule)| rule.requires_value() && !rule.optional)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                authentication_field_names: authentication.keys().cloned().collect(),
+                authentication,
+                pagination_mode: endpoint.pagination.mode,
+                pagination_parameter: (endpoint.pagination.mode != PaginationMode::None)
+                    .then(|| endpoint.pagination.parameter.clone()),
+                next_page_field: (endpoint.pagination.mode != PaginationMode::None)
+                    .then_some(endpoint.pagination.next_cursor_field.clone())
+                    .flatten(),
+                run_header_name: "x-lab-run-id".to_owned(),
+                allow_retry: endpoint.allow_retry,
+                allow_redirect: false,
+                local_test_only: true,
+            }
         })
         .collect();
     let mut proxy_authentication = BTreeMap::new();
@@ -1334,11 +1508,11 @@ fn manifest_for_run(
     } else {
         proxy_authentication.insert(
             "proxy_authorization".to_owned(),
-            proxy_authorization_value(&run.run_id),
+            proxy_authorization_value(&run.run_id, &run.access_token),
         );
         proxy_authentication.insert(
             "proxy_capability".to_owned(),
-            proxy_capability_value(&run.run_id),
+            proxy_capability_value(&run.run_id, &run.access_token),
         );
         state.proxy_url()
     };
@@ -1406,6 +1580,10 @@ fn manifest_for_run(
             },
             proxy_authentication,
             proxy_must_be_used: loaded.scenario.network_profile.proxy_must_be_used,
+            initial_proxy_auth_challenge: loaded
+                .scenario
+                .network_profile
+                .initial_proxy_auth_challenge,
             allowed_proxy_targets: allowed_proxy_targets.clone(),
             connect_fixture_target: (loaded.scenario.network_profile.mode
                 == NetworkMode::ConnectProxy)
@@ -1549,6 +1727,12 @@ fn submit_collector_result(
         accepted: true,
         rejected_fields: Vec::new(),
     };
+    if let Err(error) = lab_core::enrich_report(&mut report, &loaded) {
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":format!("cannot enrich public run report: {error}")}),
+        );
+    }
     refresh_semantic_fingerprint(&mut report);
     if let Err(error) = state.set_report(run_id, report.clone()) {
         return run_error_response(error);
@@ -1572,9 +1756,9 @@ fn validate_submission(
     let limits = &loaded.scenario.submission;
     if !matches!(
         submission.schema_version.as_str(),
-        "1.2.1" | "1.3.0" | "1.4.0"
+        "1.2.1" | "1.3.0" | "1.4.0" | lab_core::V14_SCHEMA_VERSION
     ) {
-        return Err("submission schema_version must be 1.2.1, 1.3.0 or 1.4.0".to_owned());
+        return Err("submission schema_version must be 1.2.1, 1.3.0, 1.4.0 or 1.4.1".to_owned());
     }
     if submission.collector.name.is_empty()
         || submission.collector.version.is_empty()
@@ -1847,6 +2031,38 @@ async fn scenario_response(
     ) {
         return run_error_response(RunStateError::RunNotAcceptingSourceRequests);
     }
+    if let Some(capability) = headers
+        .get("x-lab-source-capability")
+        .and_then(|value| value.to_str().ok())
+        && capability != source_capability_value(&run.run_id, &run.access_token)
+    {
+        let loaded = match state.loaded_for_run(run_id) {
+            Ok(loaded) => loaded,
+            Err(error) => return run_error_response(error),
+        };
+        let mut record = audit_record(AuditInput {
+            run_id,
+            scenario: &loaded.scenario,
+            endpoint: None,
+            method: &method,
+            path: &path,
+            query,
+            headers: &headers,
+            body: &body,
+            response_index: None,
+            response_status: 403,
+            matched: false,
+            extra: true,
+            mismatch_reasons: vec!["stale_source_capability".to_owned()],
+        });
+        record.blocked = true;
+        record.proxy_reason = Some("stale_source_capability".to_owned());
+        let _ = state.record_request(run_id, record);
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error":"source capability is stale or invalid"}),
+        );
+    }
     let loaded = match state.loaded_for_run(run_id) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -1939,12 +2155,53 @@ async fn scenario_response(
             json!({"error":"request did not match scenario rule"}),
         );
     }
+    let client_virtual_wait_ms = headers
+        .get("x-lab-client-virtual-wait-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let script_claim = match state.claim_fault_script_step(
+        run_id,
+        &loaded.scenario.fault_script,
+        FaultScriptStage::Source,
+        &endpoint.id,
+        &query,
+        client_virtual_wait_ms,
+    ) {
+        Ok(claim) => claim,
+        Err(error) => return run_error_response(error),
+    };
+    let (script_step_id, scripted_response_index, script_expects_rate_limit) = match script_claim {
+        FaultScriptClaim::Unscripted => (None, None, false),
+        FaultScriptClaim::Matched(step) => (
+            Some(step.id),
+            step.response_index,
+            step.expect_quota_rate_limited,
+        ),
+        FaultScriptClaim::Unexpected(reason) => {
+            let record = audit_record(AuditInput {
+                run_id,
+                scenario: &loaded.scenario,
+                endpoint: Some(endpoint),
+                method: &method,
+                path: &path,
+                query,
+                headers: &headers,
+                body: &body,
+                response_index: None,
+                response_status: StatusCode::CONFLICT.as_u16(),
+                matched: false,
+                extra: true,
+                mismatch_reasons: vec![format!("unexpected_script_step: {reason}")],
+            });
+            let _ = state.record_request(run_id, record);
+            return json_response(
+                StatusCode::CONFLICT,
+                json!({"error":"request did not match the current fault-script step"}),
+            );
+        }
+    };
     if !endpoint.quota.is_empty() {
-        let client_virtual_wait_ms = headers
-            .get("x-lab-client-virtual-wait-ms")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
         let credential_identity = quota_credential_identity(&headers);
         let decisions = match state.evaluate_quota(
             run_id,
@@ -1992,7 +2249,15 @@ async fn scenario_response(
                 mismatch_reasons: Vec::new(),
             });
             record.retry_after = Some(quota_retry_after(&decision.profile));
-            record.virtual_wait_ms = decision.profile.retry_after_ms;
+            record.virtual_wait_ms = client_virtual_wait_ms;
+            record.script_step_id = script_step_id;
+            if !script_expects_rate_limit && !loaded.scenario.fault_script.is_empty() {
+                record.matched = false;
+                record.extra = true;
+                record
+                    .mismatch_reasons
+                    .push("fault script did not expect a quota rejection".to_owned());
+            }
             let _ = state.record_request(run_id, record);
             return Response::builder()
                 .status(status)
@@ -2007,10 +2272,35 @@ async fn scenario_response(
                 .expect("static quota response");
         }
     }
-    let index = match state.claim_response_index(run_id, &endpoint.id, endpoint.replies.len()) {
-        Ok(Some(index)) => index,
-        Ok(None) => {
-            let record = audit_record(AuditInput {
+    if script_expects_rate_limit {
+        let mut record = audit_record(AuditInput {
+            run_id,
+            scenario: &loaded.scenario,
+            endpoint: Some(endpoint),
+            method: &method,
+            path: &path,
+            query,
+            headers: &headers,
+            body: &body,
+            response_index: None,
+            response_status: StatusCode::CONFLICT.as_u16(),
+            matched: false,
+            extra: true,
+            mismatch_reasons: vec![
+                "fault script expected a quota rejection but the quota permitted the request"
+                    .to_owned(),
+            ],
+        });
+        record.script_step_id = script_step_id;
+        let _ = state.record_request(run_id, record);
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({"error":"fault-script quota expectation was not met"}),
+        );
+    }
+    let index = if let Some(index) = scripted_response_index {
+        if index >= endpoint.replies.len() {
+            let mut record = audit_record(AuditInput {
                 run_id,
                 scenario: &loaded.scenario,
                 endpoint: Some(endpoint),
@@ -2020,18 +2310,46 @@ async fn scenario_response(
                 headers: &headers,
                 body: &body,
                 response_index: None,
-                response_status: 409,
+                response_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                 matched: false,
                 extra: true,
-                mismatch_reasons: vec!["response sequence exhausted".to_owned()],
+                mismatch_reasons: vec!["fault script references an invalid reply index".to_owned()],
             });
+            record.script_step_id = script_step_id;
             let _ = state.record_request(run_id, record);
             return json_response(
-                StatusCode::CONFLICT,
-                json!({"error":"response sequence exhausted"}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"fault-script reply index is invalid"}),
             );
         }
-        Err(error) => return run_error_response(error),
+        index
+    } else {
+        match state.claim_response_index(run_id, &endpoint.id, endpoint.replies.len()) {
+            Ok(Some(index)) => index,
+            Ok(None) => {
+                let record = audit_record(AuditInput {
+                    run_id,
+                    scenario: &loaded.scenario,
+                    endpoint: Some(endpoint),
+                    method: &method,
+                    path: &path,
+                    query,
+                    headers: &headers,
+                    body: &body,
+                    response_index: None,
+                    response_status: 409,
+                    matched: false,
+                    extra: true,
+                    mismatch_reasons: vec!["response sequence exhausted".to_owned()],
+                });
+                let _ = state.record_request(run_id, record);
+                return json_response(
+                    StatusCode::CONFLICT,
+                    json!({"error":"response sequence exhausted"}),
+                );
+            }
+            Err(error) => return run_error_response(error),
+        }
     };
     let reply = &endpoint.replies[index];
     let template_context = TemplateContext::from_request(endpoint, &query, &body);
@@ -2051,6 +2369,7 @@ async fn scenario_response(
         extra: false,
         mismatch_reasons: Vec::new(),
     });
+    record.script_step_id = script_step_id;
     record.retry_after = reply.retry_after.clone().or_else(|| {
         reply
             .headers
@@ -2058,7 +2377,7 @@ async fn scenario_response(
             .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
             .map(|(_, value)| value.clone())
     });
-    record.virtual_wait_ms = reply.virtual_wait_ms;
+    record.virtual_wait_ms = client_virtual_wait_ms;
     if status.is_redirection()
         && response_location(reply)
             .is_some_and(|location| redirect_target_is_external(base_url, location))
@@ -2485,6 +2804,7 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
             response_index,
             wire_bytes: sent.len(),
             decoded_bytes,
+            response_digest: Some(stable_digest(&json!({"bytes": sent}))),
             content_encoding: content_encoding.clone(),
             compression_limit_violation,
             transfer_mode: Some(reply.transfer_mode),
@@ -2493,12 +2813,15 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
             } else {
                 0
             },
-            transport_fault: (reply.malformed_chunk
+            transport_fault: (reply.malformed_content_length.is_some()
+                || reply.malformed_chunk
                 || reply.truncated_body
                 || reply.encoding_corrupt
                 || reply.encoding_truncated)
                 .then(|| {
-                    if reply.malformed_chunk {
+                    if reply.malformed_content_length.is_some() {
+                        "framing_conflict".to_owned()
+                    } else if reply.malformed_chunk {
                         "malformed_chunk".to_owned()
                     } else if reply.truncated_body {
                         "truncated".to_owned()
@@ -2535,7 +2858,10 @@ async fn reply_response(state: &LabState, run_id: &str, input: ReplyResponseInpu
     for (name, value) in &reply.headers {
         builder = builder.header(name, value);
     }
-    if !transport_fault && reply.transfer_mode == TransferMode::ContentLength {
+    if !transport_fault
+        && (reply.transfer_mode == TransferMode::ContentLength
+            || reply.malformed_content_length.is_some())
+    {
         builder = builder.header(
             header::CONTENT_LENGTH,
             reply
@@ -2880,6 +3206,7 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
         body_summary: redacted_body,
         endpoint_id: endpoint.map(|endpoint| endpoint.id.clone()),
         response_index,
+        script_step_id: None,
         response_sequence: response_index,
         response_status,
         before_submission: false,
@@ -2893,6 +3220,7 @@ fn audit_record(input: AuditInput<'_>) -> AuditRecord {
         extra,
         mismatch_reasons,
         wire_bytes: 0,
+        response_digest: None,
         decoded_bytes: 0,
         content_encoding: None,
         compression_limit_violation: None,

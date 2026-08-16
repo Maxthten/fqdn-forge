@@ -1,7 +1,7 @@
 id: 113-replay-provenance-and-multi-diff
 name: Replay provenance and multi-diff
 description: Fixed scenario for digest-aware strict replay and bounded multi-difference diagnostics.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s113.v14.test
 seed: 113
 include_root: false

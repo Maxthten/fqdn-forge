@@ -1,7 +1,7 @@
 id: 110-transport-framing-mutation-campaign
 name: Transport framing mutation campaign
 description: Fixed campaign base scenario for bounded transport framing variants.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s110.v14.test
 seed: 11001
 include_root: false

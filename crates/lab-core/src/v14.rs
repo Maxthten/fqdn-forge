@@ -10,16 +10,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AuditEventType, DifferenceCategory, LabState, LoadedScenario, ResourceSummary, RunProvenance,
-    RunReport, Scenario, ScenarioRepository, semantic_projection,
+    AuditEventType, DifferenceCategory, FaultScriptReport, LabState, LoadedScenario,
+    ResourceSummary, RunProvenance, RunReport, Scenario, ScenarioRepository, semantic_projection,
 };
 
-pub const V14_SCHEMA_VERSION: &str = "1.4.0";
+pub const V14_SCHEMA_VERSION: &str = "1.4.1";
 pub const MAX_REPLAY_DIFFERENCES: usize = 50;
 
 const COVERAGE_DIMENSIONS: [&str; 10] = [
@@ -50,12 +51,42 @@ pub struct CoverageReport {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CoverageException {
+    pub id: String,
+    pub rule: String,
     pub dimension: String,
     pub value: String,
     pub reason: String,
+    pub created_on: String,
     pub expires_on: String,
     pub reference: String,
+    pub replacement: String,
+    pub security_relevant: bool,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+struct CoveragePolicyFile {
+    required_combinations: Vec<String>,
+    #[serde(default)]
+    exceptions: Vec<CoverageException>,
+}
+
+const REQUIRED_COVERAGE_COMBINATIONS: [&str; 15] = [
+    "http_proxy+proxy_auth+rate_limit",
+    "http_proxy+per_source+retry_recovery",
+    "connect_proxy+truncated+resource",
+    "direct+per_key+deflate",
+    "direct+global_run+multi_source",
+    "brotli+rate_limit/recovery",
+    "chunked+malformed/content-length-conflict",
+    "pagination+rate_limit+retry_recovery",
+    "campaign+json/html/csv/text",
+    "campaign+pagination",
+    "campaign+transport",
+    "lifecycle+concurrent+reset/delete",
+    "proxy_rejection+source_requests=0+quota_decisions=0",
+    "strict_replay+provenance_difference",
+    "baseline+scenario_fixture_digest",
+];
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CampaignDefinition {
@@ -98,6 +129,19 @@ pub struct Baseline {
     pub schema_version: String,
     pub profile: String,
     pub entries: BTreeMap<String, BaselineEntry>,
+    #[serde(default)]
+    pub public_soak: Option<SoakBaseline>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SoakBaseline {
+    pub preset: SoakPreset,
+    pub seed: u64,
+    pub minimum_operations: usize,
+    pub concurrency: usize,
+    pub action_counts: BTreeMap<String, usize>,
+    pub outcome_counts: BTreeMap<String, usize>,
+    pub invariants: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -153,9 +197,19 @@ impl SoakPreset {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SoakAction {
     pub index: usize,
+    #[serde(default)]
+    pub lane: usize,
     pub operation: String,
     pub scenario_id: String,
     pub outcome: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub seed: u64,
+    #[serde(default)]
+    pub audit_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -166,6 +220,14 @@ pub struct SoakReport {
     pub operations: usize,
     pub concurrency: usize,
     pub action_trace: Vec<SoakAction>,
+    #[serde(default)]
+    pub scenario_pool: Vec<String>,
+    #[serde(default)]
+    pub trace_coverage: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub action_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub outcome_counts: BTreeMap<String, usize>,
     pub resources: ResourceSummary,
     pub invariants: BTreeMap<String, bool>,
     pub last_failure: Option<String>,
@@ -208,22 +270,23 @@ pub fn scenario_revision_digest(scenario: &Scenario) -> String {
 }
 
 pub fn fixture_digest(loaded: &LoadedScenario) -> Result<String> {
-    let mut fixtures = BTreeMap::<String, String>::new();
+    let mut fixtures = BTreeMap::<String, Value>::new();
     for endpoint in &loaded.scenario.endpoints {
-        for reply in &endpoint.replies {
+        for (index, reply) in endpoint.replies.iter().enumerate() {
             if let Some(file) = &reply.body_file {
                 let path = loaded.directory.join(file);
                 let body = fs::read(&path)
                     .with_context(|| format!("cannot read local fixture {}", path.display()))?;
                 let normalized = String::from_utf8_lossy(&body).replace("\r\n", "\n");
-                fixtures.insert(file.clone(), normalized);
-            }
-            if reply.generator.is_some() {
                 fixtures.insert(
-                    format!("<generator:{}>", endpoint.id),
-                    serde_json::to_string(reply).expect("reply is serializable"),
+                    format!("{}:{}:file", endpoint.id, index),
+                    Value::String(normalized),
                 );
             }
+            fixtures.insert(
+                format!("{}:{}:reply", endpoint.id, index),
+                serde_json::to_value(reply).expect("reply is serializable"),
+            );
         }
     }
     Ok(stable_digest(
@@ -237,6 +300,14 @@ pub fn provenance_for(loaded: &LoadedScenario, seed: u64) -> Result<RunProvenanc
     Ok(RunProvenance {
         scenario_revision_digest: scenario_revision_digest(&scenario),
         fixture_digest: fixture_digest(loaded)?,
+        actual_response_digest: String::new(),
+        actual_truth_digest: stable_digest(
+            &serde_json::to_value(&loaded.truth).expect("truth is serializable"),
+        ),
+        fault_script_digest: stable_digest(
+            &serde_json::to_value(&scenario.fault_script).expect("fault script is serializable"),
+        ),
+        campaign_operators: Vec::new(),
         campaign_id: None,
         campaign_seed: None,
         network_profile_summary: format!(
@@ -257,8 +328,66 @@ pub fn enrich_report(report: &mut RunReport, loaded: &LoadedScenario) -> Result<
     report.schema_version = V14_SCHEMA_VERSION.to_owned();
     report.lab_version = V14_SCHEMA_VERSION.to_owned();
     report.provenance = provenance_for(loaded, report.seed)?;
+    let responses = report
+        .requests
+        .iter()
+        .filter_map(|record| {
+            record.response_digest.as_ref().map(|digest| {
+                (
+                    record.endpoint_id.clone(),
+                    record.script_step_id.clone(),
+                    digest,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    report.provenance.actual_response_digest =
+        stable_digest(&serde_json::to_value(responses).expect("response digests are serializable"));
+    report.fault_script = fault_script_report(loaded, &report.requests);
+    if !report.fault_script.missing_required_steps.is_empty()
+        || !report.fault_script.unexpected_steps.is_empty()
+    {
+        report.status = crate::ReportStatus::Failed;
+        report.result = crate::ReportStatus::Failed;
+        report.failures.push(format!(
+            "fault script incomplete: missing [{}]; unexpected [{}]",
+            report.fault_script.missing_required_steps.join(", "),
+            report.fault_script.unexpected_steps.join(", ")
+        ));
+    }
     report.diagnostics = diagnostics_for(report);
+    crate::refresh_semantic_fingerprint(report);
     Ok(())
+}
+
+#[must_use]
+pub fn fault_script_report(
+    loaded: &LoadedScenario,
+    audit: &[crate::AuditRecord],
+) -> FaultScriptReport {
+    let executed_steps = audit
+        .iter()
+        .filter_map(|record| record.script_step_id.clone())
+        .collect::<Vec<_>>();
+    let missing_required_steps = loaded
+        .scenario
+        .fault_script
+        .iter()
+        .filter(|step| step.required && !executed_steps.iter().any(|id| id == &step.id))
+        .map(|step| step.id.clone())
+        .collect::<Vec<_>>();
+    let unexpected_steps = audit
+        .iter()
+        .flat_map(|record| record.mismatch_reasons.iter())
+        .filter(|reason| reason.starts_with("unexpected_script_step"))
+        .cloned()
+        .collect::<Vec<_>>();
+    FaultScriptReport {
+        order_failure_reason: unexpected_steps.first().cloned(),
+        executed_steps,
+        missing_required_steps,
+        unexpected_steps,
+    }
 }
 
 #[must_use]
@@ -290,6 +419,7 @@ pub fn diagnostics_for(report: &RunReport) -> crate::DiagnosticSummary {
                     AuditEventType::ProxyRequest => "proxy",
                     AuditEventType::QuotaDecision => "quota",
                     AuditEventType::SourceRequest => "source",
+                    AuditEventType::Lifecycle => "lifecycle",
                 }
                 .to_owned()
             },
@@ -417,6 +547,195 @@ pub fn validate_v14_scenario(loaded: &LoadedScenario) -> Vec<String> {
             );
         }
     }
+    let scenario_number = loaded
+        .scenario
+        .id
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok());
+    if !scenario_number.is_some_and(|number| (91..=114).contains(&number)) {
+        return issues;
+    }
+    let mut script_ids = BTreeSet::new();
+    let mut saw_rate_limit_step = false;
+    let mut saw_positive_wait = false;
+    for step in &loaded.scenario.fault_script {
+        if step.id.trim().is_empty() || !script_ids.insert(step.id.clone()) {
+            issues.push("fault_script step ids must be unique and non-empty".to_owned());
+        }
+        let Some(endpoint) = loaded
+            .scenario
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == step.endpoint)
+        else {
+            issues.push(format!(
+                "fault_script step {} references unknown endpoint {}; add the endpoint or fix fault_script.endpoint",
+                step.id, step.endpoint
+            ));
+            continue;
+        };
+        if step
+            .response_index
+            .is_some_and(|index| index >= endpoint.replies.len())
+        {
+            issues.push(format!(
+                "fault_script step {} response_index exceeds endpoint {} replies; use a bounded existing reply index",
+                step.id, endpoint.id
+            ));
+        }
+        saw_positive_wait |= step.minimum_virtual_wait_ms > 0;
+        if step.expect_quota_rate_limited {
+            saw_rate_limit_step = true;
+            if endpoint.quota.is_empty() {
+                issues.push(format!(
+                    "fault_script step {} expects quota rejection but endpoint {} has no quota profile; add a real bounded quota",
+                    step.id, endpoint.id
+                ));
+            }
+            if step.response_index.is_some() {
+                issues.push(format!(
+                    "fault_script step {} expects quota rejection and must not consume a normal reply; remove response_index",
+                    step.id
+                ));
+            }
+        }
+        if step.response_index.is_some_and(|index| {
+            endpoint
+                .replies
+                .get(index)
+                .is_some_and(|reply| reply.status == 429)
+        }) {
+            saw_rate_limit_step = true;
+        }
+        if step.stage == crate::FaultScriptStage::Proxy
+            && loaded.scenario.network_profile.mode == crate::NetworkMode::Direct
+        {
+            issues.push(format!(
+                "fault_script step {} is a proxy action but network_profile is direct; use a bounded local proxy profile",
+                step.id
+            ));
+        }
+    }
+    let tag = |dimension: &str, value: &str| {
+        tags.get(dimension)
+            .is_some_and(|values| values.iter().any(|item| item == value))
+    };
+    if (tag("fault_class", "rate_limit") || tag("fault_class", "retry_recovery"))
+        && (!saw_rate_limit_step || !saw_positive_wait || loaded.scenario.fault_script.len() < 2)
+    {
+        issues.push(
+            "fault_class rate_limit/retry_recovery requires a real quota-rejected fault_script step, a positive virtual wait, and a later retry step"
+                .to_owned(),
+        );
+    }
+    if tag("pagination", "page") && tag("fault_class", "rate_limit") {
+        let pages = loaded
+            .scenario
+            .fault_script
+            .iter()
+            .filter_map(|step| step.query.get("page"))
+            .collect::<BTreeSet<_>>();
+        if pages.len() < 2 {
+            issues.push(
+                "pagination rate-limit scenario requires fault_script requests for at least two distinct page values"
+                    .to_owned(),
+            );
+        }
+    }
+    if (tag("network_profile", "http_proxy") || tag("network_profile", "connect_proxy"))
+        && (!loaded.scenario.network_profile.proxy_must_be_used
+            || loaded.assertions.require_proxy != Some(true)
+            || !loaded.assertions.forbid_direct_source)
+    {
+        issues.push(
+            "proxy coverage tags require network_profile.proxy_must_be_used, assertions.require_proxy=true and forbid_direct_source=true"
+                .to_owned(),
+        );
+    }
+    if tag("authentication", "proxy_auth")
+        && (loaded.scenario.network_profile.mode == crate::NetworkMode::Direct
+            || loaded
+                .assertions
+                .expected_proxy_requests
+                .unwrap_or_default()
+                == 0)
+    {
+        issues.push(
+            "proxy_auth scenarios require a real local proxy profile and at least one expected proxy audit"
+                .to_owned(),
+        );
+    }
+    if !tag("quota_scope", "none")
+        && (loaded
+            .scenario
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.quota.is_empty())
+            || loaded
+                .assertions
+                .expected_quota_decisions
+                .unwrap_or_default()
+                == 0)
+    {
+        issues.push(
+            "quota_scope requires a real endpoint quota profile and quota audit assertions"
+                .to_owned(),
+        );
+    }
+    for (tag_value, encoding) in [("deflate", "deflate"), ("brotli", "br")] {
+        if tag("transport", tag_value)
+            && !loaded
+                .scenario
+                .endpoints
+                .iter()
+                .flat_map(|endpoint| &endpoint.replies)
+                .any(|reply| {
+                    reply
+                        .encoding
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(encoding))
+                })
+        {
+            issues.push(format!(
+                "transport {tag_value} requires a reply with the actual Content-Encoding {encoding}"
+            ));
+        }
+    }
+    if tag("transport", "chunked")
+        && !loaded
+            .scenario
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| &endpoint.replies)
+            .any(|reply| {
+                reply.transfer_mode == crate::TransferMode::Chunked && reply.chunk_count > 1
+            })
+    {
+        issues.push("transport chunked requires an actual multi-chunk reply".to_owned());
+    }
+    if tag("execution_style", "campaign")
+        && !matches!(
+            loaded.scenario.id.as_str(),
+            "107-json-structural-mutation-campaign"
+                | "108-text-html-csv-mutation-campaign"
+                | "109-pagination-token-mutation-campaign"
+                | "110-transport-framing-mutation-campaign"
+        )
+    {
+        issues.push(
+            "execution_style campaign requires a registered 107-110 campaign scenario".to_owned(),
+        );
+    }
+    if tag("execution_style", "soak")
+        && !matches!(
+            loaded.scenario.id.as_str(),
+            "111-mixed-lifecycle-soak" | "112-concurrent-mixed-fault-soak"
+        )
+    {
+        issues
+            .push("execution_style soak requires a registered end-to-end soak scenario".to_owned());
+    }
     issues
 }
 
@@ -493,6 +812,7 @@ fn allowed_values(dimension: &str) -> &'static [&'static str] {
             "redaction",
             "resource",
             "determinism",
+            "lifecycle",
         ],
         _ => &[],
     }
@@ -532,44 +852,23 @@ pub fn coverage_report(repository: &ScenarioRepository) -> CoverageReport {
             )
         })
         .collect();
-    let combination = |network: &str, quota: &str, transport: &str| {
-        repository
-            .all()
-            .iter()
-            .filter(|loaded| {
-                let tags = coverage_tags_for(&loaded.scenario);
-                tags.get("network_profile")
-                    .is_some_and(|values| values.iter().any(|value| value == network))
-                    && tags
-                        .get("quota_scope")
-                        .is_some_and(|values| values.iter().any(|value| value == quota))
-                    && tags
-                        .get("transport")
-                        .is_some_and(|values| values.iter().any(|value| value == transport))
-            })
-            .map(|loaded| loaded.scenario.id.clone())
-            .collect::<Vec<_>>()
-    };
     CoverageReport {
         schema_version: V14_SCHEMA_VERSION.to_owned(),
         scenario_count: repository.all().len(),
         dimensions,
         gaps,
-        high_risk_combinations: BTreeMap::from([
-            (
-                "http_proxy+global_run+chunked".to_owned(),
-                combination("http_proxy", "global_run", "chunked"),
-            ),
-            (
-                "connect_proxy+per_source+truncated".to_owned(),
-                combination("connect_proxy", "per_source", "truncated"),
-            ),
-            (
-                "direct+per_key+deflate".to_owned(),
-                combination("direct", "per_key", "deflate"),
-            ),
-        ]),
-        exceptions: Vec::new(),
+        high_risk_combinations: REQUIRED_COVERAGE_COMBINATIONS
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    required_combination_ids(repository, name).unwrap_or_default(),
+                )
+            })
+            .collect(),
+        exceptions: coverage_policy(repository)
+            .map(|policy| policy.exceptions)
+            .unwrap_or_default(),
     }
 }
 
@@ -580,6 +879,64 @@ pub fn coverage_check(repository: &ScenarioRepository) -> Vec<String> {
         .flat_map(validate_v14_scenario)
         .collect::<Vec<_>>();
     let report = coverage_report(repository);
+    match coverage_policy(repository) {
+        Ok(policy) => {
+            let actual = policy
+                .required_combinations
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for required in REQUIRED_COVERAGE_COMBINATIONS {
+                if !actual.contains(required) {
+                    issues.push(format!(
+                        "coverage policy is missing required combination {required}"
+                    ));
+                }
+            }
+            for exception in &policy.exceptions {
+                if exception.id.trim().is_empty()
+                    || exception.rule.trim().is_empty()
+                    || exception.reason.trim().is_empty()
+                    || exception.created_on.trim().is_empty()
+                    || exception.expires_on.trim().is_empty()
+                    || exception.reference.trim().is_empty()
+                    || exception.replacement.trim().is_empty()
+                {
+                    issues.push(format!(
+                        "coverage exception {} is missing required fields",
+                        exception.id
+                    ));
+                }
+                let expires = NaiveDate::parse_from_str(&exception.expires_on, "%Y-%m-%d");
+                if expires.is_err() {
+                    issues.push(format!(
+                        "coverage exception {} has invalid expires_on",
+                        exception.id
+                    ));
+                } else if expires
+                    .ok()
+                    .is_some_and(|date| date < chrono::Utc::now().date_naive())
+                {
+                    issues.push(format!("coverage exception {} is expired", exception.id));
+                }
+                if exception.security_relevant {
+                    issues.push(format!(
+                        "coverage exception {} cannot waive a security boundary",
+                        exception.id
+                    ));
+                }
+                if required_combination_ids(repository, &exception.rule)
+                    .is_some_and(|ids| !ids.is_empty())
+                {
+                    issues.push(format!(
+                        "coverage exception {} remains after its rule is covered",
+                        exception.id
+                    ));
+                }
+            }
+        }
+        Err(error) => issues.push(error),
+    }
     for required in ["direct", "http_proxy", "connect_proxy"] {
         if report.dimensions["network_profile"][required].is_empty() {
             issues.push(format!("coverage is missing network_profile={required}"));
@@ -598,10 +955,133 @@ pub fn coverage_check(repository: &ScenarioRepository) -> Vec<String> {
     issues
 }
 
+fn coverage_policy(repository: &ScenarioRepository) -> Result<CoveragePolicyFile, String> {
+    let path = repository.root().join("..").join("coverage-policy.yaml");
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("coverage policy {} cannot be read: {error}", path.display()))?;
+    serde_yaml::from_slice(&bytes)
+        .map_err(|error| format!("coverage policy {} is invalid: {error}", path.display()))
+}
+
+fn required_combination_ids(repository: &ScenarioRepository, name: &str) -> Option<Vec<String>> {
+    let ids: &[&str] = match name {
+        "http_proxy+proxy_auth+rate_limit" => &["094-proxy-auth-then-source-rate-limit"],
+        "http_proxy+per_source+retry_recovery" => &["095-proxy-reset-then-retry-success"],
+        "connect_proxy+truncated+resource" => &["096-connect-tunnel-truncated-payload"],
+        "direct+per_key+deflate" => &["092-rate-limit-retry-deflate-success"],
+        "direct+global_run+multi_source" => &["099-multi-source-global-quota-isolation"],
+        "brotli+rate_limit/recovery" => &["093-quota-recovery-brotli-success"],
+        "chunked+malformed/content-length-conflict" => &["098-chunked-content-length-conflict"],
+        "pagination+rate_limit+retry_recovery" => &["091-pagination-second-page-rate-limit"],
+        "campaign+json/html/csv/text" => &[
+            "107-json-structural-mutation-campaign",
+            "108-text-html-csv-mutation-campaign",
+        ],
+        "campaign+pagination" => &["109-pagination-token-mutation-campaign"],
+        "campaign+transport" => &["110-transport-framing-mutation-campaign"],
+        "lifecycle+concurrent+reset/delete" => &["105-stale-capability-after-reset-delete"],
+        "proxy_rejection+source_requests=0+quota_decisions=0" => &[
+            "101-proxy-target-canonicalization",
+            "102-proxy-authority-header-ambiguity",
+            "103-proxy-encoded-and-userinfo-targets",
+            "104-proxy-framing-and-header-limits",
+        ],
+        "strict_replay+provenance_difference" => &["113-replay-provenance-and-multi-diff"],
+        "baseline+scenario_fixture_digest" => &["114-coverage-and-baseline-integrity"],
+        _ => return None,
+    };
+    Some(
+        ids.iter()
+            .filter_map(|id| {
+                repository
+                    .get(id)
+                    .filter(|loaded| coverage_entry_is_semantic(name, loaded))
+                    .map(|loaded| loaded.scenario.id.clone())
+            })
+            .collect(),
+    )
+}
+
+fn coverage_entry_is_semantic(name: &str, loaded: &LoadedScenario) -> bool {
+    let tags = coverage_tags_for(&loaded.scenario);
+    let has = |dimension: &str, value: &str| {
+        tags.get(dimension)
+            .is_some_and(|values| values.iter().any(|actual| actual == value))
+    };
+    match name {
+        "http_proxy+proxy_auth+rate_limit" => {
+            has("network_profile", "http_proxy")
+                && has("authentication", "proxy_auth")
+                && has("fault_class", "rate_limit")
+                && loaded.assertions.require_proxy == Some(true)
+                && loaded
+                    .assertions
+                    .expected_quota_decisions
+                    .unwrap_or_default()
+                    > 0
+        }
+        "http_proxy+per_source+retry_recovery" => {
+            has("network_profile", "http_proxy")
+                && has("quota_scope", "per_source")
+                && loaded
+                    .scenario
+                    .composition
+                    .fault_stages
+                    .contains(&crate::FaultStage::RetryRecovery)
+        }
+        "connect_proxy+truncated+resource" => {
+            has("network_profile", "connect_proxy")
+                && has("transport", "truncated")
+                && has("assertion_focus", "resource")
+        }
+        "direct+per_key+deflate" => {
+            has("network_profile", "direct")
+                && has("quota_scope", "per_key")
+                && has("transport", "deflate")
+        }
+        "direct+global_run+multi_source" => {
+            has("network_profile", "direct")
+                && has("quota_scope", "global_run")
+                && loaded.scenario.endpoints.len() >= 2
+        }
+        "brotli+rate_limit/recovery" => {
+            has("transport", "brotli") && has("fault_class", "rate_limit")
+        }
+        "chunked+malformed/content-length-conflict" => {
+            has("transport", "chunked")
+                && loaded.assertions.required_transport_fault.as_deref() == Some("framing_conflict")
+        }
+        "pagination+rate_limit+retry_recovery" => {
+            has("pagination", "page")
+                && has("fault_class", "rate_limit")
+                && loaded
+                    .scenario
+                    .composition
+                    .fault_stages
+                    .contains(&crate::FaultStage::RetryRecovery)
+        }
+        "campaign+json/html/csv/text" => {
+            has("execution_style", "campaign") && loaded.scenario.id.starts_with("107-")
+                || has("execution_style", "campaign") && loaded.scenario.id.starts_with("108-")
+        }
+        "campaign+pagination" => has("execution_style", "campaign") && has("pagination", "cursor"),
+        "campaign+transport" => has("execution_style", "campaign") && has("transport", "chunked"),
+        "lifecycle+concurrent+reset/delete" => {
+            has("fault_class", "lifecycle") && has("execution_style", "concurrent")
+        }
+        "proxy_rejection+source_requests=0+quota_decisions=0" => {
+            has("network_profile", "http_proxy") || has("network_profile", "connect_proxy")
+        }
+        "strict_replay+provenance_difference" => has("execution_style", "replay"),
+        "baseline+scenario_fixture_digest" => loaded.scenario.id.starts_with("114-"),
+        _ => false,
+    }
+}
+
 #[must_use]
 pub fn coverage_markdown(report: &CoverageReport) -> String {
     let mut markdown = format!(
-        "# FQDN Forge V1.4 coverage\n\nScenarios: {}\n",
+        "# FQDN Forge V1.4.1 coverage\n\nScenarios: {}\n",
         report.scenario_count
     );
     for (dimension, values) in &report.dimensions {
@@ -698,6 +1178,218 @@ pub fn campaign_definition(id: &str) -> Option<CampaignDefinition> {
         .find(|definition| definition.id == id)
 }
 
+/// Materializes the bounded campaign fixture that the public run API serves.
+/// The same pure transformation is used by the server, the reference runner,
+/// provenance, and replay so a campaign report cannot describe a fixture that
+/// was not actually returned.
+pub fn campaign_loaded_scenario(loaded: &LoadedScenario, seed: u64) -> LoadedScenario {
+    let mut dynamic = loaded.clone();
+    dynamic.scenario.seed = seed;
+    let Some(definition) = campaign_definition(&dynamic.scenario.id) else {
+        return dynamic;
+    };
+    let operators = selected_campaign_operators(&definition, seed);
+    let operator = operators.first().map(String::as_str).unwrap_or_default();
+    let host = format!("api-{seed}.{}", dynamic.scenario.root_domain);
+    let record_id = format!(
+        "{}-{seed}",
+        dynamic.scenario.id.split('-').next().unwrap_or("campaign")
+    );
+    match dynamic.scenario.id.as_str() {
+        "107-json-structural-mutation-campaign" => {
+            if let Some(reply) = dynamic.scenario.endpoints[0].replies.first_mut()
+                && let Some(body) = reply.body.as_mut().and_then(Value::as_object_mut)
+            {
+                if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut)
+                    && let Some(item) = items.first_mut().and_then(Value::as_object_mut)
+                {
+                    item.insert("host".to_owned(), Value::String(host.clone()));
+                    item.insert("id".to_owned(), Value::String(record_id.clone()));
+                    item.insert(
+                        "mutation_operator".to_owned(),
+                        Value::String(operator.to_owned()),
+                    );
+                }
+                if operator == "json_null" {
+                    body.insert("nullable".to_owned(), Value::Null);
+                } else if operator == "json_noise" {
+                    body.insert(
+                        "unknown_field".to_owned(),
+                        Value::String(format!("noise-{seed}")),
+                    );
+                }
+            }
+            rewrite_truth(
+                &mut dynamic,
+                &host,
+                &record_id,
+                crate::SourceKind::GenericJson,
+            );
+        }
+        "108-text-html-csv-mutation-campaign" => {
+            let endpoint = &mut dynamic.scenario.endpoints[0];
+            let reply = endpoint.replies.first_mut().expect("campaign reply");
+            let extract = endpoint.extract.as_mut().expect("campaign extract");
+            match operator {
+                "csv_quoting" => {
+                    extract.format = crate::ContentFormat::Csv;
+                    reply.content_type = Some("text/csv".to_owned());
+                    reply.body = None;
+                    reply.body_text = Some(format!("host,id\n\"{host}\",{record_id}\n"));
+                }
+                "html_noise" => {
+                    extract.format = crate::ContentFormat::Html;
+                    reply.content_type = Some("text/html".to_owned());
+                    reply.body = None;
+                    reply.body_text = Some(format!(
+                        "<!-- seed {seed} --> <a href=\"https://{host}/\">{host}</a>"
+                    ));
+                }
+                _ => {
+                    extract.format = crate::ContentFormat::Text;
+                    reply.content_type = Some("text/plain".to_owned());
+                    reply.body = None;
+                    reply.body_text = Some(format!("https://{host}/noise-{seed}"));
+                }
+            }
+            rewrite_truth(
+                &mut dynamic,
+                &host,
+                &record_id,
+                crate::SourceKind::GenericJson,
+            );
+            if operator != "csv_quoting"
+                && let Some(expectation) = dynamic.truth.expected_observations.get_mut(&host)
+            {
+                expectation.record_ids.clear();
+            }
+        }
+        "109-pagination-token-mutation-campaign" => {
+            let endpoint = &mut dynamic.scenario.endpoints[0];
+            endpoint.pagination = crate::Pagination {
+                mode: crate::PaginationMode::Cursor,
+                parameter: "cursor".to_owned(),
+                next_cursor_field: Some("next_cursor".to_owned()),
+                in_body: false,
+                start: 1,
+                step: 1,
+            };
+            if endpoint.replies.len() == 1 {
+                let first = endpoint.replies[0].clone();
+                endpoint.replies.push(first);
+            }
+            if let Some(first) = endpoint.replies.get_mut(0)
+                && let Some(body) = first.body.as_mut().and_then(Value::as_object_mut)
+            {
+                body.insert(
+                    "next_cursor".to_owned(),
+                    Value::String(format!("cursor-{seed}")),
+                );
+            }
+            if let Some(second) = endpoint.replies.get_mut(1)
+                && let Some(body) = second.body.as_mut().and_then(Value::as_object_mut)
+            {
+                body.remove("next_cursor");
+                if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut)
+                    && let Some(item) = items.first_mut().and_then(Value::as_object_mut)
+                {
+                    item.insert("host".to_owned(), Value::String(host.clone()));
+                    item.insert("id".to_owned(), Value::String(record_id.clone()));
+                }
+            }
+            if let Some(first) = endpoint.replies.get_mut(0)
+                && let Some(body) = first.body.as_mut().and_then(Value::as_object_mut)
+                && let Some(items) = body.get_mut("items").and_then(Value::as_array_mut)
+                && let Some(item) = items.first_mut().and_then(Value::as_object_mut)
+            {
+                item.insert("host".to_owned(), Value::String(host.clone()));
+                item.insert("id".to_owned(), Value::String(record_id.clone()));
+            }
+            dynamic.scenario.endpoints[0].request_match.query.insert(
+                "domain".to_owned(),
+                crate::ValueRule {
+                    equals: Some("$TARGET_DOMAIN".to_owned()),
+                    ..Default::default()
+                },
+            );
+            dynamic.assertions.expected_requests = 2;
+            dynamic
+                .assertions
+                .endpoint_requests
+                .insert("source".to_owned(), 2);
+            dynamic.assertions.request_sequence = vec![
+                crate::RequestSequenceExpectation {
+                    endpoint: "source".to_owned(),
+                    response_index: Some(0),
+                },
+                crate::RequestSequenceExpectation {
+                    endpoint: "source".to_owned(),
+                    response_index: Some(1),
+                },
+            ];
+            rewrite_truth(
+                &mut dynamic,
+                &host,
+                &record_id,
+                crate::SourceKind::GenericJson,
+            );
+        }
+        "110-transport-framing-mutation-campaign" => {
+            if let Some(reply) = dynamic.scenario.endpoints[0].replies.first_mut() {
+                reply.chunk_count = 2 + (seed as usize % 3);
+                if operator == "encoding_header" {
+                    reply.content_encoding_header = Some("identity".to_owned());
+                } else if operator == "content_length" {
+                    reply.transfer_mode = crate::TransferMode::ContentLength;
+                }
+                if let Some(body) = reply.body.as_mut().and_then(Value::as_object_mut)
+                    && let Some(items) = body.get_mut("items").and_then(Value::as_array_mut)
+                    && let Some(item) = items.first_mut().and_then(Value::as_object_mut)
+                {
+                    item.insert("host".to_owned(), Value::String(host.clone()));
+                    item.insert("id".to_owned(), Value::String(record_id.clone()));
+                }
+            }
+            rewrite_truth(
+                &mut dynamic,
+                &host,
+                &record_id,
+                crate::SourceKind::GenericJson,
+            );
+        }
+        _ => {}
+    }
+    dynamic
+}
+
+fn selected_campaign_operators(definition: &CampaignDefinition, seed: u64) -> Vec<String> {
+    let mut state = seed;
+    (0..3)
+        .map(|_| {
+            state = splitmix64(state);
+            definition.operators[(state as usize) % definition.operators.len()].to_owned()
+        })
+        .collect()
+}
+
+fn rewrite_truth(
+    loaded: &mut LoadedScenario,
+    host: &str,
+    record_id: &str,
+    source_kind: crate::SourceKind,
+) {
+    loaded.truth.expected_fqdns = vec![host.to_owned()];
+    loaded.truth.expected_observations = BTreeMap::from([(
+        host.to_owned(),
+        crate::ObservationExpectation {
+            source_names: vec!["source".to_owned()],
+            source_kinds: vec![source_kind],
+            record_ids: vec![record_id.to_owned()],
+            ..Default::default()
+        },
+    )]);
+}
+
 pub fn campaign_manifest(
     repository: &ScenarioRepository,
     id: &str,
@@ -714,21 +1406,14 @@ pub fn campaign_manifest(
     let loaded = repository
         .get(definition.scenario_id)
         .ok_or_else(|| anyhow!("campaign scenario {} is missing", definition.scenario_id))?;
-    let mut state = seed;
-    let operators = (0..3)
-        .map(|_| {
-            state = splitmix64(state);
-            definition.operators[(state as usize) % definition.operators.len()].to_owned()
-        })
-        .collect::<Vec<_>>();
+    let operators = selected_campaign_operators(&definition, seed);
+    let dynamic = campaign_loaded_scenario(loaded, seed);
     let mutation_fixture = json!({
         "synthetic_domain": "campaign.synthetic.test",
         "seed": seed,
         "operators": operators,
-        "records": [
-            {"host":"api.campaign.synthetic.test","known":true},
-            {"host":"ignored.campaign.synthetic.test","known":false}
-        ],
+        "actual_scenario": dynamic.scenario,
+        "actual_truth": dynamic.truth,
         "limits": {
             "max_mutations": definition.max_mutations,
             "max_nested_depth": definition.max_nested_depth,
@@ -737,12 +1422,8 @@ pub fn campaign_manifest(
             "max_chunks": definition.max_chunks
         }
     });
-    let fixture_digest = stable_digest(&mutation_fixture);
-    let truth_digest = stable_digest(&json!({
-        "expected_fqdn":"api.campaign.synthetic.test",
-        "forbidden_fqdn":"ignored.campaign.synthetic.test",
-        "operator_set": definition.operators,
-    }));
+    let fixture_digest = fixture_digest(&dynamic)?;
+    let truth_digest = stable_digest(&serde_json::to_value(&dynamic.truth)?);
     Ok(CampaignManifest {
         schema_version: V14_SCHEMA_VERSION.to_owned(),
         campaign_id: definition.id.to_owned(),
@@ -800,6 +1481,20 @@ pub fn baseline_from_reports(profile: &str, reports: &[RunReport]) -> Baseline {
         schema_version: V14_SCHEMA_VERSION.to_owned(),
         profile: profile.to_owned(),
         entries,
+        public_soak: None,
+    }
+}
+
+#[must_use]
+pub fn soak_baseline_from_report(report: &SoakReport) -> SoakBaseline {
+    SoakBaseline {
+        preset: report.preset,
+        seed: report.seed,
+        minimum_operations: report.operations,
+        concurrency: report.concurrency,
+        action_counts: report.action_counts.clone(),
+        outcome_counts: report.outcome_counts.clone(),
+        invariants: report.invariants.clone(),
     }
 }
 
@@ -1119,7 +1814,17 @@ pub fn run_soak(
         seed,
         operations: preset.operations(),
         concurrency,
+        action_counts: actions.iter().fold(BTreeMap::new(), |mut counts, action| {
+            *counts.entry(action.endpoint.clone()).or_default() += 1;
+            counts
+        }),
+        outcome_counts: actions.iter().fold(BTreeMap::new(), |mut counts, action| {
+            *counts.entry(action.outcome.clone()).or_default() += 1;
+            counts
+        }),
         action_trace: actions,
+        scenario_pool: scenario_ids,
+        trace_coverage: BTreeMap::new(),
         resources,
         invariants,
         last_failure,
@@ -1252,9 +1957,14 @@ fn run_soak_lane(
         };
         actions.push(SoakAction {
             index: index + 1,
+            lane,
             operation: operation.to_owned(),
             scenario_id,
             outcome,
+            run_id: None,
+            endpoint: "internal-test-helper".to_owned(),
+            seed,
+            audit_count: 0,
         });
     }
     if let Some((run_id, _)) = active

@@ -1,17 +1,23 @@
 id: 100-cancel-during-quota-recovery
 name: Cancel during quota recovery
 description: Static cancellation lifecycle record with bounded virtual wait semantics.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s100.v14.test
 seed: 100
+runner: { max_retries: 2, retry_after_cap_ms: 2000, cancel_after_requests: 1 }
 include_root: false
 allow_duplicates: false
 allow_concurrent: true
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [none], network_profile: [direct], quota_scope: [per_source], transport: [identity], fault_class: [rate_limit], execution_style: [cancelled], assertion_focus: [audit, resource, determinism] }
 composition: { fault_stages: [retry_recovery, lifecycle], event_order: [{ before: cancel_requested, after: no_new_request }] }
+fault_script:
+  - { id: cancel-rate-limit, stage: source, endpoint: source, expect_quota_rate_limited: true }
+  - { id: cancelled-retry-not-executed, stage: source, endpoint: source, response_index: 0, minimum_virtual_wait_ms: 2000, required: false }
 endpoints:
   - id: source
     source_kind: generic_json
     match: { method: GET, path: /v14/100, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
     extract: { items_field: items, candidate_field: host, record_id_field: id }
+    allow_retry: true
+    quota: [{ scope: per_source, success_limit: 0, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 2000, recover_after_virtual_ms: 2000 }]
     replies: [{ status: 200, body: { items: [{ id: s100, host: api.s100.v14.test }] } }]

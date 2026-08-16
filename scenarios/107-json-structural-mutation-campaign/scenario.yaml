@@ -1,7 +1,7 @@
 id: 107-json-structural-mutation-campaign
 name: JSON structural mutation campaign
 description: Fixed campaign base scenario for bounded seed-driven JSON mutations.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s107.v14.test
 seed: 10701
 include_root: false

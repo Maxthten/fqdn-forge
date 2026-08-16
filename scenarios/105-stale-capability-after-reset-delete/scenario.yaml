@@ -1,13 +1,14 @@
 id: 105-stale-capability-after-reset-delete
 name: Stale capability after reset delete
 description: Lifecycle regression for revoked run and proxy capabilities.
-version: "1.4.0"
+version: "1.4.1"
 root_domain: s105.v14.test
 seed: 105
 include_root: false
 allow_duplicates: false
 allow_concurrent: true
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [none], authentication: [expired], network_profile: [http_proxy], quota_scope: [none], transport: [identity], fault_class: [lifecycle], execution_style: [concurrent], assertion_focus: [audit, isolation, determinism] }
+network_profile: { mode: http_proxy, proxy_must_be_used: true }
 composition: { fault_stages: [lifecycle], event_order: [{ before: capability_revoked, after: old_capability_rejected }] }
 endpoints:
   - id: source

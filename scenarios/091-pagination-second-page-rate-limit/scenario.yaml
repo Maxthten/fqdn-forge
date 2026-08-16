@@ -1,17 +1,28 @@
 id: 091-pagination-second-page-rate-limit
 name: Pagination second-page rate limit
-description: Deterministic local composition record for a second-page rate-limit recovery.
-version: "1.4.0"
+description: Page one succeeds, page two is genuinely quota-rejected, and the same page succeeds only after the declared virtual wait.
+version: "1.4.1"
 root_domain: s091.v14.test
 seed: 91
 include_root: false
 allow_duplicates: false
 allow_concurrent: true
+runner: { max_retries: 2, retry_after_cap_ms: 2000 }
+network_profile: { mode: direct }
 coverage_tags: { source_shape: [generic], payload_format: [json], pagination: [page], authentication: [none], network_profile: [direct], quota_scope: [per_source], transport: [identity], fault_class: [rate_limit], execution_style: [single], assertion_focus: [finding, audit, determinism] }
-composition: { fault_stages: [source_request, retry_recovery], event_order: [{ before: page_one, after: retry_recovery }] }
+composition: { fault_stages: [source_request, retry_recovery], event_order: [{ before: page_one, after: page_two_recovery }] }
+fault_script:
+  - { id: page-one, stage: source, endpoint: source, query: { page: "1" }, response_index: 0 }
+  - { id: page-two-rate-limit, stage: source, endpoint: source, query: { page: "2" }, expect_quota_rate_limited: true }
+  - { id: page-two-success, stage: source, endpoint: source, query: { page: "2" }, response_index: 1, minimum_virtual_wait_ms: 2000 }
 endpoints:
   - id: source
     source_kind: generic_json
+    allow_retry: true
+    pagination: { mode: page, parameter: page, next_cursor_field: next_page }
+    quota: [{ scope: per_source, success_limit: 1, exhausted_status: 429, retry_after_mode: seconds, retry_after_ms: 2000, recover_after_virtual_ms: 2000 }]
     match: { method: GET, path: /v14/091, query: { domain: { equals: $TARGET_DOMAIN } }, headers: { x-lab-run-id: { present: true } } }
     extract: { items_field: items, candidate_field: host, record_id_field: id }
-    replies: [{ status: 200, body: { items: [{ id: s091, host: api.s091.v14.test }] } }]
+    replies:
+      - { status: 200, body: { items: [], next_page: "2" } }
+      - { status: 200, body: { items: [{ id: s091, host: api.s091.v14.test }] } }

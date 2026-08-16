@@ -38,6 +38,11 @@ pub struct Scenario {
     /// expressions, scripts, URLs, or plugins.
     #[serde(default)]
     pub composition: CompositionProfile,
+    /// An executable, bounded sequence for scenarios whose advertised
+    /// behaviour depends on request ordering.  It is deliberately data only:
+    /// no expression, URL, file, or plugin can be supplied by a scenario.
+    #[serde(default)]
+    pub fault_script: Vec<FaultScriptStep>,
     pub endpoints: Vec<Endpoint>,
 }
 
@@ -66,6 +71,40 @@ pub enum FaultStage {
 pub struct EventOrder {
     pub before: String,
     pub after: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultScriptStage {
+    #[default]
+    Source,
+    Proxy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaultScriptStep {
+    pub id: String,
+    #[serde(default)]
+    pub stage: FaultScriptStage,
+    pub endpoint: String,
+    #[serde(default)]
+    pub query: BTreeMap<String, String>,
+    /// The response selected from the endpoint's bounded static reply list.
+    /// A missing value is only valid for a proxy-only or quota-rejected step.
+    pub response_index: Option<usize>,
+    #[serde(default)]
+    pub minimum_virtual_wait_ms: u64,
+    #[serde(default)]
+    pub expect_quota_rate_limited: bool,
+    #[serde(default)]
+    pub proxy_fault: ProxyFault,
+    #[serde(default = "default_script_step_required")]
+    pub required: bool,
+}
+
+const fn default_script_step_required() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -218,6 +257,8 @@ pub struct NetworkProfile {
     #[serde(default)]
     pub allow_retry: bool,
     #[serde(default)]
+    pub initial_proxy_auth_challenge: bool,
+    #[serde(default)]
     pub fault: ProxyFault,
     pub tunnel_close_after_bytes: Option<usize>,
 }
@@ -230,6 +271,7 @@ impl Default for NetworkProfile {
             max_connections: default_proxy_max_connections(),
             virtual_timeout_ms: default_proxy_timeout_ms(),
             allow_retry: false,
+            initial_proxy_auth_challenge: false,
             fault: ProxyFault::None,
             tunnel_close_after_bytes: None,
         }
@@ -934,6 +976,7 @@ pub struct ManifestNetworkProfile {
     /// errors, fingerprints, or log messages.
     pub proxy_authentication: BTreeMap<String, String>,
     pub proxy_must_be_used: bool,
+    pub initial_proxy_auth_challenge: bool,
     pub allowed_proxy_targets: Vec<String>,
     pub connect_fixture_target: Option<String>,
     pub max_connections: usize,
@@ -972,6 +1015,10 @@ pub struct ManifestSource {
     #[serde(default)]
     pub authentication: BTreeMap<String, String>,
     pub pagination_mode: PaginationMode,
+    #[serde(default)]
+    pub pagination_parameter: Option<String>,
+    #[serde(default)]
+    pub next_page_field: Option<String>,
     pub run_header_name: String,
     pub allow_retry: bool,
     pub allow_redirect: bool,
@@ -1062,6 +1109,14 @@ pub struct RunProvenance {
     pub scenario_revision_digest: String,
     #[serde(default)]
     pub fixture_digest: String,
+    #[serde(default)]
+    pub actual_response_digest: String,
+    #[serde(default)]
+    pub actual_truth_digest: String,
+    #[serde(default)]
+    pub fault_script_digest: String,
+    #[serde(default)]
+    pub campaign_operators: Vec<String>,
     #[serde(default)]
     pub campaign_id: Option<String>,
     #[serde(default)]
@@ -1155,6 +1210,18 @@ pub struct TransportReport {
     pub limit_violation: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct FaultScriptReport {
+    #[serde(default)]
+    pub executed_steps: Vec<String>,
+    #[serde(default)]
+    pub missing_required_steps: Vec<String>,
+    #[serde(default)]
+    pub unexpected_steps: Vec<String>,
+    #[serde(default)]
+    pub order_failure_reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -1182,6 +1249,8 @@ pub struct AuditRecord {
     pub body_summary: Option<Value>,
     pub endpoint_id: Option<String>,
     pub response_index: Option<usize>,
+    #[serde(default)]
+    pub script_step_id: Option<String>,
     pub response_sequence: Option<usize>,
     pub response_status: u16,
     #[serde(default)]
@@ -1200,6 +1269,8 @@ pub struct AuditRecord {
     pub mismatch_reasons: Vec<String>,
     #[serde(default)]
     pub wire_bytes: usize,
+    #[serde(default)]
+    pub response_digest: Option<String>,
     #[serde(default)]
     pub decoded_bytes: usize,
     #[serde(default)]
@@ -1245,6 +1316,7 @@ pub enum AuditEventType {
     SourceRequest,
     ProxyRequest,
     QuotaDecision,
+    Lifecycle,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1305,6 +1377,8 @@ pub struct RunReport {
     pub quota: QuotaReport,
     #[serde(default)]
     pub transport: TransportReport,
+    #[serde(default)]
+    pub fault_script: FaultScriptReport,
     #[serde(default)]
     pub provenance: RunProvenance,
     #[serde(default)]
