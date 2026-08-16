@@ -25,14 +25,14 @@ use flate2::{
 };
 use futures_util::stream;
 use lab_core::{
-    AuditEventType, AuditRecord, CollectorRun, CollectorSubmission, Endpoint, FaultScriptClaim,
-    FaultScriptStage, FilterReason, FilteredCandidate, GeneratorKind, LabState, LoadedScenario,
-    ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource,
-    ManifestSubmission, ManifestTransportProfile, NetworkMode, NetworkProfile, PaginationMode,
-    ProxyAuthenticationState, ProxyFault, QuotaProfile, Reply, ResponseMetrics, RetryAfterMode,
-    RunManifest, RunReport, RunSession, RunStateError, Scenario, ScenarioRepository, SourceStatus,
-    SubmissionLimits, SubmissionReport, TransferMode, ValueRule, accept_candidate, judge_run,
-    refresh_semantic_fingerprint, stable_digest,
+    AuditEventType, AuditRecord, CollectorRun, CollectorSubmission, EgressGuard, Endpoint,
+    FaultScriptClaim, FaultScriptStage, FilterReason, FilteredCandidate, GeneratorKind, JudgeInput,
+    LabState, LoadedScenario, ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile,
+    ManifestSource, ManifestSubmission, ManifestTransportProfile, NetworkMode, NetworkProfile,
+    PaginationMode, ProxyAuthenticationState, ProxyFault, QuotaProfile, ReferenceRunner, Reply,
+    ResponseMetrics, RetryAfterMode, RunManifest, RunReport, RunSession, RunStateError, Scenario,
+    ScenarioRepository, SourceStatus, SubmissionLimits, SubmissionReport, TransferMode, ValueRule,
+    accept_candidate, enrich_report, judge_run, refresh_semantic_fingerprint, stable_digest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1127,6 +1127,9 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
             );
         }
     };
+    if let Some(response) = console_asset_response(&method, &path) {
+        return response;
+    }
     if let Some(response) =
         control_response(&state, &method, &path, &headers, &body, &base_url).await
     {
@@ -1212,6 +1215,9 @@ async fn control_response(
             json!({"runs":state.list_runs().iter().map(run_summary).collect::<Vec<_>>() }),
         ));
     }
+    if let Some(response) = console_response(state, method, path, headers, body).await {
+        return Some(response);
+    }
     if let Some((run_id, action)) = run_route(path) {
         return Some(run_control_response(
             state, method, run_id, action, headers, body, base_url,
@@ -1282,6 +1288,259 @@ async fn control_response(
     Some(json_response(StatusCode::OK, value))
 }
 
+fn console_asset_response(method: &Method, path: &str) -> Option<Response> {
+    if method != Method::GET {
+        return None;
+    }
+    if path == "/console" {
+        return Some(
+            Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, "/console/")
+                .body(Body::empty())
+                .expect("static console redirect"),
+        );
+    }
+    let asset = lab_console::asset(path)?;
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, asset.content_type)
+            .header(
+                "content-security-policy",
+                "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self'; script-src 'self'; style-src 'self'",
+            )
+            .header("x-content-type-options", "nosniff")
+            .body(Body::from(asset.body))
+            .expect("static console response"),
+    )
+}
+
+async fn console_response(
+    state: &LabState,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<Response> {
+    if method == Method::GET && path == "/api/console/preferences" {
+        let preferences = lab_console::load_console_preferences();
+        return Some(json_response(
+            StatusCode::OK,
+            json!({"auto_open": preferences.auto_open}),
+        ));
+    }
+    if method == Method::PUT && path == "/api/console/preferences" {
+        let preferences = match serde_json::from_slice::<lab_console::ConsolePreferences>(body) {
+            Ok(preferences) => preferences,
+            Err(_) => {
+                return Some(json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"body must be {\"auto_open\": true|false}"}),
+                ));
+            }
+        };
+        return Some(match lab_console::save_console_preferences(preferences) {
+            Ok(preferences) => {
+                json_response(StatusCode::OK, json!({"auto_open": preferences.auto_open}))
+            }
+            Err(error) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("could not save local console preferences: {error}")}),
+            ),
+        });
+    }
+    if method == Method::GET && path == "/api/console/overview" {
+        let catalog = lab_console::scenario_catalog(state.repository());
+        let scenarios = catalog
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut categories = BTreeMap::<String, usize>::new();
+        for scenario in &scenarios {
+            if let Some(category) = scenario.get("category").and_then(Value::as_str) {
+                *categories.entry(category.to_owned()).or_default() += 1;
+            }
+        }
+        let runs = state.list_runs();
+        let latest = runs
+            .iter()
+            .max_by_key(|run| run.last_activity_at)
+            .map(|run| {
+                let report = state.latest_report(&run.run_id).ok().flatten();
+                lab_console::run_value(
+                    run,
+                    state
+                        .loaded_for_run(&run.run_id)
+                        .ok()
+                        .map(|loaded| loaded.scenario.root_domain),
+                    report.as_ref(),
+                )
+            });
+        return Some(json_response(
+            StatusCode::OK,
+            json!({
+                "status": "ok", "base_url": state.base_url(), "loopback_only": true,
+                "external_network_allowed": false, "real_dns": false,
+                "scenario_count": scenarios.len(), "categories": categories,
+                "active_run_count": runs.iter().filter(|run| matches!(run.status, lab_core::RunSessionStatus::Active | lab_core::RunSessionStatus::Reset | lab_core::RunSessionStatus::Submitted)).count(),
+                "latest_run": latest,
+                "verification": lab_console::latest_verification_summary(),
+            }),
+        ));
+    }
+    if method == Method::GET && path == "/api/console/scenarios" {
+        return Some(json_response(
+            StatusCode::OK,
+            lab_console::scenario_catalog(state.repository()),
+        ));
+    }
+    if method == Method::GET && path == "/api/console/runs" {
+        let mut runs = state
+            .list_runs()
+            .iter()
+            .map(|run| {
+                let report = state.latest_report(&run.run_id).ok().flatten();
+                lab_console::run_value(
+                    run,
+                    state
+                        .loaded_for_run(&run.run_id)
+                        .ok()
+                        .map(|loaded| loaded.scenario.root_domain),
+                    report.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        runs.extend(
+            state
+                .deleted_run_history()
+                .iter()
+                .map(lab_console::deleted_run_value),
+        );
+        runs.sort_by_key(|run| {
+            run.get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        });
+        runs.reverse();
+        return Some(json_response(StatusCode::OK, json!({"runs": runs})));
+    }
+    if let Some(run_id) = console_run_route(path, "/audit")
+        && method == Method::GET
+    {
+        return Some(match (state.audit(run_id), state.control_audit(run_id)) {
+            (Ok(audit), Ok(control)) => {
+                json_response(StatusCode::OK, lab_console::audit_value(&audit, &control))
+            }
+            (Err(error), _) | (_, Err(error)) => run_error_response(error),
+        });
+    }
+    if let Some(run_id) = console_run_route(path, "/report")
+        && method == Method::GET
+    {
+        return Some(match state.latest_report(run_id) {
+            Ok(Some(report)) => json_response(
+                StatusCode::OK,
+                json!({"report": lab_console::report_value(&report)}),
+            ),
+            Ok(None) => json_response(StatusCode::OK, json!({"report": Value::Null})),
+            Err(error) => run_error_response(error),
+        });
+    }
+    if let Some(run_id) = console_run_route(path, "/reference")
+        && method == Method::POST
+    {
+        let run = match state.session(run_id) {
+            Ok(run) => run,
+            Err(error) => return Some(run_error_response(error)),
+        };
+        if !has_run_access(&run, headers) {
+            let _ = state.record_control_audit(
+                run_id,
+                method.as_str(),
+                "stale_probe",
+                path,
+                "rejected",
+            );
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                json!({"error":"run access capability is required"}),
+            ));
+        }
+        let _ = state.record_control_audit(run_id, method.as_str(), "reference", path, "accepted");
+        return Some(match run_console_reference(state, run_id).await {
+            Ok(report) => json_response(
+                StatusCode::OK,
+                json!({"run_id": run_id, "status": report.status, "report": lab_console::report_value(&report)}),
+            ),
+            Err(error) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("reference client could not complete: {error}")}),
+            ),
+        });
+    }
+    None
+}
+
+fn console_run_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let run_id = path
+        .strip_prefix("/api/console/runs/")?
+        .strip_suffix(suffix)?;
+    (!run_id.is_empty() && !run_id.contains('/')).then_some(run_id)
+}
+
+async fn run_console_reference(state: &LabState, run_id: &str) -> Result<RunReport, String> {
+    let run = state
+        .session(run_id)
+        .map_err(|error| error.message().to_owned())?;
+    let loaded = state
+        .loaded_for_run(run_id)
+        .map_err(|error| error.message().to_owned())?;
+    let parsed_run_id = Uuid::parse_str(run_id).map_err(|error| error.to_string())?;
+    let guard = EgressGuard::default();
+    let runner = ReferenceRunner::new(guard.clone()).map_err(|error| error.to_string())?;
+    let base_url = state
+        .base_url()
+        .ok_or_else(|| "local base URL is unavailable".to_owned())?;
+    let proxy_url = state.proxy_url();
+    let started = Utc::now();
+    let collector = runner
+        .run_with_proxy(
+            &base_url,
+            proxy_url.as_deref(),
+            &loaded.scenario,
+            parsed_run_id,
+            "default",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let audit = state
+        .audit(run_id)
+        .map_err(|error| error.message().to_owned())?;
+    let rejected_egress_urls = guard.rejected_urls();
+    let mut report = judge_run(JudgeInput {
+        run_id: parsed_run_id,
+        scenario_id: &loaded.scenario.id,
+        seed: run.seed,
+        target_domain: &loaded.scenario.root_domain,
+        started_at: started,
+        finished_at: Utc::now(),
+        collector_run: &collector,
+        truth: &loaded.truth,
+        assertions: &loaded.assertions,
+        audit: &audit,
+        rejected_egress_urls: &rejected_egress_urls,
+    });
+    enrich_report(&mut report, &loaded).map_err(|error| error.to_string())?;
+    refresh_semantic_fingerprint(&mut report);
+    state
+        .set_report(run_id, report.clone())
+        .map_err(|error| error.message().to_owned())?;
+    Ok(report)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRunRequest {
@@ -1317,11 +1576,26 @@ fn run_control_response(
         Err(error) => return run_error_response(error),
     };
     if run_access_is_required(method, action) && !has_run_access(&run, headers) {
+        let _ = state.record_control_audit(
+            run_id,
+            method.as_str(),
+            "stale_probe",
+            &format!("/api/runs/{run_id}/{}", action.unwrap_or_default()),
+            "rejected",
+        );
         return json_response(
             StatusCode::FORBIDDEN,
             json!({"error":"run access capability is required"}),
         );
     }
+    let operation = action.unwrap_or("run");
+    let _ = state.record_control_audit(
+        run_id,
+        method.as_str(),
+        operation,
+        &format!("/api/runs/{run_id}/{}", action.unwrap_or_default()),
+        "accepted",
+    );
     match (method, action) {
         (&Method::GET, None) => json_response(StatusCode::OK, run_summary(&run)),
         (&Method::GET, Some("requests")) => match state.audit(run_id) {
@@ -3976,5 +4250,186 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert!(redirect_audit[0].external_target_rejected);
         server.shutdown().await;
         fs::remove_dir_all(temporary_root).expect("remove temporary scenarios");
+    }
+
+    #[tokio::test]
+    async fn console_workflow_is_loopback_only_bilingual_and_redacted() {
+        let repository = repository();
+        assert!(
+            repository
+                .all()
+                .iter()
+                .all(|loaded| lab_console::has_zh_translation(&loaded.scenario.id))
+        );
+        let server = LocalServer::spawn(repository, None).await.expect("server");
+        let client = Client::new();
+        let base_url = server.base_url();
+
+        let console = client
+            .get(format!("{base_url}/console/"))
+            .send()
+            .await
+            .expect("console page");
+        assert_eq!(console.status(), StatusCode::OK);
+        assert!(
+            console
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("connect-src 'self'"))
+        );
+        assert!(
+            console
+                .text()
+                .await
+                .expect("console HTML")
+                .contains("/console/app.js")
+        );
+        let script = client
+            .get(format!("{base_url}/console/app.js"))
+            .send()
+            .await
+            .expect("console script")
+            .text()
+            .await
+            .expect("script text");
+        assert!(!script.contains("https://"));
+        assert!(!script.contains("fetch(\"http"));
+
+        let overview: serde_json::Value = client
+            .get(format!("{base_url}/api/console/overview"))
+            .send()
+            .await
+            .expect("overview")
+            .json()
+            .await
+            .expect("overview JSON");
+        assert_eq!(overview["scenario_count"], 114);
+        assert_eq!(overview["loopback_only"], true);
+        assert_eq!(overview["external_network_allowed"], false);
+        let scenarios: serde_json::Value = client
+            .get(format!("{base_url}/api/console/scenarios"))
+            .send()
+            .await
+            .expect("scenario catalog")
+            .json()
+            .await
+            .expect("catalog JSON");
+        assert_eq!(scenarios["scenarios"].as_array().map(Vec::len), Some(114));
+        assert!(scenarios["scenarios"].as_array().is_some_and(|items| {
+            items.iter().all(|item| {
+                item["display"]["en"]["name"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                    && item["display"]["en"]["description"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                    && item["display"]["zh"]["name"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                    && item["display"]["zh"]["description"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+            })
+        }));
+
+        let created: serde_json::Value = client
+            .post(format!("{base_url}/api/runs"))
+            .json(&serde_json::json!({"scenario_id":"001-basic-certificate","seed":17}))
+            .send()
+            .await
+            .expect("create run")
+            .json()
+            .await
+            .expect("created run JSON");
+        let run_id = created["run_id"].as_str().expect("run ID").to_owned();
+        let token = created["run_access_token"]
+            .as_str()
+            .expect("capability")
+            .to_owned();
+        let manifest: serde_json::Value = client
+            .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+            .header("x-lab-run-access-token", &token)
+            .send()
+            .await
+            .expect("manifest")
+            .json()
+            .await
+            .expect("manifest JSON");
+        assert!(manifest.get("truth").is_none());
+
+        let reference = client
+            .post(format!("{base_url}/api/console/runs/{run_id}/reference"))
+            .header("x-lab-run-access-token", &token)
+            .send()
+            .await
+            .expect("reference run");
+        assert_eq!(reference.status(), StatusCode::OK);
+        let report: serde_json::Value = client
+            .get(format!("{base_url}/api/console/runs/{run_id}/report"))
+            .send()
+            .await
+            .expect("console report")
+            .json()
+            .await
+            .expect("console report JSON");
+        let report_text = serde_json::to_string(&report).expect("report text");
+        assert!(!report_text.contains(&token));
+        assert!(!report_text.contains("\"truth\""));
+
+        let reset: serde_json::Value = client
+            .post(format!("{base_url}/api/runs/{run_id}/reset"))
+            .header("x-lab-run-access-token", &token)
+            .send()
+            .await
+            .expect("reset")
+            .json()
+            .await
+            .expect("reset JSON");
+        let stale = client
+            .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+            .header("x-lab-run-access-token", &token)
+            .send()
+            .await
+            .expect("stale capability probe");
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let audit: serde_json::Value = client
+            .get(format!("{base_url}/api/console/runs/{run_id}/audit"))
+            .send()
+            .await
+            .expect("console audit")
+            .json()
+            .await
+            .expect("audit JSON");
+        assert!(audit["entries"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry["operation"] == "stale_probe")
+        }));
+
+        client
+            .delete(format!("{base_url}/api/runs/{run_id}"))
+            .header(
+                "x-lab-run-access-token",
+                reset["run_access_token"].as_str().expect("rotated token"),
+            )
+            .send()
+            .await
+            .expect("delete run")
+            .error_for_status()
+            .expect("delete status");
+        let runs: serde_json::Value = client
+            .get(format!("{base_url}/api/console/runs"))
+            .send()
+            .await
+            .expect("console runs")
+            .json()
+            .await
+            .expect("runs JSON");
+        assert!(runs["runs"].as_array().is_some_and(|runs| {
+            runs.iter()
+                .any(|run| run["run_id"] == run_id && run["status"] == "deleted")
+        }));
+        server.shutdown().await;
     }
 }

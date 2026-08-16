@@ -817,6 +817,7 @@ dependencies = [
  "chrono",
  "csv",
  "flate2",
+ "lab-console",
  "lab-core",
  "lab-server",
  "reqwest",
@@ -833,6 +834,7 @@ version = "1.4.1"
 dependencies = [
  "lab-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -866,6 +868,7 @@ dependencies = [
  "chrono",
  "flate2",
  "futures-util",
+ "lab-console",
  "lab-core",
  "reqwest",
  "serde",

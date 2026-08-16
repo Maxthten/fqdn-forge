@@ -22,12 +22,14 @@ pub struct LabState {
 #[derive(Debug, Default)]
 struct MutableLabState {
     runs: BTreeMap<String, RunSession>,
+    control_audit: BTreeMap<String, Vec<ControlAuditRecord>>,
     unscoped_audit: Vec<RejectedRequestAudit>,
     developer_run_id: Option<String>,
     base_url: Option<String>,
     proxy_url: Option<String>,
     submitted_payloads: BTreeMap<String, String>,
     deleted_runs: usize,
+    deleted_run_history: Vec<DeletedRunSummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -71,6 +73,28 @@ pub struct RejectedRequestAudit {
     pub method: String,
     pub path: String,
     pub reason: String,
+}
+
+/// A non-sensitive control-plane event, intentionally separate from the
+/// immutable source audit consumed by the independent judge.
+#[derive(Clone, Debug, Serialize)]
+pub struct ControlAuditRecord {
+    pub timestamp: DateTime<Utc>,
+    pub method: String,
+    pub operation: String,
+    pub path: String,
+    pub outcome: String,
+}
+
+/// A local-console tombstone. It retains no capability, report, submission,
+/// source audit, or fixture data after a run is deleted.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeletedRunSummary {
+    pub run_id: String,
+    pub scenario_id: String,
+    pub seed: u64,
+    pub created_at: DateTime<Utc>,
+    pub deleted_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -492,6 +516,47 @@ impl LabState {
         Ok(self.session(run_id)?.audit)
     }
 
+    /// Records a safe control action without changing the source/proxy audit
+    /// that determines the judge's report.
+    pub fn record_control_audit(
+        &self,
+        run_id: &str,
+        method: &str,
+        operation: &str,
+        path: &str,
+        outcome: &str,
+    ) -> std::result::Result<(), RunStateError> {
+        validate_run_id(run_id)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        if !inner.runs.contains_key(run_id) {
+            return Err(RunStateError::UnknownRun);
+        }
+        inner
+            .control_audit
+            .entry(run_id.to_owned())
+            .or_default()
+            .push(ControlAuditRecord {
+                timestamp: Utc::now(),
+                method: method.to_owned(),
+                operation: operation.to_owned(),
+                path: path.to_owned(),
+                outcome: outcome.to_owned(),
+            });
+        Ok(())
+    }
+
+    pub fn control_audit(
+        &self,
+        run_id: &str,
+    ) -> std::result::Result<Vec<ControlAuditRecord>, RunStateError> {
+        validate_run_id(run_id)?;
+        let inner = self.inner.lock().expect("lab state lock poisoned");
+        if !inner.runs.contains_key(run_id) {
+            return Err(RunStateError::UnknownRun);
+        }
+        Ok(inner.control_audit.get(run_id).cloned().unwrap_or_default())
+    }
+
     pub fn reset(&self, run_id: &str) -> std::result::Result<(), RunStateError> {
         self.reset_and_rotate(run_id).map(|_| ())
     }
@@ -678,6 +743,7 @@ impl LabState {
         validate_run_id(run_id)?;
         let mut inner = self.inner.lock().expect("lab state lock poisoned");
         let run = inner.runs.remove(run_id).ok_or(RunStateError::UnknownRun)?;
+        inner.control_audit.remove(run_id);
         if let Some(digest) = run
             .submission
             .as_ref()
@@ -690,7 +756,23 @@ impl LabState {
             inner.developer_run_id = None;
         }
         inner.deleted_runs += 1;
+        inner.deleted_run_history.push(DeletedRunSummary {
+            run_id: run.run_id,
+            scenario_id: run.scenario_id,
+            seed: run.seed,
+            created_at: run.created_at,
+            deleted_at: Utc::now(),
+        });
         Ok(())
+    }
+
+    #[must_use]
+    pub fn deleted_run_history(&self) -> Vec<DeletedRunSummary> {
+        self.inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .deleted_run_history
+            .clone()
     }
 
     #[must_use]

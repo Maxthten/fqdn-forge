@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 lab-core = { path = "../lab-core" }
+lab-console = { path = "../lab-console" }
 lab-server = { path = "../lab-server" }
 anyhow.workspace = true
 brotli.workspace = true

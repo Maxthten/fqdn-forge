@@ -15,6 +15,7 @@ use brotli::Decompressor;
 use chrono::Utc;
 use csv::ReaderBuilder;
 use flate2::read::{GzDecoder, ZlibDecoder};
+use lab_console::load_console_preferences;
 use lab_core::{
     AuditEventType, Baseline, CollectorRun, EgressGuard, JudgeInput, NetworkMode, Observation,
     ReferenceRunner, ReportStatus, ScenarioRepository, SoakAction, SoakPreset, SoakReport,
@@ -92,6 +93,7 @@ async fn run() -> anyhow::Result<bool> {
         "soak" => soak_command(&repository, &args).await,
         "proxy-regression" => proxy_regression_command(&repository).await,
         "serve" => serve_command(repository, &args).await,
+        "console" => console_command(repository, &args).await,
         _ => {
             print_help();
             Ok(true)
@@ -3268,6 +3270,75 @@ async fn serve_command(repository: ScenarioRepository, args: &[String]) -> anyho
     Ok(true)
 }
 
+async fn console_command(repository: ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
+    let mut port = 18_080_u16;
+    let mut no_open = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--no-open" => {
+                no_open = true;
+                index += 1;
+            }
+            "--port" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!("console --port requires a value from 1 to 65535")
+                })?;
+                port = value.parse::<u16>()?;
+                if port == 0 {
+                    anyhow::bail!("console --port must be in the range 1 to 65535");
+                }
+                index += 2;
+            }
+            value => {
+                anyhow::bail!("unknown console option: {value}; use --port <1-65535> or --no-open")
+            }
+        }
+    }
+    let server = LocalServer::spawn_on(repository, None, Some(port))
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not start the loopback console at 127.0.0.1:{port}: {error}. Choose a free local port with console --port <1-65535>."
+            )
+        })?;
+    let url = format!("{}/console/", server.base_url());
+    println!("FQDN Forge Console: {url}");
+    println!("only 127.0.0.1 is bound; no public network, real DNS, or real credentials are used.");
+    if !no_open && load_console_preferences().auto_open {
+        if let Err(error) = open_browser(&url) {
+            eprintln!(
+                "could not open the default browser ({error}); the console is still running at {url}"
+            );
+        }
+    } else if !no_open {
+        println!(
+            "automatic browser opening is disabled in local console preferences; copy the URL above to open it manually."
+        );
+    }
+    tokio::signal::ctrl_c().await?;
+    server.shutdown().await;
+    Ok(true)
+}
+
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    }
+}
+
 async fn self_test(repository: &ScenarioRepository) -> anyhow::Result<bool> {
     let report_dir = PathBuf::from("artifacts/reports/self-test");
     fs::create_dir_all(&report_dir)?;
@@ -3590,7 +3661,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport|combination|lifecycle [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  campaign list | run --campaign <id> --seed <number> | replay --report <campaign-report>\n  coverage --format json|markdown --output <path> | --check\n  baseline generate --profile v1.4-core | compare --baseline <path> --report <path> | check\n  soak run --preset smoke|standard|release\n  proxy-regression\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  serve [--scenario <id>] [--port 18080]"
+        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport|combination|lifecycle [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  campaign list | run --campaign <id> --seed <number> | replay --report <campaign-report>\n  coverage --format json|markdown --output <path> | --check\n  baseline generate --profile v1.4-core | compare --baseline <path> --report <path> | check\n  soak run --preset smoke|standard|release\n  proxy-regression\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  serve [--scenario <id>] [--port 18080]\n  console [--port <1-65535>] [--no-open]"
     );
 }
 

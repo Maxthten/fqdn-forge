@@ -21,8 +21,8 @@ pub use model::*;
 pub use repository::{LoadedScenario, ScenarioRepository, ValidationIssue};
 pub use runner::{ReferenceRunner, RunnerError};
 pub use state::{
-    FaultScriptClaim, LabState, QuotaDecision, RejectedRequestAudit, ResponseMetrics, RunSession,
-    RunSessionStatus, RunStateError,
+    ControlAuditRecord, DeletedRunSummary, FaultScriptClaim, LabState, QuotaDecision,
+    RejectedRequestAudit, ResponseMetrics, RunSession, RunSessionStatus, RunStateError,
 };
 pub use v14::{
     Baseline, BaselineComparison, CampaignDefinition, CampaignManifest, CampaignReport,

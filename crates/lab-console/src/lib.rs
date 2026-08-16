@@ -1,10 +1,7 @@
-//! DTOs reserved for a future control-plane UI. V1.1 intentionally has no HTML UI.
+//! DTOs and local-only static assets for the FQDN Forge browser console.
 
-use serde::Serialize;
+mod console;
+mod preferences;
 
-#[derive(Clone, Debug, Serialize)]
-pub struct ScenarioSummary {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-}
+pub use console::*;
+pub use preferences::*;

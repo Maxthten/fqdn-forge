@@ -56,11 +56,33 @@ cargo run -p lab-cli -- list
 # Run every built-in regression scenario through the local service.
 cargo run -p lab-cli -- run --all
 
+# Start the local browser console (opens the system browser by default).
+cargo run -p lab-cli -- console
+
 # Run the complete release verification suite.
 .\scripts\verify.ps1 -Repeat 20
 ```
 
 The complete verification is intentionally substantial. It includes formatting, Clippy, unit/integration tests, all scenarios, protocol conformance, mutation campaigns, coverage policy gates, baselines, strict replay, a 100,000-record stress test, a release HTTP soak, and 20 repeated regression rounds.
+
+## Local browser console
+
+FQDN Forge Console is a bundled, offline browser control surface for the test station. It is not an internet site and does not add collection, DNS, scanning, proxy, or credential features.
+
+```powershell
+# Listen only on 127.0.0.1:18080 and open the browser.
+cargo run -p lab-cli -- console
+
+# Keep the service running but do not launch the browser.
+cargo run -p lab-cli -- console --no-open
+
+# Use another explicit loopback port.
+cargo run -p lab-cli -- console --port 18081 --no-open
+```
+
+The console URL is printed as `http://127.0.0.1:<port>/console/`. It has Chinese and English views for six pages: Dashboard, Scenarios, Runs, Audit, Reports, and Settings. It can create an isolated external-integration run, show a redacted manifest, invoke the platform reference client through the existing local HTTP/proxy path, and present redacted audit/report read models.
+
+Capabilities and fake credentials remain in browser memory only. They are never written to local storage, URLs, browser-visible audit data, or the report read model. The complete usage and security contract is in [docs/CONSOLE.md](docs/CONSOLE.md).
 
 ## Common commands
 
@@ -171,6 +193,7 @@ artifacts/soak/        # release soak action traces and resource invariants
 crates/
   lab-core/       scenario models, fixtures, judging, state, replay, coverage, campaigns
   lab-server/     loopback HTTP control/source/proxy service
+  lab-console/    safe console DTOs, bilingual mappings, and bundled local web assets
   lab-cli/        command-line runner, conformance client, verification utilities
 scenarios/        synthetic test definitions and fixtures
 scripts/          release verification script
@@ -189,4 +212,4 @@ For v1.4.1, success means all 114 scenarios pass, 20 repeated rounds finish with
 
 ## Status
 
-This is an evolving local development and test platform. A later phase may add a visual interface on top of the existing run, audit, report, replay, and coverage data; it will not turn FQDN Forge into a production collection tool.
+This is an evolving local development and test platform. The GUI 0.1 console is intentionally limited to local run/audit/report workflows; it does not turn FQDN Forge into a production collection tool.

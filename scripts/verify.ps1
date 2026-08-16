@@ -537,4 +537,21 @@ Invoke-CargoStep "repeat verification ($Repeat rounds)" @(
 Invoke-NetworkIsolationCheck
 Invoke-GitRangeCheck
 
+$consoleVerificationDirectory = Join-Path (Get-Location) 'artifacts\console'
+[System.IO.Directory]::CreateDirectory($consoleVerificationDirectory) | Out-Null
+$consoleVerificationSummary = [ordered]@{
+    schema_version = 1
+    status = 'passed'
+    completed_at = [DateTime]::UtcNow.ToString('o')
+    command = ".\\scripts\\verify.ps1 -Repeat $Repeat"
+    repeat = $Repeat
+    scenario_count = 114
+    release_soak_operations = [int]$releaseSoakReport.operations
+}
+[System.IO.File]::WriteAllText(
+    (Join-Path $consoleVerificationDirectory 'verification-summary.json'),
+    ($consoleVerificationSummary | ConvertTo-Json),
+    $utf8NoBom
+)
+
 Write-Host 'Verification completed successfully. Reports are in artifacts/reports/.'
