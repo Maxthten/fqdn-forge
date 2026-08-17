@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -10,16 +10,18 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    AuditEventType, AuditRecord, CollectorSubmission, ExperimentPlan, FaultScriptStage,
-    FaultScriptStep, LoadedScenario, PlanExecutionMode, PlanRequestAuditStep, PlanRun, PlanSource,
-    PlanStore, QuotaProfile, QuotaScope, ResourceSummary, RunReport, ScenarioRepository,
-    execute_plan_with_mode,
+    AnalysisIndex, AuditEventType, AuditRecord, CollectorSubmission, ExperimentPlan,
+    FaultScriptStage, FaultScriptStep, LoadedScenario, PlanExecutionMode, PlanRequestAuditStep,
+    PlanRun, PlanSource, PlanStore, QuotaProfile, QuotaScope, ResourceSummary, RunReport,
+    ScenarioRepository, execute_plan_with_mode,
 };
 
 #[derive(Clone, Debug)]
 pub struct LabState {
     repository: Arc<ScenarioRepository>,
     plan_store: PlanStore,
+    analysis_artifacts_root: PathBuf,
+    analysis_index: Arc<Mutex<AnalysisIndex>>,
     inner: Arc<Mutex<MutableLabState>>,
 }
 
@@ -192,22 +194,41 @@ impl RunStateError {
 impl LabState {
     #[must_use]
     pub fn new(repository: ScenarioRepository) -> Self {
-        let plan_root = repository
+        let artifacts_root = repository
             .root()
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("artifacts")
-            .join("plans");
-        Self::new_with_plan_root(repository, plan_root)
+            .join("artifacts");
+        Self::new_with_plan_root_and_analysis_root(
+            repository,
+            artifacts_root.join("plans"),
+            artifacts_root,
+        )
     }
 
     #[must_use]
     pub fn new_with_plan_root(repository: ScenarioRepository, plan_root: impl AsRef<Path>) -> Self {
+        let analysis_artifacts_root = repository
+            .root()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("artifacts");
+        Self::new_with_plan_root_and_analysis_root(repository, plan_root, analysis_artifacts_root)
+    }
+
+    #[must_use]
+    pub fn new_with_plan_root_and_analysis_root(
+        repository: ScenarioRepository,
+        plan_root: impl AsRef<Path>,
+        analysis_artifacts_root: impl AsRef<Path>,
+    ) -> Self {
         let plan_root = plan_root.as_ref().to_path_buf();
         let plan_store = PlanStore::open(plan_root).expect("plan store must be available");
         Self {
             repository: Arc::new(repository),
             plan_store,
+            analysis_artifacts_root: analysis_artifacts_root.as_ref().to_path_buf(),
+            analysis_index: Arc::new(Mutex::new(AnalysisIndex::default())),
             inner: Arc::new(Mutex::new(MutableLabState::default())),
         }
     }
@@ -220,6 +241,27 @@ impl LabState {
     #[must_use]
     pub fn plan_store(&self) -> &PlanStore {
         &self.plan_store
+    }
+
+    #[must_use]
+    pub fn analysis_artifacts_root(&self) -> &Path {
+        &self.analysis_artifacts_root
+    }
+
+    pub fn analysis_value(
+        &self,
+        view: crate::AnalysisView,
+        request: &crate::AnalysisRequest,
+    ) -> serde_json::Value {
+        self.analysis_index
+            .lock()
+            .expect("analysis index lock poisoned")
+            .value(
+                self.repository(),
+                self.analysis_artifacts_root(),
+                view,
+                request,
+            )
     }
 
     pub fn create_plan(&self, plan: ExperimentPlan) -> Result<ExperimentPlan> {

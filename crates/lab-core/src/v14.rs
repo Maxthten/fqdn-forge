@@ -963,8 +963,14 @@ fn coverage_policy(repository: &ScenarioRepository) -> Result<CoveragePolicyFile
         .map_err(|error| format!("coverage policy {} is invalid: {error}", path.display()))
 }
 
-fn required_combination_ids(repository: &ScenarioRepository, name: &str) -> Option<Vec<String>> {
-    let ids: &[&str] = match name {
+/// Return the scenario IDs that form a complete high-risk coverage combination.
+///
+/// The analysis read model uses this catalog to distinguish a fully covered
+/// combination from a basic-but-incomplete (`partial`) one without inventing
+/// coverage truth in the GUI.
+#[must_use]
+pub fn coverage_combination_expected_ids(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
         "http_proxy+proxy_auth+rate_limit" => &["094-proxy-auth-then-source-rate-limit"],
         "http_proxy+per_source+retry_recovery" => &["095-proxy-reset-then-retry-success"],
         "connect_proxy+truncated+resource" => &["096-connect-tunnel-truncated-payload"],
@@ -989,7 +995,11 @@ fn required_combination_ids(repository: &ScenarioRepository, name: &str) -> Opti
         "strict_replay+provenance_difference" => &["113-replay-provenance-and-multi-diff"],
         "baseline+scenario_fixture_digest" => &["114-coverage-and-baseline-integrity"],
         _ => return None,
-    };
+    })
+}
+
+fn required_combination_ids(repository: &ScenarioRepository, name: &str) -> Option<Vec<String>> {
+    let ids = coverage_combination_expected_ids(name)?;
     Some(
         ids.iter()
             .filter_map(|id| {
@@ -1674,7 +1684,24 @@ fn push_difference(
 }
 
 fn category_for_path(path: &str) -> DifferenceCategory {
-    if path.contains("provenance") || path.contains("schema") {
+    if path.contains("fixture") {
+        DifferenceCategory::Fixture
+    } else if path.contains("truth") {
+        DifferenceCategory::Truth
+    } else if path.contains("virtual_wait")
+        || path.contains("retry_after")
+        || path.contains("timing")
+    {
+        DifferenceCategory::Timing
+    } else if path.contains("response") {
+        DifferenceCategory::Response
+    } else if path.contains("request") || path.contains("audit") {
+        DifferenceCategory::Request
+    } else if path.contains("status") || path.contains("result") || path.contains("assertion") {
+        DifferenceCategory::Verdict
+    } else if path.contains("scenario") || path.contains("configuration") {
+        DifferenceCategory::Configuration
+    } else if path.contains("provenance") || path.contains("schema") {
         DifferenceCategory::Provenance
     } else if path.contains("findings") {
         DifferenceCategory::Finding

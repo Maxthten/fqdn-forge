@@ -31,6 +31,10 @@ pub fn asset(path: &str) -> Option<ConsoleAsset> {
             content_type: "application/javascript; charset=utf-8",
             body: include_str!("../assets/plans.js"),
         }),
+        "/console/analysis.js" => Some(ConsoleAsset {
+            content_type: "application/javascript; charset=utf-8",
+            body: include_str!("../assets/analysis.js"),
+        }),
         "/console/style.css" => Some(ConsoleAsset {
             content_type: "text/css; charset=utf-8",
             body: include_str!("../assets/style.css"),

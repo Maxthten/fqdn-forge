@@ -1063,6 +1063,13 @@ pub struct ReplayReport {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DifferenceCategory {
+    Configuration,
+    Fixture,
+    Truth,
+    Request,
+    Response,
+    Timing,
+    Verdict,
     Provenance,
     Finding,
     Evidence,
@@ -1080,6 +1087,13 @@ impl DifferenceCategory {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Configuration => "configuration",
+            Self::Fixture => "fixture",
+            Self::Truth => "truth",
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::Timing => "timing",
+            Self::Verdict => "verdict",
             Self::Provenance => "provenance",
             Self::Finding => "finding",
             Self::Evidence => "evidence",

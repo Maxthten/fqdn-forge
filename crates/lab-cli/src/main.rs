@@ -17,14 +17,15 @@ use csv::ReaderBuilder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use lab_console::load_console_preferences;
 use lab_core::{
-    AuditEventType, Baseline, CollectorRun, EgressGuard, ExperimentPlan, JudgeInput, NetworkMode,
-    Observation, PlanExecutionMode, PlanStore, ReferenceRunner, ReportStatus, ScenarioRepository,
-    SoakAction, SoakPreset, SoakReport, SourceKind, SourceStatus, V14_SCHEMA_VERSION,
+    AnalysisView, AuditEventType, Baseline, CollectorRun, EgressGuard, ExperimentPlan, JudgeInput,
+    NetworkMode, Observation, PlanExecutionMode, PlanStore, ReferenceRunner, ReportStatus,
+    ScenarioRepository, SoakAction, SoakPreset, SoakReport, SourceKind, SourceStatus,
+    V14_SCHEMA_VERSION, analysis_artifacts_root, analysis_markdown, analysis_value,
     baseline_from_reports, campaign_definitions, campaign_loaded_scenario, campaign_manifest,
     compare_baseline, coverage_check, coverage_markdown, coverage_report, enrich_report,
-    execute_plan_with_mode, judge_run, refresh_semantic_fingerprint, report_differences,
-    report_json, semantic_difference, semantic_fingerprint, soak_baseline_from_report,
-    validate_plan,
+    execute_plan_with_mode, judge_run, parse_analysis_request, refresh_semantic_fingerprint,
+    report_differences, report_json, semantic_difference, semantic_fingerprint,
+    soak_baseline_from_report, validate_plan,
 };
 use lab_server::LocalServer;
 use reqwest::{
@@ -92,6 +93,7 @@ async fn run() -> anyhow::Result<bool> {
         "coverage" => coverage_command(&repository, &args).await,
         "baseline" => baseline_command(&repository, &args).await,
         "soak" => soak_command(&repository, &args).await,
+        "analysis" => analysis_command(&repository, &args),
         "proxy-regression" => proxy_regression_command(&repository).await,
         "plan" => plan_command(&args).await,
         "serve" => serve_command(repository, &args).await,
@@ -101,6 +103,92 @@ async fn run() -> anyhow::Result<bool> {
             Ok(true)
         }
     }
+}
+
+fn analysis_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
+    let (view, show_id) = match args.get(1).map(String::as_str) {
+        Some("overview") => (AnalysisView::Overview, None),
+        Some("coverage") => (AnalysisView::Coverage, None),
+        Some("replay") | Some("replays") => match args.get(2).map(String::as_str).unwrap_or("list")
+        {
+            "list" => (AnalysisView::Replays, None),
+            "show" => (AnalysisView::Replays, Some(required_flag(args, "--id")?)),
+            _ => anyhow::bail!(
+                "use: lab-cli analysis replay list|show --id <comparison-id> --format json|markdown"
+            ),
+        },
+        Some("campaign") | Some("campaigns") => {
+            match args.get(2).map(String::as_str).unwrap_or("list") {
+                "list" => (AnalysisView::Campaigns, None),
+                "show" => (AnalysisView::Campaigns, Some(required_flag(args, "--id")?)),
+                _ => anyhow::bail!(
+                    "use: lab-cli analysis campaign list|show --id <campaign-id> --format json|markdown"
+                ),
+            }
+        }
+        Some("soak") => match args.get(2).map(String::as_str).unwrap_or("list") {
+            "list" => (AnalysisView::Soak, None),
+            "show" => (AnalysisView::Soak, Some(required_flag(args, "--id")?)),
+            _ => anyhow::bail!(
+                "use: lab-cli analysis soak list|show --id <soak-id> --format json|markdown"
+            ),
+        },
+        Some("evidence") | Some("evidence-graph") => (AnalysisView::EvidenceGraph, None),
+        Some("timeline") => (AnalysisView::Timeline, None),
+        Some("trends") | Some("trend") => (AnalysisView::Trends, None),
+        _ => {
+            println!(
+                "lab-cli analysis overview|coverage|replay list|show --id <comparison-id>|campaign list|show --id <campaign-id>|soak list|show --id <soak-id>|evidence --run <run-id>|timeline --run <run-id>|trends [--format json|markdown]"
+            );
+            return Ok(false);
+        }
+    };
+    let mut parameters = BTreeMap::new();
+    for (filter, flag) in [
+        ("limit", "--limit"),
+        ("cursor", "--cursor"),
+        ("dimension", "--dimension"),
+        ("status", "--status"),
+        ("q", "--query"),
+        ("scenario", "--scenario"),
+        ("category", "--category"),
+        ("from", "--from"),
+        ("to", "--to"),
+        ("campaign", "--campaign"),
+        ("preset", "--preset"),
+        ("run", "--run"),
+        ("source", "--source"),
+        ("fqdn", "--fqdn"),
+        ("verdict", "--verdict"),
+        ("evidence_type", "--evidence-type"),
+        ("proxy", "--proxy"),
+        ("retry", "--retry"),
+        ("quota", "--quota"),
+        ("expected", "--expected"),
+        ("failure", "--failure"),
+        ("object_type", "--object-type"),
+    ] {
+        if let Some(value) = flag_value(args, flag) {
+            parameters.insert(filter.to_owned(), value);
+        }
+    }
+    if let Some(id) = show_id {
+        parameters.insert("id".to_owned(), id);
+    }
+    let request =
+        parse_analysis_request(view, &parameters).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let value = analysis_value(
+        repository,
+        &analysis_artifacts_root(repository),
+        view,
+        &request,
+    );
+    match flag_value(args, "--format").as_deref().unwrap_or("json") {
+        "json" => println!("{}", serde_json::to_string_pretty(&value)?),
+        "markdown" | "md" => print!("{}", analysis_markdown(&value)),
+        _ => anyhow::bail!("--format must be json or markdown"),
+    }
+    Ok(true)
 }
 
 fn scenarios_dir() -> PathBuf {
@@ -3555,6 +3643,8 @@ async fn console_command(repository: ScenarioRepository, args: &[String]) -> any
     let mut port = 18_080_u16;
     let mut no_open = false;
     let mut plan_root = None;
+    let mut analysis_artifacts_root = None;
+    let mut scenario_root = None;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -3579,18 +3669,54 @@ async fn console_command(repository: ScenarioRepository, args: &[String]) -> any
                 plan_root = Some(PathBuf::from(value));
                 index += 2;
             }
+            "--test-analysis-root" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!("console --test-analysis-root requires a directory")
+                })?;
+                analysis_artifacts_root = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--test-scenario-root" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!("console --test-scenario-root requires a directory")
+                })?;
+                scenario_root = Some(PathBuf::from(value));
+                index += 2;
+            }
             value => {
                 anyhow::bail!(
-                    "unknown console option: {value}; use --port <1-65535>, --no-open, or --test-plan-root <directory>"
+                    "unknown console option: {value}; use --port <1-65535>, --no-open, --test-plan-root <directory>, --test-analysis-root <directory>, or --test-scenario-root <directory>"
                 )
             }
         }
     }
-    let server = match plan_root {
-        Some(plan_root) => {
+    let repository = match scenario_root {
+        Some(root) => ScenarioRepository::load(root)?,
+        None => repository,
+    };
+    let server = match (plan_root, analysis_artifacts_root) {
+        (Some(plan_root), Some(analysis_artifacts_root)) => {
+            LocalServer::spawn_on_with_roots(
+                repository,
+                None,
+                Some(port),
+                plan_root,
+                analysis_artifacts_root,
+            )
+            .await
+        }
+        (Some(plan_root), None) => {
             LocalServer::spawn_on_with_plan_root(repository, None, Some(port), plan_root).await
         }
-        None => LocalServer::spawn_on(repository, None, Some(port)).await,
+        (None, Some(analysis_artifacts_root)) => LocalServer::spawn_on_with_roots(
+            repository,
+            None,
+            Some(port),
+            plans_dir(),
+            analysis_artifacts_root,
+        )
+        .await,
+        (None, None) => LocalServer::spawn_on(repository, None, Some(port)).await,
     }
     .map_err(|error| {
         anyhow::anyhow!(
@@ -3956,7 +4082,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport|combination|lifecycle [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  campaign list | run --campaign <id> --seed <number> | replay --report <campaign-report>\n  coverage --format json|markdown --output <path> | --check\n  baseline generate --profile v1.4-core | compare --baseline <path> --report <path> | check\n  soak run --preset smoke|standard|release\n  proxy-regression\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  plan list|validate|create|show|update|run|simulate|replay|export|import|archive|delete|storage|result|manifest [--format json]\n  serve [--scenario <id>] [--port <1-65535>]\n  console [--port <1-65535>] [--no-open]"
+        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport|combination|lifecycle [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  campaign list | run --campaign <id> --seed <number> | replay --report <campaign-report>\n  coverage --format json|markdown --output <path> | --check\n  baseline generate --profile v1.4-core | compare --baseline <path> --report <path> | check\n  soak run --preset smoke|standard|release\n  analysis overview|coverage|replay list|show --id <comparison-id>|campaign list|show --id <campaign-id>|soak list|show --id <soak-id>|evidence --run <run-id>|timeline --run <run-id>|trends [--format json|markdown]\n  proxy-regression\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  plan list|validate|create|show|update|run|simulate|replay|export|import|archive|delete|storage|result|manifest [--format json]\n  serve [--scenario <id>] [--port <1-65535>]\n  console [--port <1-65535>] [--no-open] [--test-plan-root <directory>] [--test-analysis-root <directory>] [--test-scenario-root <directory>]"
     );
 }
 

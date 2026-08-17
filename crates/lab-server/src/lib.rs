@@ -26,19 +26,19 @@ use flate2::{
 };
 use futures_util::stream;
 use lab_core::{
-    AuditEventType, AuditRecord, AuthenticationLocation, AuthenticationMode, CollectorRun,
-    CollectorSubmission, EgressGuard, Endpoint, ExperimentPlan, FaultScriptClaim, FaultScriptStage,
-    FilterReason, FilteredCandidate, GeneratorKind, JudgeInput, LabState, LoadedScenario,
-    ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource,
+    AnalysisView, AuditEventType, AuditRecord, AuthenticationLocation, AuthenticationMode,
+    CollectorRun, CollectorSubmission, EgressGuard, Endpoint, ExperimentPlan, FaultScriptClaim,
+    FaultScriptStage, FilterReason, FilteredCandidate, GeneratorKind, JudgeInput, LabState,
+    LoadedScenario, ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource,
     ManifestSubmission, ManifestTransportProfile, NetworkMode, NetworkProfile, PLAN_SCHEMA_VERSION,
     PaginationMode, PlanFaultKind, PlanNetworkMode, PlanPagination, PlanPaginationMode, PlanQuota,
     PlanRequestAuditStep, PlanRun, PlanSourceTemplate, ProxyAuthenticationState, ProxyFault,
     QuotaExhaustedBehaviour, QuotaProfile, ReferenceRunner, Reply, ResponseMetrics, RetryAfterMode,
     RunManifest, RunReport, RunSession, RunStateError, Scenario, ScenarioRepository, SourceStatus,
     SubmissionLimits, SubmissionReport, TransferMode, ValueRule, accept_candidate,
-    authentication_outcome, enrich_report, judge_run, plan_source_page_records,
-    refresh_semantic_fingerprint, retry_after_value, stable_digest, validate_plan,
-    virtual_http_date_after,
+    analysis_markdown, authentication_outcome, enrich_report, judge_run, parse_analysis_request,
+    plan_source_page_records, refresh_semantic_fingerprint, retry_after_value, stable_digest,
+    validate_plan, virtual_http_date_after,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -83,7 +83,34 @@ impl LocalServer {
         port: Option<u16>,
         plan_root: PathBuf,
     ) -> Result<Self, String> {
-        Self::spawn_inner(repository, active, port, Some(plan_root)).await
+        let analysis_artifacts_root = repository
+            .root()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("artifacts");
+        Self::spawn_inner(
+            repository,
+            active,
+            port,
+            Some((plan_root, analysis_artifacts_root)),
+        )
+        .await
+    }
+
+    pub async fn spawn_on_with_roots(
+        repository: ScenarioRepository,
+        active: Option<&str>,
+        port: Option<u16>,
+        plan_root: PathBuf,
+        analysis_artifacts_root: PathBuf,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(
+            repository,
+            active,
+            port,
+            Some((plan_root, analysis_artifacts_root)),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -99,7 +126,7 @@ impl LocalServer {
         repository: ScenarioRepository,
         active: Option<&str>,
         port: Option<u16>,
-        plan_root: Option<PathBuf>,
+        roots: Option<(PathBuf, PathBuf)>,
     ) -> Result<Self, String> {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.unwrap_or(0));
         let listener = TcpListener::bind(address)
@@ -109,8 +136,14 @@ impl LocalServer {
         if address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return Err("refusing non-loopback listener".to_owned());
         }
-        let state = match plan_root {
-            Some(plan_root) => LabState::new_with_plan_root(repository, plan_root),
+        let state = match roots {
+            Some((plan_root, analysis_artifacts_root)) => {
+                LabState::new_with_plan_root_and_analysis_root(
+                    repository,
+                    plan_root,
+                    analysis_artifacts_root,
+                )
+            }
             None => LabState::new(repository),
         };
         state.set_base_url(format!("http://127.0.0.1:{}", address.port()));
@@ -1381,7 +1414,7 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
         return response;
     }
     if let Some(response) =
-        control_response(&state, &method, &path, &headers, &body, &base_url).await
+        control_response(&state, &method, &path, &query, &headers, &body, &base_url).await
     {
         return response;
     }
@@ -1426,6 +1459,7 @@ async fn control_response(
     state: &LabState,
     method: &Method,
     path: &str,
+    query: &BTreeMap<String, String>,
     headers: &HeaderMap,
     body: &[u8],
     base_url: &str,
@@ -1474,6 +1508,9 @@ async fn control_response(
             StatusCode::OK,
             json!({"runs":state.list_runs().iter().map(run_summary).collect::<Vec<_>>() }),
         ));
+    }
+    if let Some(response) = analysis_response(state, method, path, query.clone()) {
+        return Some(response);
     }
     if let Some(response) = console_response(state, method, path, headers, body).await {
         return Some(response);
@@ -1546,6 +1583,80 @@ async fn control_response(
         _ => return None,
     };
     Some(json_response(StatusCode::OK, value))
+}
+
+fn analysis_response(
+    state: &LabState,
+    method: &Method,
+    path: &str,
+    query: BTreeMap<String, String>,
+) -> Option<Response> {
+    let (view, detail_id) = if path == "/api/analysis/overview" {
+        (AnalysisView::Overview, None)
+    } else if path == "/api/analysis/coverage" {
+        (AnalysisView::Coverage, None)
+    } else if path == "/api/analysis/replays" {
+        (AnalysisView::Replays, None)
+    } else if path == "/api/analysis/campaigns" {
+        (AnalysisView::Campaigns, None)
+    } else if path == "/api/analysis/soak" {
+        (AnalysisView::Soak, None)
+    } else if path == "/api/analysis/evidence-graph" {
+        (AnalysisView::EvidenceGraph, None)
+    } else if path == "/api/analysis/timeline" {
+        (AnalysisView::Timeline, None)
+    } else if path == "/api/analysis/trends" {
+        (AnalysisView::Trends, None)
+    } else if let Some(id) = analysis_detail_id(path, "/api/analysis/replays/") {
+        (AnalysisView::Replays, Some(id))
+    } else if let Some(id) = analysis_detail_id(path, "/api/analysis/campaigns/") {
+        (AnalysisView::Campaigns, Some(id))
+    } else {
+        let id = analysis_detail_id(path, "/api/analysis/soak/")?;
+        (AnalysisView::Soak, Some(id))
+    };
+    if method != Method::GET {
+        return Some(json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"schema_version": lab_core::ANALYSIS_SCHEMA_VERSION, "error": {"code":"ANALYSIS_READ_ONLY", "message":"analysis endpoints accept GET only"}}),
+        ));
+    }
+    let mut parameters = query;
+    let format = parameters
+        .remove("format")
+        .unwrap_or_else(|| "json".to_owned());
+    if format != "json" && format != "markdown" && format != "md" {
+        return Some(json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"schema_version": lab_core::ANALYSIS_SCHEMA_VERSION, "error": {"code":"ANALYSIS_FORMAT_INVALID", "message":"format must be json or markdown"}}),
+        ));
+    }
+    if let Some(id) = detail_id {
+        parameters.insert("id".to_owned(), id.to_owned());
+    }
+    let request = match parse_analysis_request(view, &parameters) {
+        Ok(request) => request,
+        Err(error) => {
+            return Some(json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"schema_version": lab_core::ANALYSIS_SCHEMA_VERSION, "error": {"code":error.code(), "message":error.to_string()}}),
+            ));
+        }
+    };
+    let value = state.analysis_value(view, &request);
+    if format == "markdown" || format == "md" {
+        return Some(text_response(
+            StatusCode::OK,
+            "text/markdown; charset=utf-8",
+            analysis_markdown(&value),
+        ));
+    }
+    Some(json_response(StatusCode::OK, value))
+}
+
+fn analysis_detail_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let id = path.strip_prefix(prefix)?;
+    (!id.is_empty() && !id.contains('/') && id.len() <= 256).then_some(id)
 }
 
 fn plan_response(
@@ -4775,6 +4886,15 @@ fn json_response(status: StatusCode, value: Value) -> Response {
         .expect("static response builder")
 }
 
+fn text_response(status: StatusCode, content_type: &'static str, value: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, value.len())
+        .body(Body::from(value))
+        .expect("static text response builder")
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -4978,6 +5098,88 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         });
         server.set_report(report.clone());
         report
+    }
+
+    #[tokio::test]
+    async fn analysis_routes_use_an_isolated_redacted_artifact_root() {
+        let temporary =
+            std::env::temp_dir().join(format!("fqdn-forge-analysis-api-{}", Uuid::new_v4()));
+        let plan_root = temporary.join("plans");
+        let analysis_root = temporary.join("analysis-artifacts");
+        fs::create_dir_all(analysis_root.join("reports")).expect("analysis reports directory");
+        let repository = repository();
+        let server = LocalServer::spawn_on_with_roots(
+            repository.clone(),
+            None,
+            None,
+            plan_root,
+            analysis_root.clone(),
+        )
+        .await
+        .expect("analysis server");
+        let client = Client::new();
+        let base_url = server.base_url();
+        let loaded = repository.get("001-basic-certificate").expect("scenario");
+        let run_id = create_run(&client, &base_url, &loaded.scenario.id).await;
+        let mut report = run_report(&server, &client, &base_url, loaded, run_id).await;
+        report
+            .failures
+            .push("Authorization: synthetic-not-exported".to_owned());
+        fs::write(
+            analysis_root.join("reports").join("valid.json"),
+            serde_json::to_vec(&report).expect("serialize report"),
+        )
+        .expect("write report");
+        fs::write(analysis_root.join("reports").join("broken.json"), b"{")
+            .expect("write broken artifact");
+
+        let overview: serde_json::Value = client
+            .get(format!("{base_url}/api/analysis/overview"))
+            .send()
+            .await
+            .expect("analysis overview")
+            .error_for_status()
+            .expect("overview status")
+            .json()
+            .await
+            .expect("overview JSON");
+        assert_eq!(overview["schema_version"], "1.0");
+        assert_eq!(overview["data"]["reports"]["count"], 1);
+        assert_eq!(overview["diagnostics"][0]["code"], "ARTIFACT_UNREADABLE");
+        assert!(
+            !overview
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("authorization")
+        );
+
+        let timeline: serde_json::Value = client
+            .get(format!(
+                "{base_url}/api/analysis/timeline?run={run_id}&limit=2"
+            ))
+            .send()
+            .await
+            .expect("analysis timeline")
+            .error_for_status()
+            .expect("timeline status")
+            .json()
+            .await
+            .expect("timeline JSON");
+        assert!(timeline["data"]["events"].as_array().is_some());
+
+        let invalid = client
+            .get(format!(
+                "{base_url}/api/analysis/coverage?path=../../artifacts"
+            ))
+            .send()
+            .await
+            .expect("invalid filter response");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let invalid: serde_json::Value = invalid.json().await.expect("invalid JSON");
+        assert_eq!(invalid["error"]["code"], "ANALYSIS_FILTER_INVALID");
+
+        server.shutdown().await;
+        fs::remove_dir_all(&temporary).expect("remove isolated analysis artifacts");
     }
 
     fn response_indices(audit: &[AuditRecord]) -> Vec<usize> {
