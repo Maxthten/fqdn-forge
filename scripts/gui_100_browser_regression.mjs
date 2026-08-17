@@ -205,6 +205,10 @@ exceptions:
     await run("GUI-100-001", async () => {
       await open("analysis");
       await wait("document.body.innerText.includes('Reports') || document.body.innerText.includes('报告')", "empty analysis overview");
+      if (await cdp.evaluate("document.documentElement.lang !== 'zh'")) await click('[data-action="lang"]');
+      await wait("document.documentElement.lang === 'zh'", "Chinese analysis overview");
+      await wait("document.body.innerText.includes('所有数值均来自已保存的离线测试站 artifact，并不代表公网资产。')", "localized offline-artifact notice");
+      assert.ok(!await cdp.evaluate("document.body.innerText.includes('All values describe saved offline test-station artifacts')"));
       assert.ok(await cdp.evaluate("document.body.innerText.includes('0')"));
     });
 
@@ -273,14 +277,25 @@ exceptions:
     await writeFile(join(reportDirectory, "deliberately-broken.json"), "{");
 
     await run("GUI-100-002", async () => { await open("coverage"); await wait("document.querySelectorAll('tbody tr').length > 0", "coverage matrix"); const coverage = await json("/api/analysis/coverage"); const statuses = new Set(coverage.data.cells.map(cell => cell.status)); for (const expected of ["covered", "partial", "missing", "excepted", "expired_exception"]) assert.ok(statuses.has(expected), `coverage status ${expected}`); });
-    await run("GUI-100-003", async () => { await input('[data-analysis-filter="coverage"][data-analysis-key="status"]', "partial"); await click('[data-analysis-action="load"][data-analysis-page="coverage"]'); await wait("document.body.innerText.includes('partial')", "partial coverage filter"); assert.ok((await json("/api/analysis/coverage?status=partial")).data.cells.every(cell => cell.status === "partial")); });
+    await run("GUI-100-003", async () => {
+      await input('[data-analysis-filter="coverage"][data-analysis-key="status"]', "partial");
+      await click('[data-analysis-action="load"][data-analysis-page="coverage"]');
+      await wait("document.body.innerText.includes('partial')", "partial coverage filter");
+      assert.ok((await json("/api/analysis/coverage?status=partial")).data.cells.every(cell => cell.status === "partial"));
+      assert.equal(await cdp.evaluate("document.querySelector('.coverage-table thead th')?.textContent.trim()"), "操作");
+      assert.ok(await cdp.evaluate("Boolean(document.querySelector('.coverage-table [data-analysis-action=coverage-detail]'))"));
+      await cdp.evaluate("window.scrollTo(0, document.body.scrollHeight)");
+      await click('[data-analysis-action="coverage-detail"]');
+      await wait("(() => { const detail = document.getElementById('coverage-detail'); const rect = detail?.getBoundingClientRect(); return Boolean(rect && rect.top >= 0 && rect.top < innerHeight); })()", "coverage detail auto-scroll");
+      assert.equal(await cdp.evaluate("document.activeElement?.id"), "coverage-detail");
+    });
     await run("GUI-100-004", async () => { await open("replays"); await wait("document.body.innerText.includes('matched')", "matched replay"); assert.ok((await json("/api/analysis/replays?status=matched")).data.comparisons.some(item => item.difference_count === 0)); });
     await run("GUI-100-005", async () => { await open("replays"); await input('[data-analysis-filter="replays"][data-analysis-key="status"]', "mismatch"); await click('[data-analysis-action="load"][data-analysis-page="replays"]'); await wait("document.body.innerText.includes('fixture_or_mutation_changed')", "replay mismatch explanation"); const mismatches = (await json("/api/analysis/replays?status=mismatch")).data.comparisons; assert.ok(mismatches.some(item => item.first_difference_path === "$.provenance.fixture_digest" && item.difference_count === 2)); assert.ok(!JSON.stringify(mismatches).includes("synthetic-not-exported")); });
     await run("GUI-100-006", async () => { await open("campaigns"); await wait("document.body.innerText.includes('107-json-structural-mutation-campaign')", "campaign summary"); const campaigns = (await json("/api/analysis/campaigns")).data.campaigns; assert.ok(campaigns.some(item => item.status === "passed")); assert.ok(campaigns.some(item => item.status === "failed" && item.failure_categories.fixture === 1)); });
     await run("GUI-100-007", async () => { await open("soak"); await wait("document.querySelectorAll('tbody tr').length >= 2", "soak summaries"); const soaks = (await json("/api/analysis/soak")).data.soaks; assert.ok(soaks.some(item => item.seed === 1001 && item.concurrency === 4 && item.operations === 250 && item.status === "passed")); assert.ok(soaks.some(item => item.seed === 1002 && item.status === "failed" && item.resources.active_runs === 1)); });
     await run("GUI-100-008", async () => { await open("evidence"); await wait("Boolean(document.querySelector('[data-analysis-filter=evidence][data-analysis-key=scenario]'))", "evidence filters"); await input('[data-analysis-filter="evidence"][data-analysis-key="scenario"]', "023-threat-intel-evidence"); await click('[data-analysis-action="load"][data-analysis-page="evidence"]'); await wait("Boolean(document.querySelector('.evidence-svg'))", "evidence graph"); await click('[data-analysis-action="graph-view"]'); await wait("Boolean(document.querySelector('.table-wrap'))", "evidence table alternative"); assert.ok((await json("/api/analysis/evidence-graph?scenario=023-threat-intel-evidence")).data.nodes.length > 0); });
     await run("GUI-100-009", async () => { await input('[data-analysis-filter="evidence"][data-analysis-key="scenario"]', "001-basic-certificate"); await click('[data-analysis-action="load"][data-analysis-page="evidence"]'); await wait("document.body.innerText.includes('Result truncated') || document.body.innerText.includes('结果已截断')", "evidence truncation"); const graph = await json("/api/analysis/evidence-graph?scenario=001-basic-certificate"); assert.equal(graph.truncated, true); assert.ok(graph.data.total_nodes > graph.data.nodes.length); });
-    await run("GUI-100-010", async () => { await open("timelineTrend"); await wait("Boolean(document.querySelector('[data-analysis-filter=timelineTrend][data-analysis-key=run]'))", "timeline controls"); await input('[data-analysis-filter="timelineTrend"][data-analysis-key="run"]', baseReport.run_id); await click('[data-analysis-action="load"][data-analysis-page="timelineTrend"]'); await wait("document.body.innerText.includes('Retry-After')", "rate-limit timeline"); const events = (await json(`/api/analysis/timeline?run=${baseReport.run_id}`)).data.events; assert.deepEqual(events.map(event => event.status), [429, 200]); assert.deepEqual(events.map(event => event.virtual_time_ms), [0, 1000]); });
+    await run("GUI-100-010", async () => { await open("timelineTrend"); await wait("Boolean(document.querySelector('[data-analysis-filter=timelineTrend][data-analysis-key=run]'))", "timeline controls"); await input('[data-analysis-filter="timelineTrend"][data-analysis-key="run"]', baseReport.run_id); await click('[data-analysis-action="load"][data-analysis-page="timelineTrend"]'); await wait("document.body.innerText.includes('Retry-After')", "rate-limit timeline"); const events = (await json(`/api/analysis/timeline?run=${baseReport.run_id}`)).data.events; assert.deepEqual(events.map(event => event.status), [429, 200]); assert.deepEqual(events.map(event => event.virtual_time_ms), [0, 1000]); assert.equal(await cdp.evaluate("document.querySelectorAll('.analysis-diagnostics').length"), 1); });
     await run("GUI-100-011", async () => { await input('[data-analysis-filter="timelineTrend"][data-analysis-key="source"]', "key-search"); await input('[data-analysis-filter="timelineTrend"][data-analysis-key="status"]', "429"); await click('[data-analysis-action="load"][data-analysis-page="timelineTrend"]'); await wait("document.body.innerText.includes('429')", "timeline filters"); const filtered = (await json(`/api/analysis/timeline?run=${baseReport.run_id}&source=key-search&status=429`)).data.events; assert.equal(filtered.length, 1); });
     await run("GUI-100-012", async () => { const trends = await json("/api/analysis/trends"); assert.ok(trends.data.source_point_count > 300); assert.equal(trends.data.points.length, 300); assert.deepEqual([...trends.data.points].map(point => point.timestamp), trends.data.points.map(point => point.timestamp).sort()); const empty = await json("/api/analysis/trends?scenario=not-present"); assert.deepEqual(empty.data.points, []); });
     await run("GUI-100-013", async () => { await open("coverage"); await wait("Boolean(document.querySelector('[data-analysis-export=json]'))", "analysis export controls"); await click('[data-analysis-export="json"]'); await click('[data-analysis-export="markdown"]'); await sleep(200); const exported = await json("/api/analysis/coverage"); assert.equal(exported.schema_version, "1.0"); assert.ok(Object.hasOwn(exported, "filters") && Object.hasOwn(exported, "truncated")); assert.ok(cdp.network.some(url => url.includes("/api/analysis/") && url.includes("format=markdown"))); assert.ok(!JSON.stringify(exported).includes("synthetic-not-exported")); });
@@ -288,9 +303,18 @@ exceptions:
     await run("GUI-100-015", async () => { await cdp.command("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }); await sleep(100); assert.deepEqual(await cdp.evaluate("[document.documentElement.scrollWidth, document.documentElement.clientWidth]"), [390, 390]); assert.ok(await cdp.evaluate("Boolean(document.querySelector('.trend-svg, .table-wrap, .empty'))")); await cdp.command("Emulation.clearDeviceMetricsOverride"); });
     await run("GUI-100-016", async () => { const external = cdp.network.filter(url => /^https?:/i.test(url)).filter(url => !["127.0.0.1", "localhost"].includes(new URL(url).hostname)); assert.deepEqual(external, []); assert.deepEqual(cdp.console, []); });
     await run("GUI-100-017", async () => { const first = await hashTree(analysisRoot); for (const page of ["analysis", "coverage", "replays", "campaigns", "soak", "evidence", "timelineTrend"]) await open(page); assert.equal(await hashTree(analysisRoot), first); });
+    await run("GUI-100-018", async () => {
+      await open("analysis");
+      if (await cdp.evaluate("document.documentElement.lang !== 'zh'")) await click('[data-action="lang"]');
+      await wait("document.querySelectorAll('.recent-run').length > 0", "recent analysis runs");
+      assert.equal(await cdp.evaluate("document.querySelector('.content table tbody')?.rows.length"), 20);
+      assert.ok(await cdp.evaluate("document.querySelector('.recent-run code')?.textContent.trim().length === 8"));
+      const recent = (await json("/api/analysis/overview")).data.reports.recent;
+      for (let index = 1; index < recent.length; index += 1) assert.ok(Date.parse(recent[index - 1].finished_at) >= Date.parse(recent[index].finished_at), "recent runs are sorted by completion time");
+    });
 
     if (failures.length) throw new AggregateError(failures, `${failures.length} GUI 1.0 browser regression case(s) failed`);
-    console.log("GUI 1.0 browser regression: 17 passed, 0 failed");
+    console.log("GUI 1.0 browser regression: 18 passed, 0 failed");
   } finally {
     await cdp?.close();
     if (browser.exitCode === null) browser.kill();

@@ -464,12 +464,14 @@ fn overview_value(
     generated_at: &str,
 ) -> Value {
     let coverage = coverage_summary(&coverage_report(repository));
-    let mut recent = corpus
-        .reports
-        .iter()
-        .map(report_summary)
-        .collect::<Vec<_>>();
-    recent.reverse();
+    let mut recent = corpus.reports.iter().collect::<Vec<_>>();
+    recent.sort_by(|left, right| {
+        right
+            .finished_at
+            .cmp(&left.finished_at)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    let mut recent = recent.into_iter().map(report_summary).collect::<Vec<_>>();
     recent.truncate(request.limit.min(20));
     let replay_count = replay_rows(corpus).len();
     let mismatch_count = replay_rows(corpus)
@@ -489,6 +491,7 @@ fn overview_value(
         None,
         json!({
             "local_only": true,
+            "simulation_notice_code": "offline_artifacts_not_public_network_assets",
             "simulation_notice": "All values describe saved offline test-station artifacts, not public-network assets.",
             "reports": {"count": corpus.reports.len(), "recent": recent},
             "campaigns": {"count": corpus.campaigns.len(), "recent": campaign_rows(corpus).into_iter().rev().take(5).collect::<Vec<_>>()},
