@@ -286,7 +286,7 @@ exceptions:
       assert.ok(await cdp.evaluate("Boolean(document.querySelector('.coverage-table [data-analysis-action=coverage-detail]'))"));
       await cdp.evaluate("window.scrollTo(0, document.body.scrollHeight)");
       await click('[data-analysis-action="coverage-detail"]');
-      await wait("(() => { const detail = document.getElementById('coverage-detail'); const rect = detail?.getBoundingClientRect(); return Boolean(rect && rect.top >= 0 && rect.top < innerHeight); })()", "coverage detail auto-scroll");
+      await wait("(() => { const detail = document.getElementById('coverage-detail'); const rect = detail?.getBoundingClientRect(); return Boolean(rect && rect.top >= 0 && rect.top < innerHeight && document.activeElement?.id === 'coverage-detail'); })()", "coverage detail auto-scroll and focus");
       assert.equal(await cdp.evaluate("document.activeElement?.id"), "coverage-detail");
     });
     await run("GUI-100-004", async () => { await open("replays"); await wait("document.body.innerText.includes('matched')", "matched replay"); assert.ok((await json("/api/analysis/replays?status=matched")).data.comparisons.some(item => item.difference_count === 0)); });
@@ -303,6 +303,8 @@ exceptions:
     await run("GUI-100-015", async () => { await cdp.command("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }); await sleep(100); assert.deepEqual(await cdp.evaluate("[document.documentElement.scrollWidth, document.documentElement.clientWidth]"), [390, 390]); assert.ok(await cdp.evaluate("Boolean(document.querySelector('.trend-svg, .table-wrap, .empty'))")); await cdp.command("Emulation.clearDeviceMetricsOverride"); });
     await run("GUI-100-016", async () => { const external = cdp.network.filter(url => /^https?:/i.test(url)).filter(url => !["127.0.0.1", "localhost"].includes(new URL(url).hostname)); assert.deepEqual(external, []); assert.deepEqual(cdp.console, []); });
     await run("GUI-100-017", async () => { const first = await hashTree(analysisRoot); for (const page of ["analysis", "coverage", "replays", "campaigns", "soak", "evidence", "timelineTrend"]) await open(page); assert.equal(await hashTree(analysisRoot), first); });
+    // GUI-100-018 — recent analysis runs: verifies the localized overview is usable,
+    // renders a stable 20-row recent-run list, and orders reports by completion time.
     await run("GUI-100-018", async () => {
       await open("analysis");
       if (await cdp.evaluate("document.documentElement.lang !== 'zh'")) await click('[data-action="lang"]');
