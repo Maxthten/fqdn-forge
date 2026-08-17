@@ -5,7 +5,7 @@ use std::{
 };
 
 use brotli::Decompressor;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use csv::ReaderBuilder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use futures_util::StreamExt;
@@ -41,6 +41,43 @@ pub enum RunnerError {
 pub struct ReferenceRunner {
     client: Client,
     guard: EgressGuard,
+}
+
+/// A deterministic test clock for all client-side waits. It deliberately
+/// never reads wall-clock time, so HTTP-date Retry-After values are stable
+/// across dates, time zones, and repeated test runs.
+#[derive(Clone, Debug)]
+struct TestClock {
+    base_time: DateTime<Utc>,
+    virtual_elapsed_ms: u64,
+}
+
+impl TestClock {
+    fn fixed() -> Self {
+        Self::with_base(
+            Utc.with_ymd_and_hms(2026, 8, 17, 0, 0, 0)
+                .single()
+                .expect("fixed test clock timestamp is valid"),
+        )
+    }
+
+    fn with_base(base_time: DateTime<Utc>) -> Self {
+        Self {
+            base_time,
+            virtual_elapsed_ms: 0,
+        }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.base_time
+            + ChronoDuration::milliseconds(
+                i64::try_from(self.virtual_elapsed_ms).unwrap_or(i64::MAX),
+            )
+    }
+
+    fn advance(&mut self, elapsed_ms: u64) {
+        self.virtual_elapsed_ms = self.virtual_elapsed_ms.saturating_add(elapsed_ms);
+    }
 }
 
 impl ReferenceRunner {
@@ -198,6 +235,7 @@ impl ReferenceRunner {
         let mut seen_cursors = BTreeSet::new();
         let mut retries = 0_usize;
         let mut client_virtual_wait_ms = 0_u64;
+        let mut test_clock = TestClock::fixed();
         loop {
             if scenario
                 .runner
@@ -275,6 +313,7 @@ impl ReferenceRunner {
                 .min(scenario.runner.retry_after_cap_ms);
             run.virtual_waited_ms = run.virtual_waited_ms.saturating_add(virtual_wait);
             client_virtual_wait_ms = client_virtual_wait_ms.saturating_add(virtual_wait);
+            test_clock.advance(virtual_wait);
             if status.is_redirection() {
                 let Some(location) = response
                     .headers()
@@ -314,12 +353,13 @@ impl ReferenceRunner {
                             .headers()
                             .get("retry-after")
                             .and_then(|value| value.to_str().ok())
-                            .map(parse_retry_after_ms)
+                            .map(|value| parse_retry_after_ms(value, test_clock.now()))
                             .unwrap_or(0)
                             .min(scenario.runner.retry_after_cap_ms)
                     };
                     run.virtual_waited_ms = run.virtual_waited_ms.saturating_add(wait);
                     client_virtual_wait_ms = client_virtual_wait_ms.saturating_add(wait);
+                    test_clock.advance(wait);
                     continue;
                 }
                 return (
@@ -724,14 +764,14 @@ fn materialize_value(
     }
 }
 
-fn parse_retry_after_ms(value: &str) -> u64 {
+fn parse_retry_after_ms(value: &str, virtual_now: DateTime<Utc>) -> u64 {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return seconds.saturating_mul(1_000);
     }
     DateTime::parse_from_rfc2822(value.trim())
         .ok()
         .and_then(|date| {
-            let delta = date.with_timezone(&Utc) - Utc::now();
+            let delta = date.with_timezone(&Utc) - virtual_now;
             u64::try_from(delta.num_milliseconds()).ok()
         })
         .unwrap_or(0)
@@ -1248,7 +1288,9 @@ fn record_candidate(
 mod tests {
     use serde_json::json;
 
-    use super::{parse_retry_after_ms, values_at_path};
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+
+    use super::{TestClock, parse_retry_after_ms, values_at_path};
 
     #[test]
     fn nested_json_path_and_csv_quotes_are_deterministic() {
@@ -1275,7 +1317,29 @@ mod tests {
 
     #[test]
     fn retry_after_parser_never_requires_real_sleep() {
-        assert_eq!(parse_retry_after_ms("2"), 2_000);
-        assert_eq!(parse_retry_after_ms("not-a-date"), 0);
+        let fixed = TestClock::fixed();
+        assert_eq!(parse_retry_after_ms("2", fixed.now()), 2_000);
+        assert_eq!(parse_retry_after_ms("not-a-date", fixed.now()), 0);
+    }
+
+    #[test]
+    fn http_date_retry_after_is_relative_to_the_virtual_clock() {
+        for base in [
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid base"),
+            Utc.with_ymd_and_hms(2026, 8, 17, 0, 0, 0)
+                .single()
+                .expect("valid base"),
+            Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid base"),
+        ] {
+            let clock = TestClock::with_base(base);
+            let header = (base + ChronoDuration::milliseconds(2_000)).to_rfc2822();
+            assert_eq!(parse_retry_after_ms(&header, clock.now()), 2_000);
+            let expired = (base - ChronoDuration::milliseconds(1)).to_rfc2822();
+            assert_eq!(parse_retry_after_ms(&expired, clock.now()), 0);
+        }
     }
 }

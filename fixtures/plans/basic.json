@@ -1,0 +1,66 @@
+{
+  "schema_version": "0.2",
+  "plan_id": "plan_basic_001",
+  "name": "分页与限流基础实验",
+  "description": "验证多来源、分页、重复数据和 429 重试；只使用本地固定响应。",
+  "target_domain": "acme.test",
+  "seed": 20260816,
+  "sources": [
+    {
+      "id": "certificate",
+      "template": "certificate",
+      "enabled": true,
+      "faults": []
+    },
+    {
+      "id": "passive-dns",
+      "template": "passive_dns",
+      "enabled": true,
+      "faults": []
+    }
+  ],
+  "authentication": {
+    "mode": "fake_api_key",
+    "location": "header",
+    "failure_status": 401
+  },
+  "quota": {
+    "request_budget": 100,
+    "consume_per_page": true,
+    "allow_burst": false,
+    "rate_limit_on_request": 2,
+    "retry_after_seconds": 1,
+    "retry_after_format": "seconds",
+    "cooldown_seconds": 0,
+    "exhausted_behaviour": "rate_limited"
+  },
+  "pagination": {
+    "mode": "page",
+    "page_size": 25,
+    "total_pages": 3,
+    "next_page_exists": true,
+    "duplicate_ratio_percent": 10,
+    "cursor_loop": false,
+    "empty_final_page_with_next": false
+  },
+  "network_path": {
+    "mode": "direct",
+    "proxy_authentication": "not_required",
+    "proxy_fault": "none",
+    "allowlisted_sources": []
+  },
+  "faults": [],
+  "dataset": {
+    "size": "small"
+  },
+  "expected_behaviour": {
+    "expected_fqdns": [],
+    "forbidden_fqdns": [],
+    "filtered_candidates": [],
+    "expected_requests_per_source": {},
+    "allow_partial_success": false,
+    "require_evidence": false
+  },
+  "status": "runnable",
+  "plan_digest": ""
+}

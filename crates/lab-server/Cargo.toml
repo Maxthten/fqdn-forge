@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 lab-core = { path = "../lab-core" }
 lab-console = { path = "../lab-console" }
 axum.workspace = true

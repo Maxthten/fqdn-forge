@@ -1,21 +1,25 @@
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    AuditEventType, AuditRecord, CollectorSubmission, FaultScriptStage, FaultScriptStep,
-    LoadedScenario, QuotaProfile, QuotaScope, ResourceSummary, RunReport, ScenarioRepository,
+    AuditEventType, AuditRecord, CollectorSubmission, ExperimentPlan, FaultScriptStage,
+    FaultScriptStep, LoadedScenario, PlanExecutionMode, PlanRequestAuditStep, PlanRun, PlanSource,
+    PlanStore, QuotaProfile, QuotaScope, ResourceSummary, RunReport, ScenarioRepository,
+    execute_plan_with_mode,
 };
 
 #[derive(Clone, Debug)]
 pub struct LabState {
     repository: Arc<ScenarioRepository>,
+    plan_store: PlanStore,
     inner: Arc<Mutex<MutableLabState>>,
 }
 
@@ -30,6 +34,40 @@ struct MutableLabState {
     submitted_payloads: BTreeMap<String, String>,
     deleted_runs: usize,
     deleted_run_history: Vec<DeletedRunSummary>,
+    plan_runs: BTreeMap<String, PlanRun>,
+    plan_runtimes: BTreeMap<String, PlanRunRuntime>,
+}
+
+const PLAN_RUNTIME_CAPABILITY_TTL_SECONDS: i64 = 300;
+const MAX_PLAN_RUNTIME_AUDIT_REQUESTS: usize = 512;
+
+/// Secrets are intentionally only held in memory for a current local plan
+/// run. They are never part of `PlanRun`, exports, reports, or logs.
+#[derive(Clone, Debug)]
+struct PlanRunRuntime {
+    source_capability: String,
+    fake_api_key: Option<String>,
+    expires_at: DateTime<Utc>,
+    active: bool,
+    request_counts: BTreeMap<String, usize>,
+    fault_occurrences: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanRunAccess {
+    pub run_id: String,
+    pub source_capability: String,
+    pub fake_api_key: Option<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanSourceRequest {
+    pub plan: ExperimentPlan,
+    pub source: PlanSource,
+    pub request_number: usize,
+    pub fake_api_key: Option<String>,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -154,8 +192,22 @@ impl RunStateError {
 impl LabState {
     #[must_use]
     pub fn new(repository: ScenarioRepository) -> Self {
+        let plan_root = repository
+            .root()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("artifacts")
+            .join("plans");
+        Self::new_with_plan_root(repository, plan_root)
+    }
+
+    #[must_use]
+    pub fn new_with_plan_root(repository: ScenarioRepository, plan_root: impl AsRef<Path>) -> Self {
+        let plan_root = plan_root.as_ref().to_path_buf();
+        let plan_store = PlanStore::open(plan_root).expect("plan store must be available");
         Self {
             repository: Arc::new(repository),
+            plan_store,
             inner: Arc::new(Mutex::new(MutableLabState::default())),
         }
     }
@@ -163,6 +215,344 @@ impl LabState {
     #[must_use]
     pub fn repository(&self) -> &ScenarioRepository {
         &self.repository
+    }
+
+    #[must_use]
+    pub fn plan_store(&self) -> &PlanStore {
+        &self.plan_store
+    }
+
+    pub fn create_plan(&self, plan: ExperimentPlan) -> Result<ExperimentPlan> {
+        self.plan_store.create(plan)
+    }
+
+    pub fn update_plan(&self, plan_id: &str, plan: ExperimentPlan) -> Result<ExperimentPlan> {
+        self.plan_store.update(plan_id, plan)
+    }
+
+    pub fn archive_plan(&self, plan_id: &str) -> Result<ExperimentPlan> {
+        self.plan_store.archive(plan_id)
+    }
+
+    pub fn import_plan(&self, plan: ExperimentPlan) -> Result<ExperimentPlan> {
+        self.plan_store.import(plan)
+    }
+
+    pub fn delete_plan(&self, plan_id: &str) -> Result<()> {
+        self.plan_store.delete(plan_id)?;
+        self.invalidate_plan_runtimes(plan_id, "plan definition deleted")
+    }
+
+    pub fn run_plan(&self, plan_id: &str) -> Result<PlanRun> {
+        self.run_plan_with_mode(plan_id, PlanExecutionMode::ExternalIntegration)
+    }
+
+    pub fn simulate_plan(&self, plan_id: &str) -> Result<PlanRun> {
+        self.run_plan_with_mode(plan_id, PlanExecutionMode::LocalSimulation)
+    }
+
+    pub fn run_plan_with_mode(
+        &self,
+        plan_id: &str,
+        execution_mode: PlanExecutionMode,
+    ) -> Result<PlanRun> {
+        let plan = self
+            .plan_store
+            .get(plan_id)
+            .ok_or_else(|| anyhow!("PLAN_NOT_FOUND: plan {plan_id} does not exist"))?;
+        if plan.status == crate::PlanStatus::Archived {
+            bail!("PLAN_ARCHIVED: archived plans cannot be run");
+        }
+        if plan.status != crate::PlanStatus::Runnable {
+            bail!("PLAN_NOT_RUNNABLE: only plans marked runnable can be run");
+        }
+        self.register_plan_run(execute_plan_with_mode(plan, None, execution_mode))
+    }
+
+    pub fn replay_plan_run(&self, run_id: &str) -> Result<PlanRun> {
+        let prior = self
+            .inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .plan_runs
+            .get(run_id)
+            .cloned()
+            .or_else(|| self.plan_store.load_run(run_id).ok())
+            .ok_or_else(|| anyhow!("PLAN_RUN_NOT_FOUND: run {run_id} does not exist"))?;
+        self.register_plan_run(execute_plan_with_mode(
+            prior.plan_snapshot,
+            Some(run_id.to_owned()),
+            prior.manifest.execution_mode,
+        ))
+    }
+
+    #[must_use]
+    pub fn list_plan_runs(&self) -> Vec<PlanRun> {
+        let mut runs = self.plan_store.list_runs().unwrap_or_default();
+        for run in self
+            .inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .plan_runs
+            .values()
+            .cloned()
+        {
+            if !runs
+                .iter()
+                .any(|saved| saved.manifest.run_id == run.manifest.run_id)
+            {
+                runs.push(run);
+            }
+        }
+        runs.sort_by_key(|run| run.manifest.created_at);
+        runs
+    }
+
+    pub fn plan_run(&self, run_id: &str) -> Result<PlanRun> {
+        self.inner
+            .lock()
+            .expect("lab state lock poisoned")
+            .plan_runs
+            .get(run_id)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| self.plan_store.load_run(run_id))
+    }
+
+    /// Returns the one short-lived secret bundle which is sent only in the
+    /// create/replay response. Callers must keep it in memory and never export
+    /// it. A cancelled, expired, deleted, or historical run has no bundle.
+    pub fn plan_run_access(&self, run_id: &str) -> Result<PlanRunAccess> {
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let runtime = inner.plan_runtimes.get_mut(run_id).ok_or_else(|| {
+            anyhow!("PLAN_SOURCE_CAPABILITY_UNAVAILABLE: no active local source capability")
+        })?;
+        if Utc::now() >= runtime.expires_at {
+            runtime.active = false;
+        }
+        if !runtime.active {
+            bail!(
+                "PLAN_SOURCE_CAPABILITY_UNAVAILABLE: local source capability is expired or cancelled"
+            );
+        }
+        Ok(PlanRunAccess {
+            run_id: run_id.to_owned(),
+            source_capability: runtime.source_capability.clone(),
+            fake_api_key: runtime.fake_api_key.clone(),
+            expires_at: runtime.expires_at,
+        })
+    }
+
+    /// Authorizes one direct or proxied plan-source request and reserves its
+    /// request sequence number. Authentication mode-specific validation is
+    /// performed by the server after it receives this non-persistent context.
+    pub fn authorize_plan_source(
+        &self,
+        run_id: &str,
+        source_id: &str,
+        source_capability: Option<&str>,
+    ) -> Result<PlanSourceRequest> {
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        {
+            let runtime = inner.plan_runtimes.get_mut(run_id).ok_or_else(|| {
+                anyhow!("PLAN_SOURCE_CAPABILITY_UNAVAILABLE: no active local source capability")
+            })?;
+            if Utc::now() >= runtime.expires_at {
+                runtime.active = false;
+            }
+            if !runtime.active {
+                bail!(
+                    "PLAN_SOURCE_CAPABILITY_UNAVAILABLE: local source capability is expired or cancelled"
+                );
+            }
+            if source_capability != Some(runtime.source_capability.as_str()) {
+                bail!(
+                    "PLAN_SOURCE_CAPABILITY_INVALID: source capability is missing, stale, or invalid"
+                );
+            }
+        }
+        let run = inner
+            .plan_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("PLAN_RUN_NOT_FOUND: plan run {run_id} does not exist"))?;
+        let source = run
+            .plan_snapshot
+            .sources
+            .iter()
+            .find(|source| source.id == source_id && source.enabled)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("PLAN_SOURCE_NOT_FOUND: enabled source {source_id} does not exist")
+            })?;
+        let runtime = inner
+            .plan_runtimes
+            .get_mut(run_id)
+            .expect("validated plan runtime must remain present");
+        let request_number = runtime
+            .request_counts
+            .entry(source_id.to_owned())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        Ok(PlanSourceRequest {
+            plan: run.plan_snapshot,
+            source,
+            request_number: *request_number,
+            fake_api_key: runtime.fake_api_key.clone(),
+            expires_at: runtime.expires_at,
+        })
+    }
+
+    pub fn record_plan_source_request(
+        &self,
+        run_id: &str,
+        source_id: &str,
+        step: PlanRequestAuditStep,
+    ) -> Result<()> {
+        let updated = {
+            let mut inner = self.inner.lock().expect("lab state lock poisoned");
+            let run = inner
+                .plan_runs
+                .get_mut(run_id)
+                .ok_or_else(|| anyhow!("PLAN_RUN_NOT_FOUND: plan run {run_id} does not exist"))?;
+            let entry = run
+                .audit
+                .iter_mut()
+                .find(|entry| entry.source_id == source_id)
+                .ok_or_else(|| {
+                    anyhow!("PLAN_SOURCE_NOT_FOUND: source {source_id} does not exist")
+                })?;
+            if entry.actual_requests.len() < MAX_PLAN_RUNTIME_AUDIT_REQUESTS {
+                entry.actual_requests.push(step);
+            }
+            run.report.actual_requests = run.report.actual_requests.saturating_add(1);
+            run.report.source_access_status = "active".to_owned();
+            run.clone()
+        };
+        self.plan_store.save_run(&updated)
+    }
+
+    /// Consumes one deterministic occurrence of a configured source fault.
+    /// This state is strictly runtime-only so a retry can observe a one-shot
+    /// failure without making the plan snapshot or manifest stateful.
+    pub fn consume_plan_fault(
+        &self,
+        run_id: &str,
+        source_id: &str,
+        fault: &crate::PlanFault,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        let runtime = inner.plan_runtimes.get_mut(run_id).ok_or_else(|| {
+            anyhow!("PLAN_SOURCE_CAPABILITY_UNAVAILABLE: no active local source capability")
+        })?;
+        if Utc::now() >= runtime.expires_at {
+            runtime.active = false;
+        }
+        if !runtime.active {
+            bail!(
+                "PLAN_SOURCE_CAPABILITY_UNAVAILABLE: local source capability is expired or cancelled"
+            );
+        }
+        let key = format!("{source_id}:{}:{:?}", fault.trigger_page, fault.kind);
+        let consumed = runtime.fault_occurrences.entry(key).or_default();
+        if *consumed >= fault.occurrences {
+            return Ok(false);
+        }
+        *consumed = consumed.saturating_add(1);
+        Ok(true)
+    }
+
+    pub fn cancel_plan_run(&self, run_id: &str) -> Result<PlanRun> {
+        let updated = {
+            let mut inner = self.inner.lock().expect("lab state lock poisoned");
+            let runtime = inner.plan_runtimes.get_mut(run_id).ok_or_else(|| {
+                anyhow!("PLAN_SOURCE_CAPABILITY_UNAVAILABLE: no active local source capability")
+            })?;
+            runtime.active = false;
+            let run = inner
+                .plan_runs
+                .get_mut(run_id)
+                .ok_or_else(|| anyhow!("PLAN_RUN_NOT_FOUND: plan run {run_id} does not exist"))?;
+            run.report.source_access_status = "cancelled".to_owned();
+            run.report.source_access_expires_at = None;
+            if !run
+                .report
+                .failures
+                .iter()
+                .any(|failure| failure == "local source capability cancelled")
+            {
+                run.report
+                    .failures
+                    .push("local source capability cancelled".to_owned());
+            }
+            run.clone()
+        };
+        self.plan_store.save_run(&updated)?;
+        Ok(updated)
+    }
+
+    fn register_plan_run(&self, run: PlanRun) -> Result<PlanRun> {
+        let expires_at = Utc::now() + ChronoDuration::seconds(PLAN_RUNTIME_CAPABILITY_TTL_SECONDS);
+        let needs_fake_key = run.plan_snapshot.sources.iter().any(|source| {
+            source
+                .authentication
+                .as_ref()
+                .unwrap_or(&run.plan_snapshot.authentication)
+                .mode
+                == crate::AuthenticationMode::FakeApiKey
+        });
+        let runtime = PlanRunRuntime {
+            source_capability: format!("plan-src-{}", Uuid::new_v4()),
+            fake_api_key: needs_fake_key.then(|| format!("fake-plan-{}", Uuid::new_v4().simple())),
+            expires_at,
+            active: true,
+            request_counts: BTreeMap::new(),
+            fault_occurrences: BTreeMap::new(),
+        };
+        self.plan_store.save_run(&run)?;
+        let mut inner = self.inner.lock().expect("lab state lock poisoned");
+        inner
+            .plan_runtimes
+            .insert(run.manifest.run_id.clone(), runtime);
+        inner
+            .plan_runs
+            .insert(run.manifest.run_id.clone(), run.clone());
+        Ok(run)
+    }
+
+    fn invalidate_plan_runtimes(&self, plan_id: &str, reason: &str) -> Result<()> {
+        let updated = {
+            let mut inner = self.inner.lock().expect("lab state lock poisoned");
+            let mut updated = Vec::new();
+            let run_ids = inner
+                .plan_runs
+                .iter()
+                .filter(|(run_id, run)| {
+                    run.manifest.plan_id == plan_id
+                        && inner
+                            .plan_runtimes
+                            .get(*run_id)
+                            .is_some_and(|runtime| runtime.active)
+                })
+                .map(|(run_id, _)| run_id.clone())
+                .collect::<Vec<_>>();
+            for run_id in run_ids {
+                if let Some(runtime) = inner.plan_runtimes.get_mut(&run_id) {
+                    runtime.active = false;
+                }
+                if let Some(run) = inner.plan_runs.get_mut(&run_id) {
+                    run.report.source_access_status = "invalidated".to_owned();
+                    run.report.source_access_expires_at = None;
+                    run.report.failures.push(reason.to_owned());
+                    updated.push(run.clone());
+                }
+            }
+            updated
+        };
+        for run in updated {
+            self.plan_store.save_run(&run)?;
+        }
+        Ok(())
     }
 
     pub fn set_base_url(&self, base_url: String) {

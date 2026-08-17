@@ -4,6 +4,7 @@ mod domain;
 mod egress;
 mod judge;
 mod model;
+mod plan;
 mod repository;
 mod runner;
 mod state;
@@ -18,6 +19,7 @@ pub use judge::{
     refresh_semantic_fingerprint, semantic_difference, semantic_fingerprint, semantic_projection,
 };
 pub use model::*;
+pub use plan::*;
 pub use repository::{LoadedScenario, ScenarioRepository, ValidationIssue};
 pub use runner::{ReferenceRunner, RunnerError};
 pub use state::{

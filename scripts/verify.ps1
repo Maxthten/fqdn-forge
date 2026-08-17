@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(20, 1000)][int]$Repeat = 20
+    [ValidateRange(20, 1000)][int]$Repeat = 20,
+    [switch]$Stress
 )
 
 $ErrorActionPreference = 'Stop'
@@ -531,9 +532,12 @@ if (-not (Test-Path -LiteralPath $releaseSoakPath)) {
 $releaseSoakReport = Get-Content -LiteralPath $releaseSoakPath -Raw | ConvertFrom-Json
 Assert-ReleaseSoakReport $releaseSoakReport
 Invoke-ReleaseSoakNegativeChecks $releaseSoakReport
-Invoke-CargoStep "repeat verification ($Repeat rounds)" @(
-    'run', '-p', 'lab-cli', '--', 'repeat', '--count', $Repeat
-)
+$repeatArguments = @('run', '-p', 'lab-cli', '--', 'repeat', '--count', $Repeat)
+if ($Stress) {
+    Write-Host '==> stress repeat profile enabled'
+    $repeatArguments += @('--profile', 'stress')
+}
+Invoke-CargoStep "repeat verification ($Repeat rounds)" $repeatArguments
 Invoke-NetworkIsolationCheck
 Invoke-GitRangeCheck
 
@@ -543,7 +547,7 @@ $consoleVerificationSummary = [ordered]@{
     schema_version = 1
     status = 'passed'
     completed_at = [DateTime]::UtcNow.ToString('o')
-    command = ".\\scripts\\verify.ps1 -Repeat $Repeat"
+    command = if ($Stress) { ".\\scripts\\verify.ps1 -Stress -Repeat $Repeat" } else { ".\\scripts\\verify.ps1 -Repeat $Repeat" }
     repeat = $Repeat
     scenario_count = 114
     release_soak_operations = [int]$releaseSoakReport.operations

@@ -17,13 +17,14 @@ use csv::ReaderBuilder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use lab_console::load_console_preferences;
 use lab_core::{
-    AuditEventType, Baseline, CollectorRun, EgressGuard, JudgeInput, NetworkMode, Observation,
-    ReferenceRunner, ReportStatus, ScenarioRepository, SoakAction, SoakPreset, SoakReport,
-    SourceKind, SourceStatus, V14_SCHEMA_VERSION, baseline_from_reports, campaign_definitions,
-    campaign_loaded_scenario, campaign_manifest, compare_baseline, coverage_check,
-    coverage_markdown, coverage_report, enrich_report, judge_run, refresh_semantic_fingerprint,
-    report_differences, report_json, semantic_difference, semantic_fingerprint,
-    soak_baseline_from_report,
+    AuditEventType, Baseline, CollectorRun, EgressGuard, ExperimentPlan, JudgeInput, NetworkMode,
+    Observation, PlanExecutionMode, PlanStore, ReferenceRunner, ReportStatus, ScenarioRepository,
+    SoakAction, SoakPreset, SoakReport, SourceKind, SourceStatus, V14_SCHEMA_VERSION,
+    baseline_from_reports, campaign_definitions, campaign_loaded_scenario, campaign_manifest,
+    compare_baseline, coverage_check, coverage_markdown, coverage_report, enrich_report,
+    execute_plan_with_mode, judge_run, refresh_semantic_fingerprint, report_differences,
+    report_json, semantic_difference, semantic_fingerprint, soak_baseline_from_report,
+    validate_plan,
 };
 use lab_server::LocalServer;
 use reqwest::{
@@ -92,6 +93,7 @@ async fn run() -> anyhow::Result<bool> {
         "baseline" => baseline_command(&repository, &args).await,
         "soak" => soak_command(&repository, &args).await,
         "proxy-regression" => proxy_regression_command(&repository).await,
+        "plan" => plan_command(&args).await,
         "serve" => serve_command(repository, &args).await,
         "console" => console_command(repository, &args).await,
         _ => {
@@ -103,6 +105,285 @@ async fn run() -> anyhow::Result<bool> {
 
 fn scenarios_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios")
+}
+
+fn plans_dir() -> PathBuf {
+    scenarios_dir()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("artifacts")
+        .join("plans")
+}
+
+fn plan_store_dir(args: &[String]) -> PathBuf {
+    flag_value(args, "--test-plan-root")
+        .map(PathBuf::from)
+        .unwrap_or_else(plans_dir)
+}
+
+async fn plan_command(args: &[String]) -> anyhow::Result<bool> {
+    let operation = args.get(1).map(String::as_str).unwrap_or("help");
+    let json_output = args.iter().any(|value| value == "--format=json")
+        || flag_value(args, "--format").as_deref() == Some("json");
+    if let Some(format) = flag_value(args, "--format")
+        && format != "json"
+    {
+        anyhow::bail!("--format must be json when supplied");
+    }
+    let store = PlanStore::open(plan_store_dir(args))?;
+    match operation {
+        "list" => {
+            let plans = store.list();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":"0.2", "plans":plans})
+                    )?
+                );
+            } else {
+                for plan in plans {
+                    println!(
+                        "{}\t{}\t{}\t{} source(s)\t{:?}",
+                        plan.plan_id,
+                        plan.name,
+                        plan.updated_at.to_rfc3339(),
+                        plan.sources.len(),
+                        plan.status
+                    );
+                }
+            }
+            Ok(true)
+        }
+        "validate" => {
+            let result = validate_plan(plan_from_file(args)?, true);
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if result.valid {
+                println!(
+                    "valid plan; digest {}",
+                    result.plan_digest.as_deref().unwrap_or("<not calculated>")
+                );
+            } else {
+                for issue in &result.issues {
+                    eprintln!("{} {}: {}", issue.code, issue.field, issue.message);
+                }
+            }
+            Ok(result.valid)
+        }
+        "create" => {
+            let plan = store.create(plan_from_file(args)?)?;
+            print_plan(&plan, json_output)?;
+            Ok(true)
+        }
+        "show" => {
+            let id = required_flag(args, "--id")?;
+            let plan = store
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("PLAN_NOT_FOUND: plan {id} does not exist"))?;
+            print_plan(&plan, json_output)?;
+            Ok(true)
+        }
+        "run" | "simulate" => {
+            let id = required_flag(args, "--id")?;
+            let plan = store
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("PLAN_NOT_FOUND: plan {id} does not exist"))?;
+            if plan.status == lab_core::PlanStatus::Archived {
+                anyhow::bail!("PLAN_ARCHIVED: archived plans cannot be run");
+            }
+            if plan.status != lab_core::PlanStatus::Runnable {
+                anyhow::bail!("PLAN_NOT_RUNNABLE: only plans marked runnable can be run");
+            }
+            let run = execute_plan_with_mode(plan, None, PlanExecutionMode::LocalSimulation);
+            store.save_run(&run)?;
+            print_plan_run(&run, json_output)?;
+            Ok(run.report.status == "passed")
+        }
+        "update" => {
+            let id = required_flag(args, "--id")?;
+            let plan = store.update(&id, plan_from_file(args)?)?;
+            print_plan(&plan, json_output)?;
+            Ok(true)
+        }
+        "replay" => {
+            let run_id = required_flag(args, "--run")?;
+            let prior = store.load_run(&run_id)?;
+            let run = execute_plan_with_mode(
+                prior.plan_snapshot,
+                Some(run_id),
+                prior.manifest.execution_mode,
+            );
+            store.save_run(&run)?;
+            print_plan_run(&run, json_output)?;
+            Ok(run.report.status == "passed")
+        }
+        "export" => {
+            let id = required_flag(args, "--id")?;
+            let output = PathBuf::from(required_flag(args, "--output")?);
+            let plan = store
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("PLAN_NOT_FOUND: plan {id} does not exist"))?;
+            fs::write(&output, serde_json::to_vec_pretty(&plan)?)
+                .with_context(|| format!("cannot write plan export {}", output.display()))?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":"0.2", "plan_id":id, "output":output})
+                    )?
+                );
+            } else {
+                println!("exported plan {id} to {}", output.display());
+            }
+            Ok(true)
+        }
+        "import" => {
+            let plan = store.import(plan_from_file(args)?)?;
+            print_plan(&plan, json_output)?;
+            Ok(true)
+        }
+        "archive" => {
+            let id = required_flag(args, "--id")?;
+            let plan = store.archive(&id)?;
+            print_plan(&plan, json_output)?;
+            Ok(true)
+        }
+        "delete" => {
+            let id = required_flag(args, "--id")?;
+            store.delete(&id)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":"0.2", "deleted":true, "plan_id":id})
+                    )?
+                );
+            } else {
+                println!("deleted plan {id}");
+            }
+            Ok(true)
+        }
+        "storage" => {
+            let stats = store.storage_stats()?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!(
+                    "plans: {}; runs: {}; bytes: {}; plans: {}; runs: {}",
+                    stats.plan_count,
+                    stats.run_count,
+                    stats.total_bytes,
+                    stats.plans_directory,
+                    stats.runs_directory
+                );
+            }
+            Ok(true)
+        }
+        "result" => {
+            let run_id = required_flag(args, "--run")?;
+            let run = store.load_run(&run_id)?;
+            print_plan_run(&run, json_output)?;
+            Ok(run.report.status == "passed")
+        }
+        "manifest" | "export-manifest" => {
+            let run_id = required_flag(args, "--run")?;
+            let output = PathBuf::from(required_flag(args, "--output")?);
+            let run = store.load_run(&run_id)?;
+            // The immutable manifest intentionally contains only the source
+            // contract and expiry policy, never a live capability or fake key.
+            fs::write(&output, serde_json::to_vec_pretty(&run.manifest)?)
+                .with_context(|| format!("cannot write plan manifest {}", output.display()))?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":"0.2", "run_id":run_id, "output":output})
+                    )?
+                );
+            } else {
+                println!(
+                    "exported immutable manifest {run_id} to {}",
+                    output.display()
+                );
+            }
+            Ok(true)
+        }
+        _ => {
+            println!(
+                "lab-cli plan list | validate --file <plan.json> | create --file <plan.json> | show --id <plan-id> | update --id <plan-id> --file <plan.json> | run|simulate --id <plan-id> | replay --run <run-id> | export --id <plan-id> --output <plan.json> | import --file <plan.json> | archive --id <plan-id> | delete --id <plan-id> | storage | result --run <run-id> | manifest --run <run-id> --output <manifest.json> [--format json]"
+            );
+            Ok(operation == "help")
+        }
+    }
+}
+
+fn plan_from_file(args: &[String]) -> anyhow::Result<ExperimentPlan> {
+    let path = PathBuf::from(required_flag(args, "--file")?);
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("cannot inspect plan file {}", path.display()))?;
+    if metadata.len() > 1024 * 1024 {
+        anyhow::bail!("PLAN_TOO_LARGE: plan file exceeds the 1 MiB safety limit");
+    }
+    serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("cannot parse plan file {}", path.display()))
+}
+
+fn required_flag(args: &[String], flag: &str) -> anyhow::Result<String> {
+    flag_value(args, flag).ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
+}
+
+fn print_plan(plan: &ExperimentPlan, json_output: bool) -> anyhow::Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"schema_version":"0.2", "plan":plan})
+            )?
+        );
+    } else {
+        println!("plan: {} ({})", plan.name, plan.plan_id);
+        println!("status: {:?}; revision: {}", plan.status, plan.revision);
+        println!(
+            "sources: {}; digest: {}",
+            plan.sources.len(),
+            plan.plan_digest
+        );
+    }
+    Ok(())
+}
+
+fn print_plan_run(run: &lab_core::PlanRun, json_output: bool) -> anyhow::Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"schema_version":"0.2", "manifest":run.manifest, "report":run.report, "audit":run.audit})
+            )?
+        );
+    } else {
+        println!("plan: {}", run.report.plan_id);
+        println!("run: {}", run.manifest.run_id);
+        println!("result: {}", run.report.status);
+        println!(
+            "requests: {}; retries: {}; rate limited: {}; virtual wait: {} ms",
+            run.report.requests,
+            run.report.retries,
+            run.report.rate_limited_sources,
+            run.report.virtual_wait_ms
+        );
+        println!(
+            "digests: fixture {}; truth {}; plan {}; manifest {}",
+            run.report.fixture_digest,
+            run.report.truth_digest,
+            run.report.plan_digest,
+            run.report.manifest_digest
+        );
+        if let Some(failure) = run.report.failures.first() {
+            println!("failure: {failure}");
+        }
+    }
+    Ok(())
 }
 
 async fn run_command(repository: &ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
@@ -3661,7 +3942,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport|combination|lifecycle [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  campaign list | run --campaign <id> --seed <number> | replay --report <campaign-report>\n  coverage --format json|markdown --output <path> | --check\n  baseline generate --profile v1.4-core | compare --baseline <path> --report <path> | check\n  soak run --preset smoke|standard|release\n  proxy-regression\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  serve [--scenario <id>] [--port 18080]\n  console [--port <1-65535>] [--no-open]"
+        "lab-cli commands:\n  validate\n  list\n  run --all | --scenario <id> | --group network|proxy|quota|transport|combination|lifecycle [--seed <number>] [--profile default|stress] [--report-dir artifacts/reports]\n  repeat --count <number> [--scenario <id>] [--profile default|stress]\n  replay [--strict] --report <report-path>\n  campaign list | run --campaign <id> --seed <number> | replay --report <campaign-report>\n  coverage --format json|markdown --output <path> | --check\n  baseline generate --profile v1.4-core | compare --baseline <path> --report <path> | check\n  soak run --preset smoke|standard|release\n  proxy-regression\n  conformance [--scenario 067-external-submission-pass]\n  self-test\n  plan list|validate|create|show|update|run|simulate|replay|export|import|archive|delete|storage|result|manifest [--format json]\n  serve [--scenario <id>] [--port <1-65535>]\n  console [--port <1-65535>] [--no-open]"
     );
 }
 

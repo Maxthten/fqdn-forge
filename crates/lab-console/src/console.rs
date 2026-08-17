@@ -27,6 +27,10 @@ pub fn asset(path: &str) -> Option<ConsoleAsset> {
             content_type: "application/javascript; charset=utf-8",
             body: include_str!("../assets/app.js"),
         }),
+        "/console/plans.js" => Some(ConsoleAsset {
+            content_type: "application/javascript; charset=utf-8",
+            body: include_str!("../assets/plans.js"),
+        }),
         "/console/style.css" => Some(ConsoleAsset {
             content_type: "text/css; charset=utf-8",
             body: include_str!("../assets/style.css"),
@@ -495,6 +499,9 @@ mod tests {
             .expect("console stylesheet")
             .body;
         let script = asset("/console/app.js").expect("console script").body;
+        let plans = asset("/console/plans.js")
+            .expect("experiment plans script")
+            .body;
 
         assert!(html.contains("color-scheme\" content=\"light"));
         assert!(html.contains("/console/style.css"));
@@ -502,6 +509,7 @@ mod tests {
         assert!(!html.contains("https://"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("cdn"));
+        assert!(html.contains("/console/plans.js"));
 
         assert!(!css.contains("prefers-color-scheme"));
         assert!(!css.contains("data-theme"));
@@ -522,5 +530,18 @@ mod tests {
         assert!(script.contains("soakOperations"));
         assert!(script.contains("已复制"));
         assert!(script.contains("没有找到匹配场景"));
+
+        assert!(!plans.contains("localStorage."));
+        assert!(!plans.contains("window.localStorage"));
+        assert!(!plans.contains("https://"));
+        assert!(!plans.contains("http://"));
+        assert!(plans.contains("new URL(path, location.origin)"));
+        assert!(plans.contains("non-loopback UI request refused"));
+        assert!(plans.contains("/api/plans/storage"));
+        assert!(plans.contains("/simulate"));
+        assert!(plans.contains("/runs"));
+        assert!(plans.contains("plan-status-filter"));
+        assert!(plans.contains("confirm(t(\"confirmDelete\"))"));
+        assert!(plans.contains("state.busy"));
     }
 }

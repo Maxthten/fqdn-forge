@@ -6,6 +6,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -25,14 +26,19 @@ use flate2::{
 };
 use futures_util::stream;
 use lab_core::{
-    AuditEventType, AuditRecord, CollectorRun, CollectorSubmission, EgressGuard, Endpoint,
-    FaultScriptClaim, FaultScriptStage, FilterReason, FilteredCandidate, GeneratorKind, JudgeInput,
-    LabState, LoadedScenario, ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile,
-    ManifestSource, ManifestSubmission, ManifestTransportProfile, NetworkMode, NetworkProfile,
-    PaginationMode, ProxyAuthenticationState, ProxyFault, QuotaProfile, ReferenceRunner, Reply,
-    ResponseMetrics, RetryAfterMode, RunManifest, RunReport, RunSession, RunStateError, Scenario,
-    ScenarioRepository, SourceStatus, SubmissionLimits, SubmissionReport, TransferMode, ValueRule,
-    accept_candidate, enrich_report, judge_run, refresh_semantic_fingerprint, stable_digest,
+    AuditEventType, AuditRecord, AuthenticationLocation, AuthenticationMode, CollectorRun,
+    CollectorSubmission, EgressGuard, Endpoint, ExperimentPlan, FaultScriptClaim, FaultScriptStage,
+    FilterReason, FilteredCandidate, GeneratorKind, JudgeInput, LabState, LoadedScenario,
+    ManifestNetwork, ManifestNetworkProfile, ManifestQuotaProfile, ManifestSource,
+    ManifestSubmission, ManifestTransportProfile, NetworkMode, NetworkProfile, PLAN_SCHEMA_VERSION,
+    PaginationMode, PlanFaultKind, PlanNetworkMode, PlanPagination, PlanPaginationMode, PlanQuota,
+    PlanRequestAuditStep, PlanRun, PlanSourceTemplate, ProxyAuthenticationState, ProxyFault,
+    QuotaExhaustedBehaviour, QuotaProfile, ReferenceRunner, Reply, ResponseMetrics, RetryAfterMode,
+    RunManifest, RunReport, RunSession, RunStateError, Scenario, ScenarioRepository, SourceStatus,
+    SubmissionLimits, SubmissionReport, TransferMode, ValueRule, accept_candidate,
+    authentication_outcome, enrich_report, judge_run, plan_source_page_records,
+    refresh_semantic_fingerprint, retry_after_value, stable_digest, validate_plan,
+    virtual_http_date_after,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -60,13 +66,31 @@ impl LocalServer {
         repository: ScenarioRepository,
         active: Option<&str>,
     ) -> Result<Self, String> {
-        Self::spawn_on(repository, active, None).await
+        Self::spawn_inner(repository, active, None, None).await
     }
 
     pub async fn spawn_on(
         repository: ScenarioRepository,
         active: Option<&str>,
         port: Option<u16>,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(repository, active, port, None).await
+    }
+
+    #[cfg(test)]
+    async fn spawn_with_plan_root(
+        repository: ScenarioRepository,
+        active: Option<&str>,
+        plan_root: PathBuf,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(repository, active, None, Some(plan_root)).await
+    }
+
+    async fn spawn_inner(
+        repository: ScenarioRepository,
+        active: Option<&str>,
+        port: Option<u16>,
+        plan_root: Option<PathBuf>,
     ) -> Result<Self, String> {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.unwrap_or(0));
         let listener = TcpListener::bind(address)
@@ -76,7 +100,10 @@ impl LocalServer {
         if address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return Err("refusing non-loopback listener".to_owned());
         }
-        let state = LabState::new(repository);
+        let state = match plan_root {
+            Some(plan_root) => LabState::new_with_plan_root(repository, plan_root),
+            None => LabState::new(repository),
+        };
         state.set_base_url(format!("http://127.0.0.1:{}", address.port()));
         let proxy_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
@@ -224,12 +251,16 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         }
     };
     let headers = proxy_header_map(&request.headers);
-    let Some(run_id) = headers.get("x-lab-run-id").map(String::as_str) else {
+    let Some(run_id) = headers.get("x-lab-run-id").cloned() else {
         state.record_unscoped_request(&request.method, &request.target, "missing x-lab-run-id");
         let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
         return;
     };
-    let loaded = match state.loaded_for_run(run_id) {
+    if state.plan_run(&run_id).is_ok() {
+        handle_plan_proxy_connection(client, state, &run_id, request, headers).await;
+        return;
+    }
+    let loaded = match state.loaded_for_run(&run_id) {
         Ok(loaded) => loaded,
         Err(_) => {
             state.record_unscoped_request(&request.method, &request.target, "unknown proxy run");
@@ -238,14 +269,14 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         }
     };
     let profile = loaded.scenario.network_profile.clone();
-    let auth = match state.session(run_id) {
+    let auth = match state.session(&run_id) {
         Ok(run) => proxy_authentication_state(&headers, &run),
         Err(_) => ProxyAuthenticationState::Invalid,
     };
     let is_connect = request.method.eq_ignore_ascii_case("CONNECT");
     let correlation_id = Uuid::new_v4().to_string();
     let mut audit = proxy_audit_record(ProxyAuditContext {
-        run_id,
+        run_id: &run_id,
         scenario: &loaded.scenario,
         method: &request.method,
         target: &request.target,
@@ -261,7 +292,7 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         audit.blocked = true;
         audit.external_target_rejected = true;
         audit.proxy_reason = Some(reason);
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
         return;
     }
@@ -272,14 +303,14 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         audit.response_status = 403;
         audit.blocked = true;
         audit.proxy_reason = Some("profile_mismatch".to_owned());
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
         return;
     }
     if auth != ProxyAuthenticationState::Valid {
         audit.response_status = 407;
         audit.proxy_reason = Some("proxy_authentication_required".to_owned());
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         let _ = write_proxy_response(
             &mut client,
             407,
@@ -292,27 +323,27 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
     if matches!(profile.fault, ProxyFault::ConnectionRefused) {
         audit.response_status = 502;
         audit.proxy_reason = Some("connection_refused".to_owned());
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
         return;
     }
     if matches!(profile.fault, ProxyFault::ConnectTimeout) {
         audit.response_status = 504;
         audit.proxy_reason = Some("connect_timeout".to_owned());
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         tokio::time::sleep(Duration::from_millis(profile.virtual_timeout_ms.min(50))).await;
         let _ = write_proxy_response(&mut client, 504, "Gateway Timeout", None).await;
         return;
     }
     if matches!(profile.fault, ProxyFault::ResetBeforeResponse) {
         audit.proxy_reason = Some("reset_before_response".to_owned());
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         return;
     }
     if matches!(profile.fault, ProxyFault::ResetAfterHeaders) {
         audit.response_status = 502;
         audit.proxy_reason = Some("reset_after_headers".to_owned());
-        let _ = state.record_request(run_id, audit);
+        let _ = state.record_request(&run_id, audit);
         let _ = client
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\n")
             .await;
@@ -322,7 +353,7 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         proxy_connect(
             client,
             state,
-            run_id,
+            &run_id,
             &loaded.scenario,
             profile,
             request,
@@ -333,7 +364,7 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         proxy_forward(
             client,
             state,
-            run_id,
+            &run_id,
             &loaded.scenario,
             profile,
             request,
@@ -341,6 +372,218 @@ async fn handle_proxy_connection(mut client: TcpStream, state: LabState) {
         )
         .await;
     }
+}
+
+async fn handle_plan_proxy_connection(
+    mut client: TcpStream,
+    state: LabState,
+    run_id: &str,
+    request: RawProxyRequest,
+    headers: BTreeMap<String, String>,
+) {
+    if let Some(reason) = proxy_request_shape_reason(&request) {
+        let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
+        state.record_unscoped_request("PLAN_PROXY", &request.target, &reason);
+        return;
+    }
+    let access = match state.plan_run_access(run_id) {
+        Ok(access) => access,
+        Err(_) => {
+            let _ = write_proxy_response(&mut client, 410, "Gone", None).await;
+            return;
+        }
+    };
+    if headers.get("x-lab-source-capability") != Some(&access.source_capability) {
+        let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+        return;
+    }
+    let plan = match state.plan_run(run_id) {
+        Ok(run) => run.plan_snapshot,
+        Err(_) => {
+            let _ = write_proxy_response(&mut client, 404, "Not Found", None).await;
+            return;
+        }
+    };
+    let is_connect = request.method.eq_ignore_ascii_case("CONNECT");
+    if plan.network_path.mode == PlanNetworkMode::Direct
+        || (plan.network_path.mode == PlanNetworkMode::HttpProxy && is_connect)
+        || (plan.network_path.mode == PlanNetworkMode::Connect && !is_connect)
+    {
+        let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+        return;
+    }
+    match plan.network_path.proxy_authentication {
+        lab_core::ProxyAuthentication::Fails => {
+            let _ = write_proxy_response(
+                &mut client,
+                407,
+                "Proxy Authentication Required",
+                Some("Proxy-Authenticate: Lab\r\n"),
+            )
+            .await;
+            return;
+        }
+        lab_core::ProxyAuthentication::Succeeds => {
+            let authorization = format!("Lab {}", access.source_capability);
+            if headers.get("proxy-authorization") != Some(&authorization)
+                || headers.get("x-lab-proxy-capability") != Some(&access.source_capability)
+            {
+                let _ = write_proxy_response(
+                    &mut client,
+                    407,
+                    "Proxy Authentication Required",
+                    Some("Proxy-Authenticate: Lab\r\n"),
+                )
+                .await;
+                return;
+            }
+        }
+        lab_core::ProxyAuthentication::NotRequired => {}
+    }
+    match plan.network_path.proxy_fault {
+        lab_core::ProxySimulationFault::RejectRequest
+        | lab_core::ProxySimulationFault::NotAllowlisted => {
+            let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+            return;
+        }
+        lab_core::ProxySimulationFault::ConnectFailure => {
+            let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+            return;
+        }
+        lab_core::ProxySimulationFault::SlowResponse => {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        lab_core::ProxySimulationFault::Disconnect => return,
+        lab_core::ProxySimulationFault::None => {}
+    }
+    let source_port = state
+        .base_url()
+        .and_then(|value| Url::parse(&value).ok())
+        .and_then(|url| url.port_or_known_default())
+        .unwrap_or_default();
+    let (forward_request, path, source_id) = if is_connect {
+        if request.target != format!("127.0.0.1:{source_port}") {
+            let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+            return;
+        }
+        if client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        // This is deliberately a controlled CONNECT simulation, not a real
+        // TLS tunnel: the one request inside it stays plaintext so the server
+        // can enforce that it targets only a local plan-source endpoint.
+        let tunneled = match tokio::time::timeout(
+            Duration::from_millis(1_000),
+            read_proxy_request(&mut client),
+        )
+        .await
+        {
+            Ok(Ok(tunneled)) => tunneled,
+            _ => {
+                let _ = write_proxy_response(&mut client, 400, "Bad Request", None).await;
+                return;
+            }
+        };
+        if proxy_request_shape_reason(&tunneled).is_some()
+            || tunneled.method.eq_ignore_ascii_case("CONNECT")
+            || !tunneled.target.starts_with('/')
+        {
+            let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+            return;
+        }
+        let (path, source_id) = {
+            let tunneled_path = tunneled
+                .target
+                .split_once('?')
+                .map_or(tunneled.target.as_str(), |(path, _)| path);
+            let Some((_, source_id)) = plan_source_route(tunneled_path) else {
+                let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+                return;
+            };
+            (tunneled_path.to_owned(), source_id.to_owned())
+        };
+        (tunneled, path, source_id)
+    } else {
+        let target = match Url::parse(&request.target) {
+            Ok(target)
+                if target.host_str() == Some("127.0.0.1")
+                    && target.port_or_known_default() == Some(source_port)
+                    && plan_source_route(target.path()).is_some() =>
+            {
+                target
+            }
+            _ => {
+                let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+                return;
+            }
+        };
+        let (_, source_id) = plan_source_route(target.path()).expect("validated plan source route");
+        let mut path = target.path().to_owned();
+        if let Some(query) = target.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        (request, path, source_id.to_owned())
+    };
+    if !plan.network_path.allowlisted_sources.is_empty()
+        && !plan
+            .network_path
+            .allowlisted_sources
+            .iter()
+            .any(|allowed| allowed == &source_id)
+    {
+        let _ = write_proxy_response(&mut client, 403, "Forbidden", None).await;
+        return;
+    }
+    let mut source = match TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+            return;
+        }
+    };
+    let mut forwarded = format!(
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{source_port}\r\n",
+        forward_request.method, path
+    );
+    for (name, value) in &forward_request.headers {
+        let normalized = name.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "host"
+                | "connection"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "x-lab-proxy-capability"
+        ) {
+            continue;
+        }
+        forwarded.push_str(&format!("{name}: {value}\r\n"));
+    }
+    forwarded.push_str("x-lab-proxy-correlation: plan-local\r\nConnection: close\r\n\r\n");
+    if source.write_all(forwarded.as_bytes()).await.is_err()
+        || source.write_all(&forward_request.body).await.is_err()
+    {
+        return;
+    }
+    let mut response = Vec::new();
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_millis(1_000),
+            source.read_to_end(&mut response)
+        )
+        .await,
+        Ok(Ok(_))
+    ) || response.len() > MAX_PROXY_TUNNEL_BYTES.saturating_mul(16)
+    {
+        let _ = write_proxy_response(&mut client, 502, "Bad Gateway", None).await;
+        return;
+    }
+    let _ = client.write_all(&response).await;
 }
 
 async fn proxy_forward(
@@ -927,9 +1170,7 @@ fn quota_credential_identity(headers: &HeaderMap) -> String {
 fn quota_retry_after(profile: &QuotaProfile) -> String {
     match profile.retry_after_mode {
         RetryAfterMode::Seconds => profile.retry_after_ms.div_ceil(1_000).to_string(),
-        // Fixed synthetic time keeps reports/replays deterministic; clients get
-        // the exact virtual duration separately in x-lab-virtual-wait-ms.
-        RetryAfterMode::HttpDate => "Sat, 15 Aug 2026 00:00:01 GMT".to_owned(),
+        RetryAfterMode::HttpDate => virtual_http_date_after(profile.retry_after_ms),
     }
 }
 
@@ -1148,6 +1389,13 @@ async fn handle_request(State(state): State<LabState>, request: Request) -> Resp
 }
 
 fn request_body_limits(state: &LabState, method: &Method, path: &str) -> (usize, Duration) {
+    if path == "/api/plans"
+        || path == "/api/plans/validate"
+        || path == "/api/plans/import"
+        || path.starts_with("/api/plans/")
+    {
+        return (1024 * 1024, Duration::from_millis(1_000));
+    }
     if method == Method::POST
         && let Some((run_id, Some("submission"))) = run_route(path)
         && let Ok(loaded) = state.loaded_for_run(run_id)
@@ -1173,6 +1421,9 @@ async fn control_response(
     body: &[u8],
     base_url: &str,
 ) -> Option<Response> {
+    if let Some(response) = plan_response(state, method, path, body, base_url) {
+        return Some(response);
+    }
     if method == Method::POST && path == "/api/runs" {
         let request = match serde_json::from_slice::<CreateRunRequest>(body) {
             Ok(request) => request,
@@ -1286,6 +1537,318 @@ async fn control_response(
         _ => return None,
     };
     Some(json_response(StatusCode::OK, value))
+}
+
+fn plan_response(
+    state: &LabState,
+    method: &Method,
+    path: &str,
+    body: &[u8],
+    base_url: &str,
+) -> Option<Response> {
+    if method == Method::GET && path == "/api/plans" {
+        let runs = state.list_plan_runs();
+        let plans = state
+            .plan_store()
+            .list()
+            .into_iter()
+            .map(|plan| {
+                let latest = runs
+                    .iter()
+                    .filter(|run| run.manifest.plan_id == plan.plan_id)
+                    .max_by_key(|run| run.manifest.created_at);
+                json!({
+                    "schema_version": PLAN_SCHEMA_VERSION,
+                    "plan_id": plan.plan_id,
+                    "name": plan.name,
+                    "description": plan.description,
+                    "target_domain": plan.target_domain,
+                    "seed": plan.seed,
+                    "sources": plan.sources,
+                    "status": plan.status,
+                    "revision": plan.revision,
+                    "created_at": plan.created_at,
+                    "updated_at": plan.updated_at,
+                    "plan_digest": plan.plan_digest,
+                    "latest_run_status": latest.map(|run| run.report.status.clone()),
+                    "latest_run_id": latest.map(|run| run.manifest.run_id.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        return Some(json_response(
+            StatusCode::OK,
+            json!({"schema_version": PLAN_SCHEMA_VERSION, "plans": plans}),
+        ));
+    }
+    if method == Method::GET && path == "/api/plans/storage" {
+        return Some(match state.plan_store().storage_stats() {
+            Ok(stats) => json_response(
+                StatusCode::OK,
+                serde_json::to_value(stats).expect("plan storage stats are serializable"),
+            ),
+            Err(error) => plan_error_from_anyhow(error),
+        });
+    }
+    if method == Method::POST && path == "/api/plans/validate" {
+        return Some(match serde_json::from_slice::<ExperimentPlan>(body) {
+            Ok(plan) => json_response(
+                StatusCode::OK,
+                serde_json::to_value(validate_plan(plan, false))
+                    .expect("plan validation is serializable"),
+            ),
+            Err(error) => plan_error(
+                StatusCode::BAD_REQUEST,
+                "PLAN_JSON_INVALID",
+                format!("plan JSON is invalid: {error}"),
+            ),
+        });
+    }
+    if method == Method::POST && path == "/api/plans/import" {
+        return Some(match serde_json::from_slice::<ExperimentPlan>(body) {
+            Ok(plan) => match state.import_plan(plan) {
+                Ok(plan) => json_response(
+                    StatusCode::CREATED,
+                    json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
+                ),
+                Err(error) => plan_error_from_anyhow(error),
+            },
+            Err(error) => plan_error(
+                StatusCode::BAD_REQUEST,
+                "PLAN_JSON_INVALID",
+                format!("plan JSON is invalid: {error}"),
+            ),
+        });
+    }
+    if method == Method::POST && path == "/api/plans" {
+        return Some(match serde_json::from_slice::<ExperimentPlan>(body) {
+            Ok(plan) => match state.create_plan(plan) {
+                Ok(plan) => json_response(
+                    StatusCode::CREATED,
+                    json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
+                ),
+                Err(error) => plan_error_from_anyhow(error),
+            },
+            Err(error) => plan_error(
+                StatusCode::BAD_REQUEST,
+                "PLAN_JSON_INVALID",
+                format!("plan JSON is invalid: {error}"),
+            ),
+        });
+    }
+    if let Some(plan_id) = path.strip_prefix("/api/plans/") {
+        let mut segments = plan_id.split('/');
+        let plan_id = segments.next().unwrap_or_default();
+        let action = segments.next();
+        if segments.next().is_some() || plan_id.is_empty() {
+            return None;
+        }
+        match (method, action) {
+            (&Method::GET, None) => {
+                return Some(match state.plan_store().get(plan_id) {
+                    Some(plan) => json_response(
+                        StatusCode::OK,
+                        json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
+                    ),
+                    None => plan_error(
+                        StatusCode::NOT_FOUND,
+                        "PLAN_NOT_FOUND",
+                        format!("plan {plan_id} does not exist"),
+                    ),
+                });
+            }
+            (&Method::PUT, None) => {
+                return Some(match serde_json::from_slice::<ExperimentPlan>(body) {
+                    Ok(plan) => match state.update_plan(plan_id, plan) {
+                        Ok(plan) => json_response(
+                            StatusCode::OK,
+                            json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
+                        ),
+                        Err(error) => plan_error_from_anyhow(error),
+                    },
+                    Err(error) => plan_error(
+                        StatusCode::BAD_REQUEST,
+                        "PLAN_JSON_INVALID",
+                        format!("plan JSON is invalid: {error}"),
+                    ),
+                });
+            }
+            (&Method::DELETE, None) => {
+                return Some(match state.delete_plan(plan_id) {
+                    Ok(()) => json_response(
+                        StatusCode::OK,
+                        json!({"schema_version": PLAN_SCHEMA_VERSION, "deleted": true, "plan_id": plan_id}),
+                    ),
+                    Err(error) => plan_error_from_anyhow(error),
+                });
+            }
+            (&Method::POST, Some("archive")) => {
+                return Some(match state.archive_plan(plan_id) {
+                    Ok(plan) => json_response(
+                        StatusCode::OK,
+                        json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
+                    ),
+                    Err(error) => plan_error_from_anyhow(error),
+                });
+            }
+            (&Method::POST, Some("runs")) => {
+                return Some(match state.run_plan(plan_id) {
+                    Ok(run) => plan_run_response(state, StatusCode::CREATED, &run, base_url),
+                    Err(error) => plan_error_from_anyhow(error),
+                });
+            }
+            (&Method::POST, Some("simulate")) => {
+                return Some(match state.simulate_plan(plan_id) {
+                    Ok(run) => plan_run_response(state, StatusCode::CREATED, &run, base_url),
+                    Err(error) => plan_error_from_anyhow(error),
+                });
+            }
+            (&Method::POST, Some("export")) => {
+                return Some(match state.plan_store().get(plan_id) {
+                    Some(plan) => json_response(
+                        StatusCode::OK,
+                        json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
+                    ),
+                    None => plan_error(
+                        StatusCode::NOT_FOUND,
+                        "PLAN_NOT_FOUND",
+                        format!("plan {plan_id} does not exist"),
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    if let Some(run_path) = path.strip_prefix("/api/plan-runs/") {
+        let mut segments = run_path.split('/');
+        let run_id = segments.next().unwrap_or_default();
+        let action = segments.next();
+        if segments.next().is_some() || run_id.is_empty() {
+            return None;
+        }
+        match (method, action) {
+            (&Method::GET, None) => {
+                return Some(plan_run_lookup(
+                    state,
+                    run_id,
+                    |run| json!({"schema_version": PLAN_SCHEMA_VERSION, "manifest": run.manifest, "report": run.report}),
+                ));
+            }
+            (&Method::GET, Some("audit")) => {
+                return Some(plan_run_lookup(
+                    state,
+                    run_id,
+                    |run| json!({"schema_version": PLAN_SCHEMA_VERSION, "run_id": run_id, "entries": run.audit}),
+                ));
+            }
+            (&Method::GET, Some("report")) => {
+                return Some(plan_run_lookup(
+                    state,
+                    run_id,
+                    |run| json!({"schema_version": PLAN_SCHEMA_VERSION, "run_id": run_id, "report": run.report}),
+                ));
+            }
+            (&Method::GET, Some("manifest")) => {
+                return Some(plan_run_lookup(
+                    state,
+                    run_id,
+                    |run| json!({"schema_version": PLAN_SCHEMA_VERSION, "run_id": run_id, "manifest": run.manifest}),
+                ));
+            }
+            (&Method::POST, Some("replay")) => {
+                return Some(match state.replay_plan_run(run_id) {
+                    Ok(run) => plan_run_response(state, StatusCode::CREATED, &run, base_url),
+                    Err(error) => plan_error_from_anyhow(error),
+                });
+            }
+            (&Method::POST, Some("cancel")) => {
+                return Some(match state.cancel_plan_run(run_id) {
+                    Ok(run) => json_response(
+                        StatusCode::OK,
+                        json!({"schema_version": PLAN_SCHEMA_VERSION, "run_id": run_id, "cancelled": true, "report": run.report}),
+                    ),
+                    Err(error) => plan_error_from_anyhow(error),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn plan_run_response(
+    state: &LabState,
+    status: StatusCode,
+    run: &PlanRun,
+    base_url: &str,
+) -> Response {
+    let source_access = state.plan_run_access(&run.manifest.run_id).ok().map(|access| {
+        json!({
+            "available": true,
+            "expires_at": access.expires_at,
+            "source_url_template": format!("{base_url}/api/plan-runs/{}/sources/{{source_id}}", access.run_id),
+            "run_header_name": run.manifest.source_contract.run_header_name,
+            "run_id": access.run_id,
+            "source_capability_header": run.manifest.source_contract.source_capability_header,
+            "source_capability": access.source_capability,
+            "fake_api_key_header": run.manifest.source_contract.fake_api_key_header,
+            "fake_api_key": access.fake_api_key,
+            "network_mode": run.manifest.source_contract.network_mode,
+            "proxy_url": (run.manifest.source_contract.network_mode != PlanNetworkMode::Direct).then(|| state.proxy_url()).flatten(),
+        })
+    });
+    let mut response = json_response(
+        status,
+        json!({
+            "schema_version": PLAN_SCHEMA_VERSION,
+            "run_id": run.manifest.run_id,
+            "plan_id": run.manifest.plan_id,
+            "manifest": run.manifest,
+            "report": run.report,
+            "audit_url": format!("/api/plan-runs/{}/audit", run.manifest.run_id),
+            "report_url": format!("/api/plan-runs/{}/report", run.manifest.run_id),
+            "manifest_url": format!("/api/plan-runs/{}/manifest", run.manifest.run_id),
+            "source_access": source_access,
+        }),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn plan_run_lookup<F>(state: &LabState, run_id: &str, build: F) -> Response
+where
+    F: FnOnce(PlanRun) -> Value,
+{
+    match state.plan_run(run_id) {
+        Ok(run) => json_response(StatusCode::OK, build(run)),
+        Err(error) => plan_error_from_anyhow(error),
+    }
+}
+
+fn plan_error_from_anyhow(error: anyhow::Error) -> Response {
+    let message = error.to_string();
+    let (code, human) = message.split_once(": ").map_or(
+        ("PLAN_OPERATION_FAILED", message.as_str()),
+        |(code, human)| (code, human),
+    );
+    let status = match code {
+        "PLAN_NOT_FOUND" | "PLAN_RUN_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "PLAN_ALREADY_EXISTS" => StatusCode::CONFLICT,
+        "PLAN_ARCHIVED" | "PLAN_NOT_RUNNABLE" | "PLAN_DIGEST_MISMATCH" => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        _ => StatusCode::BAD_REQUEST,
+    };
+    plan_error(status, code, human)
+}
+
+fn plan_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    json_response(
+        status,
+        json!({"schema_version": PLAN_SCHEMA_VERSION, "error": {"code": code, "message": message.into()}}),
+    )
 }
 
 fn console_asset_response(method: &Method, path: &str) -> Option<Response> {
@@ -2270,6 +2833,548 @@ fn run_error_response(error: RunStateError) -> Response {
     json_response(status, json!({"error":error.message()}))
 }
 
+#[derive(Debug)]
+struct PlanSourceReply {
+    status: StatusCode,
+    body: Vec<u8>,
+    content_type: &'static str,
+    content_encoding: Option<&'static str>,
+    retry_after: Option<String>,
+    link: Option<String>,
+}
+
+fn plan_source_route(path: &str) -> Option<(&str, &str)> {
+    let path = path.strip_prefix("/api/plan-runs/")?;
+    let mut segments = path.split('/');
+    let run_id = segments.next()?;
+    (segments.next()? == "sources").then_some(())?;
+    let source_id = segments.next()?;
+    segments.next().is_none().then_some((run_id, source_id))
+}
+
+async fn plan_source_response(
+    state: &LabState,
+    method: &Method,
+    path: &str,
+    query: &BTreeMap<String, String>,
+    headers: &HeaderMap,
+    body: &[u8],
+    run_id: &str,
+) -> Response {
+    let Some((path_run_id, source_id)) = plan_source_route(path) else {
+        return plan_source_error(
+            StatusCode::NOT_FOUND,
+            "PLAN_SOURCE_ROUTE_NOT_FOUND",
+            "no local plan source matches this route",
+        );
+    };
+    if path_run_id != run_id {
+        return plan_source_error(
+            StatusCode::CONFLICT,
+            "PLAN_SOURCE_RUN_MISMATCH",
+            "x-lab-run-id must match the plan source route",
+        );
+    }
+    if !matches!(*method, Method::GET | Method::POST) {
+        return plan_source_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "PLAN_SOURCE_METHOD_INVALID",
+            "plan sources accept only GET or POST",
+        );
+    }
+    let source_capability = headers
+        .get("x-lab-source-capability")
+        .and_then(|value| value.to_str().ok());
+    let access = match state.authorize_plan_source(run_id, source_id, source_capability) {
+        Ok(access) => access,
+        Err(error) => return plan_source_error_from_anyhow(error),
+    };
+    let authentication = access
+        .source
+        .authentication
+        .as_ref()
+        .unwrap_or(&access.plan.authentication);
+    let pagination = access
+        .source
+        .pagination
+        .as_ref()
+        .unwrap_or(&access.plan.pagination);
+    let quota = access.source.quota.as_ref().unwrap_or(&access.plan.quota);
+    let page = plan_source_page(pagination, query, body);
+    let virtual_wait_ms = headers
+        .get("x-lab-client-virtual-wait-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut step = PlanRequestAuditStep {
+        request_number: access.request_number,
+        page: Some(page),
+        pagination_token: Some(plan_pagination_token(pagination, page)),
+        quota_consumed: quota.consume_per_page,
+        virtual_wait_ms,
+        authentication: authentication_outcome(authentication).to_owned(),
+        network_mode: access.plan.network_path.mode,
+        proxy_authentication: access.plan.network_path.proxy_authentication,
+        proxy_fault: access.plan.network_path.proxy_fault,
+        ..PlanRequestAuditStep::default()
+    };
+    if access.plan.network_path.mode != PlanNetworkMode::Direct
+        && !headers.contains_key("x-lab-proxy-correlation")
+    {
+        step.response_status = StatusCode::FORBIDDEN.as_u16();
+        step.rate_limit_reason = Some("proxy_required".to_owned());
+        let _ = state.record_plan_source_request(run_id, source_id, step);
+        return plan_source_error(
+            StatusCode::FORBIDDEN,
+            "PLAN_PROXY_REQUIRED",
+            "this plan source must be reached through its local proxy",
+        );
+    }
+    let supplied_key = match authentication.location {
+        AuthenticationLocation::Header => headers
+            .get("x-lab-plan-api-key")
+            .and_then(|value| value.to_str().ok()),
+        AuthenticationLocation::Query => query.get("api_key").map(String::as_str),
+    };
+    let authentication_rejected = match authentication.mode {
+        AuthenticationMode::None => false,
+        AuthenticationMode::FakeApiKey => supplied_key != access.fake_api_key.as_deref(),
+        AuthenticationMode::MissingKey | AuthenticationMode::WrongKey => true,
+    };
+    if authentication_rejected {
+        step.response_status = authentication.failure_status;
+        step.authentication = match authentication.mode {
+            AuthenticationMode::MissingKey => "missing_key_rejected".to_owned(),
+            AuthenticationMode::WrongKey => "wrong_key_rejected".to_owned(),
+            AuthenticationMode::FakeApiKey => "fake_key_rejected".to_owned(),
+            AuthenticationMode::None => "not_required".to_owned(),
+        };
+        let _ = state.record_plan_source_request(run_id, source_id, step);
+        return plan_source_error(
+            StatusCode::from_u16(authentication.failure_status).unwrap_or(StatusCode::UNAUTHORIZED),
+            "PLAN_AUTH_REJECTED",
+            "the simulated authentication mode rejected this request",
+        );
+    }
+    let quota_consumed = if quota.consume_per_page {
+        access.request_number
+    } else {
+        0
+    };
+    let rate_limit_reason = if quota.rate_limit_on_request == Some(access.request_number) {
+        Some("configured rate_limit_on_request".to_owned())
+    } else if quota_consumed > quota.request_budget {
+        Some("request_budget_exhausted".to_owned())
+    } else {
+        None
+    };
+    if let Some(reason) = rate_limit_reason {
+        let status = if reason == "configured rate_limit_on_request" {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            match quota.exhausted_behaviour {
+                QuotaExhaustedBehaviour::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+                QuotaExhaustedBehaviour::Forbidden => StatusCode::FORBIDDEN,
+                QuotaExhaustedBehaviour::EmptyResult => StatusCode::OK,
+            }
+        };
+        step.response_status = status.as_u16();
+        step.rate_limit_reason = Some(reason.clone());
+        step.retry_after =
+            (status == StatusCode::TOO_MANY_REQUESTS).then(|| retry_after_value(quota));
+        let retry_after = step.retry_after.clone();
+        let _ = state.record_plan_source_request(run_id, source_id, step);
+        if status == StatusCode::OK {
+            return plan_source_reply(PlanSourceReply {
+                status,
+                body: serde_json::to_vec(
+                    &json!({"schema_version": PLAN_SCHEMA_VERSION, "records": []}),
+                )
+                .expect("serializable local empty response"),
+                content_type: "application/json",
+                content_encoding: None,
+                retry_after: None,
+                link: None,
+            });
+        }
+        return plan_source_reply(PlanSourceReply {
+            status,
+            body: serde_json::to_vec(
+                &json!({"schema_version": PLAN_SCHEMA_VERSION, "error": reason}),
+            )
+            .expect("serializable local error"),
+            content_type: "application/json",
+            content_encoding: None,
+            retry_after,
+            link: None,
+        });
+    }
+    let faults = access
+        .source
+        .faults
+        .iter()
+        .chain(access.plan.faults.iter())
+        .collect::<Vec<_>>();
+    if let Some(fault) = faults.iter().find(|fault| fault.trigger_page == page) {
+        match state.consume_plan_fault(run_id, source_id, fault) {
+            Ok(true) => {
+                step.triggered_fault = Some(fault.kind);
+                let reply = plan_fault_reply(
+                    fault.kind,
+                    quota,
+                    &access.plan,
+                    &access.source,
+                    page,
+                    pagination,
+                );
+                step.response_status = reply.status.as_u16();
+                step.retry_after = reply.retry_after.clone();
+                if reply.status == StatusCode::TOO_MANY_REQUESTS {
+                    step.rate_limit_reason = Some("controlled status_429 fault".to_owned());
+                }
+                if fault.kind == PlanFaultKind::SlowResponse || fault.kind == PlanFaultKind::Timeout
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                let _ = state.record_plan_source_request(run_id, source_id, step);
+                return plan_source_reply(reply);
+            }
+            Ok(false) => {}
+            Err(error) => return plan_source_error_from_anyhow(error),
+        }
+    }
+    if page == 0 || page > pagination.total_pages || pagination.invalid_page == Some(page) {
+        step.response_status = StatusCode::BAD_REQUEST.as_u16();
+        step.rate_limit_reason = Some("invalid_pagination_token".to_owned());
+        let _ = state.record_plan_source_request(run_id, source_id, step);
+        return plan_source_error(
+            StatusCode::BAD_REQUEST,
+            "PLAN_PAGINATION_INVALID",
+            "the requested local page or cursor is invalid",
+        );
+    }
+    let reply = plan_success_reply(&access.plan, &access.source, page, pagination);
+    step.response_status = reply.status.as_u16();
+    let _ = state.record_plan_source_request(run_id, source_id, step);
+    plan_source_reply(reply)
+}
+
+fn plan_source_page(
+    pagination: &PlanPagination,
+    query: &BTreeMap<String, String>,
+    body: &[u8],
+) -> usize {
+    let from_value = |value: Option<&str>| {
+        value
+            .and_then(|value| value.strip_prefix("cursor-").or(Some(value)))
+            .and_then(|value| value.strip_prefix("page-").or(Some(value)))
+            .and_then(|value| value.strip_prefix("body-").or(Some(value)))
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    match pagination.mode {
+        PlanPaginationMode::None => 1,
+        PlanPaginationMode::Page | PlanPaginationMode::Link => {
+            from_value(query.get("page").map(String::as_str)).unwrap_or(1)
+        }
+        PlanPaginationMode::Offset => query
+            .get("offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|offset| offset / pagination.page_size.max(1) + 1)
+            .unwrap_or(1),
+        PlanPaginationMode::Cursor => {
+            from_value(query.get("cursor").map(String::as_str)).unwrap_or(1)
+        }
+        PlanPaginationMode::PostBody => serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("page")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .or_else(|| {
+                        value
+                            .get("cursor")
+                            .and_then(Value::as_str)
+                            .and_then(|value| from_value(Some(value)))
+                    })
+            })
+            .unwrap_or(1),
+    }
+}
+
+fn plan_pagination_token(pagination: &PlanPagination, page: usize) -> String {
+    match pagination.mode {
+        PlanPaginationMode::None => "single".to_owned(),
+        PlanPaginationMode::Page => page.to_string(),
+        PlanPaginationMode::Offset => page
+            .saturating_sub(1)
+            .saturating_mul(pagination.page_size)
+            .to_string(),
+        PlanPaginationMode::Cursor => format!("cursor-{page}"),
+        PlanPaginationMode::Link => format!("page-{page}"),
+        PlanPaginationMode::PostBody => format!("body-{page}"),
+    }
+}
+
+fn plan_success_reply(
+    plan: &ExperimentPlan,
+    source: &lab_core::PlanSource,
+    page: usize,
+    pagination: &PlanPagination,
+) -> PlanSourceReply {
+    let records = plan_source_page_records(plan, source, page, pagination.page_size);
+    let next_page =
+        (page < pagination.total_pages && pagination.next_page_exists).then_some(page + 1);
+    let mut link = next_page.map(|next| {
+        format!(
+            "</api/plan-runs/{{run_id}}/sources/{}?page={next}>; rel=\"next\"",
+            source.id
+        )
+    });
+    if pagination.empty_final_page_with_next && page == pagination.total_pages {
+        link = Some(format!(
+            "</api/plan-runs/{{run_id}}/sources/{}?page={}>; rel=\"next\"",
+            source.id,
+            page + 1
+        ));
+    }
+    let (body, content_type) = match source.template {
+        PlanSourceTemplate::GenericHtml => (
+            format!("<ul>{}</ul>", records.iter().map(|record| format!("<li>{record}</li>")).collect::<String>()).into_bytes(),
+            "text/html; charset=utf-8",
+        ),
+        PlanSourceTemplate::GenericCsv => (
+            format!("host\n{}\n", records.join("\n")).into_bytes(),
+            "text/csv; charset=utf-8",
+        ),
+        PlanSourceTemplate::GenericText => (records.join("\n").into_bytes(), "text/plain; charset=utf-8"),
+        PlanSourceTemplate::Archive | PlanSourceTemplate::UrlSearch | PlanSourceTemplate::SearchEngine => (
+            serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "captures": records.iter().map(|record| json!({"url": format!("https://{record}/")})).collect::<Vec<_>>(), "next_page": next_page})).expect("serializable local response"),
+            "application/json",
+        ),
+        PlanSourceTemplate::CodeSearch => (
+            serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "matches": records.iter().map(|record| json!({"snippet": format!("host = {record}")})).collect::<Vec<_>>(), "next_page": next_page})).expect("serializable local response"),
+            "application/json",
+        ),
+        PlanSourceTemplate::Organization => (
+            serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "domains": records.iter().map(|record| json!({"domain": record})).collect::<Vec<_>>(), "next_page": next_page})).expect("serializable local response"),
+            "application/json",
+        ),
+        PlanSourceTemplate::ThreatIntel => (
+            serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "indicators": records.iter().map(|record| json!({"hostname": record})).collect::<Vec<_>>(), "next_page": next_page})).expect("serializable local response"),
+            "application/json",
+        ),
+        PlanSourceTemplate::GenericJson | PlanSourceTemplate::CustomRest | PlanSourceTemplate::UserImport => (
+            serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "items": records.iter().map(|record| json!({"host": record})).collect::<Vec<_>>(), "next_page": next_page})).expect("serializable local response"),
+            "application/json",
+        ),
+        PlanSourceTemplate::Certificate | PlanSourceTemplate::PassiveDns => (
+            serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "records": records.iter().map(|record| json!({"name": record})).collect::<Vec<_>>(), "next_page": next_page})).expect("serializable local response"),
+            "application/json",
+        ),
+    };
+    PlanSourceReply {
+        status: StatusCode::OK,
+        body,
+        content_type,
+        content_encoding: None,
+        retry_after: None,
+        link,
+    }
+}
+
+fn plan_fault_reply(
+    kind: PlanFaultKind,
+    quota: &PlanQuota,
+    plan: &ExperimentPlan,
+    source: &lab_core::PlanSource,
+    page: usize,
+    pagination: &PlanPagination,
+) -> PlanSourceReply {
+    let success = || plan_success_reply(plan, source, page, pagination);
+    match kind {
+        PlanFaultKind::Status401 => plan_error_reply(StatusCode::UNAUTHORIZED, "controlled_401"),
+        PlanFaultKind::Status403 => plan_error_reply(StatusCode::FORBIDDEN, "controlled_403"),
+        PlanFaultKind::Status404 => plan_error_reply(StatusCode::NOT_FOUND, "controlled_404"),
+        PlanFaultKind::Status429 => PlanSourceReply {
+            retry_after: Some(retry_after_value(quota)),
+            ..plan_error_reply(StatusCode::TOO_MANY_REQUESTS, "controlled_429")
+        },
+        PlanFaultKind::Status500 => {
+            plan_error_reply(StatusCode::INTERNAL_SERVER_ERROR, "controlled_500")
+        }
+        PlanFaultKind::Status502 => plan_error_reply(StatusCode::BAD_GATEWAY, "controlled_502"),
+        PlanFaultKind::Status503 | PlanFaultKind::Timeout | PlanFaultKind::Disconnect => {
+            plan_error_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "controlled_transport_failure",
+            )
+        }
+        PlanFaultKind::EmptyResponse => PlanSourceReply {
+            status: StatusCode::OK,
+            body: Vec::new(),
+            content_type: "application/json",
+            content_encoding: None,
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::NoContent => PlanSourceReply {
+            status: StatusCode::NO_CONTENT,
+            body: Vec::new(),
+            content_type: "application/json",
+            content_encoding: None,
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::InvalidJson => PlanSourceReply {
+            status: StatusCode::OK,
+            body: b"{not-json".to_vec(),
+            content_type: "application/json",
+            content_encoding: None,
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::TruncatedJson => PlanSourceReply {
+            status: StatusCode::OK,
+            body: b"{\"items\":[".to_vec(),
+            content_type: "application/json",
+            content_encoding: None,
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::HtmlInsteadOfJson => PlanSourceReply {
+            status: StatusCode::OK,
+            body: b"<html><body>local controlled error</body></html>".to_vec(),
+            content_type: "text/html; charset=utf-8",
+            content_encoding: None,
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::WrongContentType => {
+            let mut reply = success();
+            reply.content_type = "text/plain; charset=utf-8";
+            reply
+        }
+        PlanFaultKind::WrongContentLength | PlanFaultKind::MalformedChunked => {
+            plan_error_reply(StatusCode::BAD_GATEWAY, "controlled_framing_failure")
+        }
+        PlanFaultKind::Gzip | PlanFaultKind::Deflate | PlanFaultKind::Brotli => {
+            plan_compressed_reply(kind, success())
+        }
+        PlanFaultKind::CorruptCompression => PlanSourceReply {
+            status: StatusCode::OK,
+            body: vec![0, 159, 255, 17],
+            content_type: "application/json",
+            content_encoding: Some("gzip"),
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::ResponseTooLarge => PlanSourceReply {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: vec![b'x'; 1024 * 1024],
+            content_type: "application/octet-stream",
+            content_encoding: None,
+            retry_after: None,
+            link: None,
+        },
+        PlanFaultKind::SlowResponse => success(),
+    }
+}
+
+fn plan_error_reply(status: StatusCode, error: &str) -> PlanSourceReply {
+    PlanSourceReply {
+        status,
+        body: serde_json::to_vec(&json!({"schema_version": PLAN_SCHEMA_VERSION, "error": error}))
+            .expect("serializable local error"),
+        content_type: "application/json",
+        content_encoding: None,
+        retry_after: None,
+        link: None,
+    }
+}
+
+fn plan_compressed_reply(kind: PlanFaultKind, mut reply: PlanSourceReply) -> PlanSourceReply {
+    let (encoding, body) = match kind {
+        PlanFaultKind::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&reply.body)
+                .expect("local gzip fixture encodes");
+            (
+                "gzip",
+                encoder.finish().expect("local gzip fixture finishes"),
+            )
+        }
+        PlanFaultKind::Deflate => {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&reply.body)
+                .expect("local deflate fixture encodes");
+            (
+                "deflate",
+                encoder.finish().expect("local deflate fixture finishes"),
+            )
+        }
+        PlanFaultKind::Brotli => {
+            let mut encoder = CompressorWriter::new(Vec::new(), 4 * 1024, 5, 22);
+            encoder
+                .write_all(&reply.body)
+                .expect("local brotli fixture encodes");
+            ("br", encoder.into_inner())
+        }
+        _ => return reply,
+    };
+    reply.body = body;
+    reply.content_encoding = Some(encoding);
+    reply
+}
+
+fn plan_source_reply(reply: PlanSourceReply) -> Response {
+    let mut builder = Response::builder()
+        .status(reply.status)
+        .header(header::CONTENT_TYPE, reply.content_type)
+        .header("cache-control", "no-store");
+    if let Some(content_encoding) = reply.content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, content_encoding);
+    }
+    if let Some(retry_after) = reply.retry_after {
+        builder = builder.header(header::RETRY_AFTER, retry_after);
+    }
+    if let Some(link) = reply.link {
+        builder = builder.header(header::LINK, link);
+    }
+    builder
+        .body(Body::from(reply.body))
+        .expect("static plan source response")
+}
+
+fn plan_source_error(status: StatusCode, code: &str, message: &str) -> Response {
+    let mut response = json_response(
+        status,
+        json!({"schema_version": PLAN_SCHEMA_VERSION, "error": {"code": code, "message": message}}),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn plan_source_error_from_anyhow(error: anyhow::Error) -> Response {
+    let message = error.to_string();
+    let (code, human) = message.split_once(": ").map_or(
+        ("PLAN_SOURCE_OPERATION_FAILED", message.as_str()),
+        |(code, human)| (code, human),
+    );
+    let status = match code {
+        "PLAN_RUN_NOT_FOUND" | "PLAN_SOURCE_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "PLAN_SOURCE_CAPABILITY_INVALID" => StatusCode::FORBIDDEN,
+        "PLAN_SOURCE_CAPABILITY_UNAVAILABLE" => StatusCode::GONE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    plan_source_error(status, code, human)
+}
+
 async fn scenario_response(
     state: LabState,
     method: Method,
@@ -2292,6 +3397,9 @@ async fn scenario_response(
             );
         }
     };
+    if plan_source_route(&path).is_some() {
+        return plan_source_response(&state, &method, &path, &query, &headers, &body, run_id).await;
+    }
     let run = match state.session(run_id) {
         Ok(run) => run,
         Err(error) => {
@@ -3604,11 +4712,18 @@ fn json_response(status: StatusCode, value: Value) -> Response {
 mod tests {
     use chrono::Utc;
     use lab_core::{
-        AuditRecord, EgressGuard, JudgeInput, LoadedScenario, ReferenceRunner, ReportStatus,
-        RunReport, ScenarioRepository, SourceStatus, judge_run,
+        AuditRecord, EgressGuard, ExperimentPlan, JudgeInput, LoadedScenario, PlanFault,
+        PlanFaultKind, PlanNetworkMode, ReferenceRunner, ReportStatus, RunReport,
+        ScenarioRepository, SourceStatus, judge_run,
     };
     use reqwest::{Client, StatusCode};
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use serde_json::json;
+    use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::PathBuf};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+    use url::Url;
     use uuid::Uuid;
 
     use super::{LocalServer, TemplateContext, materialize_text};
@@ -3616,6 +4731,13 @@ mod tests {
     fn repository() -> ScenarioRepository {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
         ScenarioRepository::load(root).expect("load scenarios")
+    }
+
+    fn plan_test_root(label: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-artifacts")
+            .join(format!("lab-server-{label}-{}", Uuid::new_v4().simple()))
+            .join("plans")
     }
 
     fn temporary_contract_repository() -> (ScenarioRepository, PathBuf) {
@@ -4253,6 +5375,546 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
     }
 
     #[tokio::test]
+    async fn plan_api_has_a_complete_local_lifecycle_and_replays_its_snapshot() {
+        let server =
+            LocalServer::spawn_with_plan_root(repository(), None, plan_test_root("plan-lifecycle"))
+                .await
+                .expect("server");
+        let client = Client::new();
+        let base_url = server.base_url();
+        let mut plan = ExperimentPlan::example();
+        plan.plan_id = format!("plan-api-{}", Uuid::new_v4().simple());
+        plan.authentication.mode = lab_core::AuthenticationMode::FakeApiKey;
+
+        let created: serde_json::Value = client
+            .post(format!("{base_url}/api/plans"))
+            .json(&plan)
+            .send()
+            .await
+            .expect("create plan")
+            .error_for_status()
+            .expect("created plan status")
+            .json()
+            .await
+            .expect("created plan JSON");
+        assert_eq!(created["schema_version"], "0.2");
+        let digest = created["plan"]["plan_digest"]
+            .as_str()
+            .expect("plan digest")
+            .to_owned();
+
+        let mut updated_plan = created["plan"].clone();
+        updated_plan["description"] = "Updated through the API lifecycle test".into();
+        let updated: serde_json::Value = client
+            .put(format!("{base_url}/api/plans/{}", plan.plan_id))
+            .json(&updated_plan)
+            .send()
+            .await
+            .expect("update plan")
+            .error_for_status()
+            .expect("update status")
+            .json()
+            .await
+            .expect("update JSON");
+        assert_eq!(updated["plan"]["revision"], 1);
+        assert_eq!(updated["plan"]["plan_digest"], digest);
+
+        let exported: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/export", plan.plan_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("export plan")
+            .error_for_status()
+            .expect("export status")
+            .json()
+            .await
+            .expect("export JSON");
+        assert_eq!(exported["plan"]["plan_digest"], digest);
+        let imported_id = format!("{}-import", plan.plan_id);
+        let mut imported_plan = exported["plan"].clone();
+        imported_plan["plan_id"] = imported_id.clone().into();
+        let imported: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/import"))
+            .json(&imported_plan)
+            .send()
+            .await
+            .expect("import plan")
+            .error_for_status()
+            .expect("import status")
+            .json()
+            .await
+            .expect("import JSON");
+        assert_eq!(imported["plan"]["plan_digest"], digest);
+
+        let run: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/runs", plan.plan_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("run plan")
+            .error_for_status()
+            .expect("run status")
+            .json()
+            .await
+            .expect("run JSON");
+        assert_eq!(run["report"]["status"], "passed");
+        assert_eq!(run["report"]["egress_attempted"], false);
+        assert_eq!(run["manifest"]["execution_mode"], "external_integration");
+        let run_id = run["run_id"].as_str().expect("run ID").to_owned();
+
+        let simulation: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/simulate", plan.plan_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("simulate plan")
+            .error_for_status()
+            .expect("simulation status")
+            .json()
+            .await
+            .expect("simulation JSON");
+        assert_eq!(simulation["manifest"]["execution_mode"], "local_simulation");
+        let audit: serde_json::Value = client
+            .get(format!("{base_url}/api/plan-runs/{run_id}/audit"))
+            .send()
+            .await
+            .expect("audit")
+            .error_for_status()
+            .expect("audit status")
+            .json()
+            .await
+            .expect("audit JSON");
+        assert_eq!(audit["entries"].as_array().map(Vec::len), Some(1));
+        assert!(audit["entries"][0]["expected_requests"].is_array());
+        assert!(audit["entries"][0]["actual_requests"].is_array());
+
+        let source_access = &run["source_access"];
+        let source_url = source_access["source_url_template"]
+            .as_str()
+            .expect("source URL template")
+            .replace("{source_id}", "certificate");
+        let capability = source_access["source_capability"]
+            .as_str()
+            .expect("ephemeral source capability");
+        let fake_key = source_access["fake_api_key"]
+            .as_str()
+            .expect("ephemeral fake API key");
+        let rejected = client
+            .get(&source_url)
+            .header("x-lab-run-id", &run_id)
+            .header("x-lab-source-capability", capability)
+            .send()
+            .await
+            .expect("missing fake key request");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let source_response = client
+            .get(source_url)
+            .header("x-lab-run-id", &run_id)
+            .header("x-lab-source-capability", capability)
+            .header("x-lab-plan-api-key", fake_key)
+            .send()
+            .await
+            .expect("local plan source")
+            .error_for_status()
+            .expect("source status");
+        assert_eq!(
+            source_response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let source: serde_json::Value = source_response.json().await.expect("source JSON");
+        assert_eq!(source["schema_version"], "0.2");
+        assert!(source["records"].is_array());
+        let source_audit: serde_json::Value = client
+            .get(format!("{base_url}/api/plan-runs/{run_id}/audit"))
+            .send()
+            .await
+            .expect("updated audit")
+            .error_for_status()
+            .expect("updated audit status")
+            .json()
+            .await
+            .expect("updated audit JSON");
+        assert_eq!(
+            source_audit["entries"][0]["actual_requests"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        let manifest: serde_json::Value = client
+            .get(format!("{base_url}/api/plan-runs/{run_id}/manifest"))
+            .send()
+            .await
+            .expect("plan manifest")
+            .error_for_status()
+            .expect("plan manifest status")
+            .json()
+            .await
+            .expect("plan manifest JSON");
+        assert!(manifest["manifest"].get("source_capability").is_none());
+        assert!(!manifest.to_string().contains(capability));
+
+        let cancelled = client
+            .post(format!("{base_url}/api/plan-runs/{run_id}/cancel"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("cancel plan source");
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let stale = client
+            .get(
+                source_access["source_url_template"]
+                    .as_str()
+                    .expect("source URL")
+                    .replace("{source_id}", "certificate"),
+            )
+            .header("x-lab-run-id", &run_id)
+            .header("x-lab-source-capability", capability)
+            .send()
+            .await
+            .expect("stale plan source");
+        assert_eq!(stale.status(), StatusCode::GONE);
+
+        let replay: serde_json::Value = client
+            .post(format!("{base_url}/api/plan-runs/{run_id}/replay"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("replay")
+            .error_for_status()
+            .expect("replay status")
+            .json()
+            .await
+            .expect("replay JSON");
+        assert_eq!(
+            replay["report"]["fixture_digest"],
+            run["report"]["fixture_digest"]
+        );
+        assert_eq!(
+            replay["report"]["truth_digest"],
+            run["report"]["truth_digest"]
+        );
+        assert_eq!(replay["manifest"]["replayed_from"], run_id);
+        assert_eq!(replay["manifest"]["execution_mode"], "external_integration");
+
+        let storage: serde_json::Value = client
+            .get(format!("{base_url}/api/plans/storage"))
+            .send()
+            .await
+            .expect("storage diagnostics")
+            .error_for_status()
+            .expect("storage status")
+            .json()
+            .await
+            .expect("storage JSON");
+        assert_eq!(storage["plan_count"], 2);
+        assert!(storage["run_count"].as_u64().unwrap_or_default() >= 3);
+
+        let archived: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/archive", plan.plan_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("archive plan")
+            .error_for_status()
+            .expect("archive status")
+            .json()
+            .await
+            .expect("archive JSON");
+        assert_eq!(archived["plan"]["status"], "archived");
+        assert_eq!(archived["plan"]["revision"], 2);
+        let archived_run = client
+            .post(format!("{base_url}/api/plans/{}/runs", plan.plan_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("archived plan run rejection");
+        assert_eq!(archived_run.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            archived_run
+                .text()
+                .await
+                .expect("archived run error body")
+                .contains("PLAN_ARCHIVED")
+        );
+
+        client
+            .delete(format!("{base_url}/api/plans/{}", plan.plan_id))
+            .send()
+            .await
+            .expect("delete plan")
+            .error_for_status()
+            .expect("delete status");
+        client
+            .delete(format!("{base_url}/api/plans/{imported_id}"))
+            .send()
+            .await
+            .expect("delete imported plan")
+            .error_for_status()
+            .expect("delete imported status");
+        let retained_manifest = client
+            .get(format!("{base_url}/api/plan-runs/{run_id}"))
+            .send()
+            .await
+            .expect("retained run manifest");
+        assert_eq!(retained_manifest.status(), StatusCode::OK);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plan_source_fault_occurrences_and_compression_are_runtime_bounded() {
+        let server =
+            LocalServer::spawn_with_plan_root(repository(), None, plan_test_root("plan-faults"))
+                .await
+                .expect("server");
+        let client = Client::new();
+        let base_url = server.base_url();
+        let mut plan = ExperimentPlan::example();
+        plan.plan_id = format!("plan-faults-{}", Uuid::new_v4().simple());
+        plan.sources[0].faults.push(PlanFault {
+            kind: PlanFaultKind::Status503,
+            trigger_page: 1,
+            occurrences: 1,
+        });
+        let mut gzip_source = plan.sources[0].clone();
+        gzip_source.id = "gzip".to_owned();
+        gzip_source.faults = vec![PlanFault {
+            kind: PlanFaultKind::Gzip,
+            trigger_page: 1,
+            occurrences: 1,
+        }];
+        plan.sources.push(gzip_source);
+        client
+            .post(format!("{base_url}/api/plans"))
+            .json(&plan)
+            .send()
+            .await
+            .expect("create fault plan")
+            .error_for_status()
+            .expect("fault plan status");
+        let run: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/runs", plan.plan_id))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("run fault plan")
+            .error_for_status()
+            .expect("fault run status")
+            .json()
+            .await
+            .expect("fault run JSON");
+        let run_id = run["run_id"].as_str().expect("fault run ID");
+        let capability = run["source_access"]["source_capability"]
+            .as_str()
+            .expect("fault capability");
+        let source_url = run["source_access"]["source_url_template"]
+            .as_str()
+            .expect("fault source URL")
+            .replace("{source_id}", "certificate");
+        let first = client
+            .get(&source_url)
+            .header("x-lab-run-id", run_id)
+            .header("x-lab-source-capability", capability)
+            .send()
+            .await
+            .expect("first controlled fault request");
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let recovered: serde_json::Value = client
+            .get(&source_url)
+            .header("x-lab-run-id", run_id)
+            .header("x-lab-source-capability", capability)
+            .send()
+            .await
+            .expect("retry after one-shot fault")
+            .error_for_status()
+            .expect("recovered source status")
+            .json()
+            .await
+            .expect("recovered source JSON");
+        assert_eq!(recovered["schema_version"], "0.2");
+
+        let gzip_url = run["source_access"]["source_url_template"]
+            .as_str()
+            .expect("gzip source URL")
+            .replace("{source_id}", "gzip");
+        let gzip_target = Url::parse(&gzip_url).expect("gzip URL");
+        let gzip_port = gzip_target
+            .port_or_known_default()
+            .expect("gzip source port");
+        let mut gzip_stream = TcpStream::connect((Ipv4Addr::LOCALHOST, gzip_port))
+            .await
+            .expect("connect gzip plan source");
+        let gzip_request = format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{gzip_port}\r\nx-lab-run-id: {run_id}\r\nx-lab-source-capability: {capability}\r\nConnection: close\r\n\r\n",
+            gzip_target.path()
+        );
+        gzip_stream
+            .write_all(gzip_request.as_bytes())
+            .await
+            .expect("request compressed source");
+        let mut gzip_response = Vec::new();
+        gzip_stream
+            .read_to_end(&mut gzip_response)
+            .await
+            .expect("read compressed source");
+        let header_end = gzip_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("compressed response headers")
+            + 4;
+        let gzip_headers =
+            String::from_utf8_lossy(&gzip_response[..header_end]).to_ascii_lowercase();
+        assert!(gzip_headers.starts_with("http/1.1 200"));
+        assert!(gzip_headers.contains("content-encoding: gzip"));
+        assert!(gzip_headers.contains("cache-control: no-store"));
+        assert!(gzip_response[header_end..].starts_with(&[0x1f, 0x8b]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plan_sources_use_the_loopback_http_proxy_and_connect_contracts() {
+        let server =
+            LocalServer::spawn_with_plan_root(repository(), None, plan_test_root("plan-proxy"))
+                .await
+                .expect("server");
+        let client = Client::new();
+        let base_url = server.base_url();
+        let proxy_port = Url::parse(&server.proxy_url())
+            .expect("proxy URL")
+            .port_or_known_default()
+            .expect("proxy port");
+
+        let mut http_plan = ExperimentPlan::example();
+        http_plan.plan_id = format!("plan-http-proxy-{}", Uuid::new_v4().simple());
+        http_plan.network_path.mode = PlanNetworkMode::HttpProxy;
+        http_plan.network_path.proxy_authentication = lab_core::ProxyAuthentication::Succeeds;
+        client
+            .post(format!("{base_url}/api/plans"))
+            .json(&http_plan)
+            .send()
+            .await
+            .expect("create HTTP proxy plan")
+            .error_for_status()
+            .expect("HTTP proxy plan status");
+        let run: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/runs", http_plan.plan_id))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("run HTTP proxy plan")
+            .error_for_status()
+            .expect("HTTP proxy run status")
+            .json()
+            .await
+            .expect("HTTP proxy run JSON");
+        let run_id = run["run_id"].as_str().expect("run ID");
+        let access = &run["source_access"];
+        let source_url = access["source_url_template"]
+            .as_str()
+            .expect("source URL")
+            .replace("{source_id}", "certificate");
+        let capability = access["source_capability"]
+            .as_str()
+            .expect("source capability");
+        let direct = client
+            .get(&source_url)
+            .header("x-lab-run-id", run_id)
+            .header("x-lab-source-capability", capability)
+            .send()
+            .await
+            .expect("direct source request");
+        assert_eq!(direct.status(), StatusCode::FORBIDDEN);
+
+        let mut proxy = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port))
+            .await
+            .expect("connect local proxy");
+        let request = format!(
+            "GET {source_url} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-lab-run-id: {run_id}\r\nx-lab-source-capability: {capability}\r\nProxy-Authorization: Lab {capability}\r\nx-lab-proxy-capability: {capability}\r\nConnection: close\r\n\r\n"
+        );
+        proxy
+            .write_all(request.as_bytes())
+            .await
+            .expect("write proxied source request");
+        let mut forwarded = Vec::new();
+        proxy
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read proxied source response");
+        assert!(String::from_utf8_lossy(&forwarded).starts_with("HTTP/1.1 200"));
+
+        let mut connect_plan = ExperimentPlan::example();
+        connect_plan.plan_id = format!("plan-connect-{}", Uuid::new_v4().simple());
+        connect_plan.network_path.mode = PlanNetworkMode::Connect;
+        client
+            .post(format!("{base_url}/api/plans"))
+            .json(&connect_plan)
+            .send()
+            .await
+            .expect("create CONNECT plan")
+            .error_for_status()
+            .expect("CONNECT plan status");
+        let connect_run: serde_json::Value = client
+            .post(format!(
+                "{base_url}/api/plans/{}/runs",
+                connect_plan.plan_id
+            ))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("run CONNECT plan")
+            .error_for_status()
+            .expect("CONNECT run status")
+            .json()
+            .await
+            .expect("CONNECT run JSON");
+        let connect_id = connect_run["run_id"].as_str().expect("CONNECT run ID");
+        let connect_capability = connect_run["source_access"]["source_capability"]
+            .as_str()
+            .expect("CONNECT capability");
+        let source_port = Url::parse(&base_url)
+            .expect("source URL")
+            .port_or_known_default()
+            .expect("source port");
+        let mut tunnel = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port))
+            .await
+            .expect("connect local proxy for CONNECT");
+        let connect_request = format!(
+            "CONNECT 127.0.0.1:{source_port} HTTP/1.1\r\nHost: 127.0.0.1:{source_port}\r\nx-lab-run-id: {connect_id}\r\nx-lab-source-capability: {connect_capability}\r\nConnection: close\r\n\r\n"
+        );
+        tunnel
+            .write_all(connect_request.as_bytes())
+            .await
+            .expect("write CONNECT request");
+        let mut established = [0_u8; 256];
+        let established_count = tunnel
+            .read(&mut established)
+            .await
+            .expect("read CONNECT establishment");
+        let connected = String::from_utf8_lossy(&established[..established_count]);
+        assert!(connected.starts_with("HTTP/1.1 200"));
+        let tunneled_source_request = format!(
+            "GET /api/plan-runs/{connect_id}/sources/certificate HTTP/1.1\r\nHost: 127.0.0.1:{source_port}\r\nx-lab-run-id: {connect_id}\r\nx-lab-source-capability: {connect_capability}\r\nConnection: close\r\n\r\n"
+        );
+        tunnel
+            .write_all(tunneled_source_request.as_bytes())
+            .await
+            .expect("write controlled request through CONNECT");
+        tunnel.shutdown().await.expect("finish CONNECT request");
+        let mut connected_source = Vec::new();
+        tunnel
+            .read_to_end(&mut connected_source)
+            .await
+            .expect("read CONNECT source response");
+        let connected_source = String::from_utf8_lossy(&connected_source);
+        assert!(connected_source.starts_with("HTTP/1.1 200"));
+        assert!(connected_source.contains("\"schema_version\":\"0.2\""));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn console_workflow_is_loopback_only_bilingual_and_redacted() {
         let repository = repository();
         assert!(
@@ -4285,6 +5947,15 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
                 .expect("console HTML")
                 .contains("/console/app.js")
         );
+        let console_html = client
+            .get(format!("{base_url}/console/"))
+            .send()
+            .await
+            .expect("console page second read")
+            .text()
+            .await
+            .expect("console HTML second read");
+        assert!(console_html.contains("/console/plans.js"));
         let script = client
             .get(format!("{base_url}/console/app.js"))
             .send()
@@ -4295,6 +5966,16 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .expect("script text");
         assert!(!script.contains("https://"));
         assert!(!script.contains("fetch(\"http"));
+        let plans_script = client
+            .get(format!("{base_url}/console/plans.js"))
+            .send()
+            .await
+            .expect("plan console script")
+            .text()
+            .await
+            .expect("plan console script text");
+        assert!(!plans_script.contains("https://"));
+        assert!(!plans_script.contains("http://"));
 
         let overview: serde_json::Value = client
             .get(format!("{base_url}/api/console/overview"))
