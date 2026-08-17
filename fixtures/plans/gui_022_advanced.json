@@ -1,0 +1,106 @@
+{
+  "schema_version": "0.2",
+  "plan_id": "plan_gui_022_advanced",
+  "name": "GUI 0.2.2 advanced round-trip plan",
+  "description": "Exercises multiple plan faults, 403 authentication, and source-level overrides without any external address or credential.",
+  "target_domain": "advanced.acme.test",
+  "seed": 20260817,
+  "sources": [
+    {
+      "id": "certificate-1",
+      "template": "certificate",
+      "enabled": true,
+      "authentication": {
+        "mode": "fake_api_key",
+        "location": "header",
+        "failure_status": 403
+      },
+      "quota": {
+        "request_budget": 11,
+        "consume_per_page": true,
+        "allow_burst": false,
+        "rate_limit_on_request": null,
+        "retry_after_seconds": 2,
+        "retry_after_format": "http_date",
+        "cooldown_seconds": 0,
+        "exhausted_behaviour": "rate_limited"
+      },
+      "pagination": {
+        "mode": "page",
+        "page_size": 10,
+        "total_pages": 2,
+        "next_page_exists": true,
+        "repeat_from_page": null,
+        "duplicate_ratio_percent": 0,
+        "cursor_loop": false,
+        "invalid_page": null,
+        "empty_final_page_with_next": false
+      },
+      "faults": [
+        {
+          "kind": "timeout",
+          "trigger_page": 2,
+          "occurrences": 1
+        }
+      ]
+    }
+  ],
+  "authentication": {
+    "mode": "fake_api_key",
+    "location": "query",
+    "failure_status": 403
+  },
+  "quota": {
+    "request_budget": 100,
+    "consume_per_page": true,
+    "allow_burst": false,
+    "rate_limit_on_request": null,
+    "retry_after_seconds": 1,
+    "retry_after_format": "seconds",
+    "cooldown_seconds": 0,
+    "exhausted_behaviour": "rate_limited"
+  },
+  "pagination": {
+    "mode": "page",
+    "page_size": 25,
+    "total_pages": 2,
+    "next_page_exists": true,
+    "repeat_from_page": null,
+    "duplicate_ratio_percent": 0,
+    "cursor_loop": false,
+    "invalid_page": null,
+    "empty_final_page_with_next": false
+  },
+  "network_path": {
+    "mode": "direct",
+    "proxy_authentication": "not_required",
+    "proxy_fault": "none",
+    "allowlisted_sources": []
+  },
+  "faults": [
+    {
+      "kind": "status429",
+      "trigger_page": 1,
+      "occurrences": 2
+    },
+    {
+      "kind": "status503",
+      "trigger_page": 2,
+      "occurrences": 1
+    }
+  ],
+  "dataset": {
+    "size": "medium"
+  },
+  "expected_behaviour": {
+    "expected_fqdns": [],
+    "forbidden_fqdns": [],
+    "filtered_candidates": [],
+    "expected_requests_per_source": {},
+    "allow_partial_success": true,
+    "require_evidence": false
+  },
+  "status": "runnable",
+  "revision": 0,
+  "plan_digest": ""
+}

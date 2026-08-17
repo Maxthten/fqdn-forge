@@ -77,13 +77,22 @@ impl LocalServer {
         Self::spawn_inner(repository, active, port, None).await
     }
 
+    pub async fn spawn_on_with_plan_root(
+        repository: ScenarioRepository,
+        active: Option<&str>,
+        port: Option<u16>,
+        plan_root: PathBuf,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(repository, active, port, Some(plan_root)).await
+    }
+
     #[cfg(test)]
     async fn spawn_with_plan_root(
         repository: ScenarioRepository,
         active: Option<&str>,
         plan_root: PathBuf,
     ) -> Result<Self, String> {
-        Self::spawn_inner(repository, active, None, Some(plan_root)).await
+        Self::spawn_on_with_plan_root(repository, active, None, plan_root).await
     }
 
     async fn spawn_inner(
@@ -1421,7 +1430,7 @@ async fn control_response(
     body: &[u8],
     base_url: &str,
 ) -> Option<Response> {
-    if let Some(response) = plan_response(state, method, path, body, base_url) {
+    if let Some(response) = plan_response(state, method, path, headers, body, base_url) {
         return Some(response);
     }
     if method == Method::POST && path == "/api/runs" {
@@ -1543,6 +1552,7 @@ fn plan_response(
     state: &LabState,
     method: &Method,
     path: &str,
+    headers: &HeaderMap,
     body: &[u8],
     base_url: &str,
 ) -> Option<Response> {
@@ -1658,7 +1668,11 @@ fn plan_response(
             }
             (&Method::PUT, None) => {
                 return Some(match serde_json::from_slice::<ExperimentPlan>(body) {
-                    Ok(plan) => match state.update_plan(plan_id, plan) {
+                    Ok(plan) => match state.plan_store().update_if_revision(
+                        plan_id,
+                        plan,
+                        expected_plan_revision(headers),
+                    ) {
                         Ok(plan) => json_response(
                             StatusCode::OK,
                             json!({"schema_version": PLAN_SCHEMA_VERSION, "plan": plan}),
@@ -1692,13 +1706,25 @@ fn plan_response(
             }
             (&Method::POST, Some("runs")) => {
                 return Some(match state.run_plan(plan_id) {
-                    Ok(run) => plan_run_response(state, StatusCode::CREATED, &run, base_url),
+                    Ok(run) => plan_run_response(
+                        state,
+                        StatusCode::CREATED,
+                        &run,
+                        base_url,
+                        !is_console_request(headers),
+                    ),
                     Err(error) => plan_error_from_anyhow(error),
                 });
             }
             (&Method::POST, Some("simulate")) => {
                 return Some(match state.simulate_plan(plan_id) {
-                    Ok(run) => plan_run_response(state, StatusCode::CREATED, &run, base_url),
+                    Ok(run) => plan_run_response(
+                        state,
+                        StatusCode::CREATED,
+                        &run,
+                        base_url,
+                        !is_console_request(headers),
+                    ),
                     Err(error) => plan_error_from_anyhow(error),
                 });
             }
@@ -1756,7 +1782,13 @@ fn plan_response(
             }
             (&Method::POST, Some("replay")) => {
                 return Some(match state.replay_plan_run(run_id) {
-                    Ok(run) => plan_run_response(state, StatusCode::CREATED, &run, base_url),
+                    Ok(run) => plan_run_response(
+                        state,
+                        StatusCode::CREATED,
+                        &run,
+                        base_url,
+                        !is_console_request(headers),
+                    ),
                     Err(error) => plan_error_from_anyhow(error),
                 });
             }
@@ -1780,21 +1812,31 @@ fn plan_run_response(
     status: StatusCode,
     run: &PlanRun,
     base_url: &str,
+    include_source_credentials: bool,
 ) -> Response {
     let source_access = state.plan_run_access(&run.manifest.run_id).ok().map(|access| {
-        json!({
+        let base = json!({
             "available": true,
             "expires_at": access.expires_at,
             "source_url_template": format!("{base_url}/api/plan-runs/{}/sources/{{source_id}}", access.run_id),
             "run_header_name": run.manifest.source_contract.run_header_name,
             "run_id": access.run_id,
             "source_capability_header": run.manifest.source_contract.source_capability_header,
-            "source_capability": access.source_capability,
             "fake_api_key_header": run.manifest.source_contract.fake_api_key_header,
-            "fake_api_key": access.fake_api_key,
             "network_mode": run.manifest.source_contract.network_mode,
             "proxy_url": (run.manifest.source_contract.network_mode != PlanNetworkMode::Direct).then(|| state.proxy_url()).flatten(),
-        })
+        });
+        if include_source_credentials {
+            let mut access_with_credentials = base;
+            let access_object = access_with_credentials
+                .as_object_mut()
+                .expect("plan source access must be an object");
+            access_object.insert("source_capability".to_owned(), json!(access.source_capability));
+            access_object.insert("fake_api_key".to_owned(), json!(access.fake_api_key));
+            access_with_credentials
+        } else {
+            base
+        }
     });
     let mut response = json_response(
         status,
@@ -1817,6 +1859,13 @@ fn plan_run_response(
     response
 }
 
+fn is_console_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-fqdn-console-request")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1")
+}
+
 fn plan_run_lookup<F>(state: &LabState, run_id: &str, build: F) -> Response
 where
     F: FnOnce(PlanRun) -> Value,
@@ -1835,13 +1884,22 @@ fn plan_error_from_anyhow(error: anyhow::Error) -> Response {
     );
     let status = match code {
         "PLAN_NOT_FOUND" | "PLAN_RUN_NOT_FOUND" => StatusCode::NOT_FOUND,
-        "PLAN_ALREADY_EXISTS" => StatusCode::CONFLICT,
+        "PLAN_ALREADY_EXISTS" | "PLAN_REVISION_CONFLICT" => StatusCode::CONFLICT,
         "PLAN_ARCHIVED" | "PLAN_NOT_RUNNABLE" | "PLAN_DIGEST_MISMATCH" => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
         _ => StatusCode::BAD_REQUEST,
     };
     plan_error(status, code, human)
+}
+
+fn expected_plan_revision(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::IF_MATCH)
+        .or_else(|| headers.get("x-fqdn-plan-revision"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
 }
 
 fn plan_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -1862,6 +1920,15 @@ fn console_asset_response(method: &Method, path: &str) -> Option<Response> {
                 .header(header::LOCATION, "/console/")
                 .body(Body::empty())
                 .expect("static console redirect"),
+        );
+    }
+    if path == "/favicon.ico" {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, "public, max-age=86400")
+                .body(Body::empty())
+                .expect("empty favicon response"),
         );
     }
     let asset = lab_console::asset(path)?;
@@ -5419,6 +5486,19 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert_eq!(updated["plan"]["revision"], 1);
         assert_eq!(updated["plan"]["plan_digest"], digest);
 
+        let mut stale_plan = created["plan"].clone();
+        stale_plan["description"] = "Stale browser draft".into();
+        let stale = client
+            .put(format!("{base_url}/api/plans/{}", plan.plan_id))
+            .header("if-match", "\"0\"")
+            .json(&stale_plan)
+            .send()
+            .await
+            .expect("stale conditional update response");
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale: serde_json::Value = stale.json().await.expect("stale update JSON");
+        assert_eq!(stale["error"]["code"], "PLAN_REVISION_CONFLICT");
+
         let exported: serde_json::Value = client
             .post(format!("{base_url}/api/plans/{}/export", plan.plan_id))
             .json(&serde_json::json!({}))
@@ -5462,6 +5542,26 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
         assert_eq!(run["report"]["egress_attempted"], false);
         assert_eq!(run["manifest"]["execution_mode"], "external_integration");
         let run_id = run["run_id"].as_str().expect("run ID").to_owned();
+
+        let console_run: serde_json::Value = client
+            .post(format!("{base_url}/api/plans/{}/runs", plan.plan_id))
+            .header("x-fqdn-console-request", "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("console run plan")
+            .error_for_status()
+            .expect("console run status")
+            .json()
+            .await
+            .expect("console run JSON");
+        assert_eq!(console_run["source_access"]["available"], true);
+        assert!(
+            console_run["source_access"]
+                .get("source_capability")
+                .is_none()
+        );
+        assert!(console_run["source_access"].get("fake_api_key").is_none());
 
         let simulation: serde_json::Value = client
             .post(format!("{base_url}/api/plans/{}/simulate", plan.plan_id))
@@ -5956,6 +6056,12 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("console HTML second read");
         assert!(console_html.contains("/console/plans.js"));
+        let favicon = client
+            .get(format!("{base_url}/favicon.ico"))
+            .send()
+            .await
+            .expect("favicon response");
+        assert_eq!(favicon.status(), StatusCode::NO_CONTENT);
         let script = client
             .get(format!("{base_url}/console/app.js"))
             .send()

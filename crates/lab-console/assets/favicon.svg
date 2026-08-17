@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="FQDN Forge">
+  <rect width="64" height="64" rx="12" fill="#15233d"/>
+  <path d="M15 17h34v8H24v7h19v8H24v15h-9z" fill="#ffffff"/>
+  <circle cx="48" cy="45" r="6" fill="#66b2ff"/>
+</svg>

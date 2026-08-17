@@ -763,12 +763,33 @@ impl PlanStore {
         Ok(canonical)
     }
 
-    pub fn update(&self, plan_id: &str, mut plan: ExperimentPlan) -> Result<ExperimentPlan> {
+    pub fn update(&self, plan_id: &str, plan: ExperimentPlan) -> Result<ExperimentPlan> {
+        self.update_if_revision(plan_id, plan, None)
+    }
+
+    /// Updates a plan while optionally enforcing the revision the caller last
+    /// observed.  CLI and existing API consumers may continue to omit the
+    /// revision; interactive clients use it to avoid silently overwriting a
+    /// concurrent edit.
+    pub fn update_if_revision(
+        &self,
+        plan_id: &str,
+        mut plan: ExperimentPlan,
+        expected_revision: Option<u64>,
+    ) -> Result<ExperimentPlan> {
         let mut plans = self.plans.lock().expect("plan store lock poisoned");
         let prior = plans
             .get(plan_id)
             .cloned()
             .ok_or_else(|| anyhow!("PLAN_NOT_FOUND: plan {plan_id} does not exist"))?;
+        if let Some(expected_revision) = expected_revision
+            && prior.revision != expected_revision
+        {
+            bail!(
+                "PLAN_REVISION_CONFLICT: plan {plan_id} is revision {}, not {expected_revision}",
+                prior.revision
+            );
+        }
         plan.plan_id = plan_id.to_owned();
         plan.created_at = prior.created_at;
         plan.revision = prior.revision.saturating_add(1);
@@ -1991,6 +2012,74 @@ mod tests {
             .delete(&created.plan_id)
             .expect_err("missing plan is stable");
         assert!(error.to_string().contains("PLAN_NOT_FOUND"));
+    }
+
+    #[test]
+    fn plan_store_rejects_a_stale_revision_without_mutating_the_plan() {
+        let store = test_plan_store("revision-conflict");
+        let mut plan = ExperimentPlan::example();
+        plan.plan_id = format!("plan-revision-{}", Uuid::new_v4().simple());
+        let created = store.create(plan).expect("create plan");
+
+        let mut first_update = created.clone();
+        first_update.name = "First concurrent update".to_owned();
+        let updated = store
+            .update_if_revision(&created.plan_id, first_update, Some(created.revision))
+            .expect("first conditional update");
+        assert_eq!(updated.revision, created.revision + 1);
+
+        let mut stale_update = created.clone();
+        stale_update.name = "Stale update must not win".to_owned();
+        let error = store
+            .update_if_revision(&created.plan_id, stale_update, Some(created.revision))
+            .expect_err("stale revision is rejected");
+        assert!(error.to_string().contains("PLAN_REVISION_CONFLICT"));
+
+        let retained = store.get(&created.plan_id).expect("retained plan");
+        assert_eq!(retained.name, "First concurrent update");
+        assert_eq!(retained.revision, updated.revision);
+    }
+
+    #[test]
+    fn gui_022_advanced_fixture_survives_a_name_only_round_trip() {
+        let fixture: ExperimentPlan = serde_json::from_slice(include_bytes!(
+            "../../../fixtures/plans/gui_022_advanced.json"
+        ))
+        .expect("GUI 0.2.2 advanced fixture parses");
+        assert!(validate_plan(fixture.clone(), false).valid);
+
+        let store = test_plan_store("gui-022-advanced");
+        let created = store.create(fixture).expect("create advanced plan");
+        let mut renamed = created.clone();
+        renamed.name = "GUI 0.2.2 advanced renamed".to_owned();
+        let updated = store
+            .update_if_revision(&created.plan_id, renamed, Some(created.revision))
+            .expect("conditional update");
+
+        assert_eq!(updated.authentication.failure_status, 403);
+        assert_eq!(updated.faults.len(), 2);
+        assert_eq!(updated.faults[0].kind, PlanFaultKind::Status429);
+        assert_eq!(updated.faults[1].kind, PlanFaultKind::Status503);
+        let source = updated.sources.first().expect("advanced source");
+        assert_eq!(
+            source
+                .authentication
+                .as_ref()
+                .map(|value| value.failure_status),
+            Some(403)
+        );
+        assert_eq!(
+            source.quota.as_ref().map(|value| value.request_budget),
+            Some(11)
+        );
+        assert_eq!(
+            source.pagination.as_ref().map(|value| value.total_pages),
+            Some(2)
+        );
+        assert_eq!(source.faults.len(), 1);
+        assert_eq!(source.faults[0].kind, PlanFaultKind::Timeout);
+        assert_eq!(updated.dataset.size, DatasetSize::Medium);
+        assert!(updated.expected_behaviour.allow_partial_success);
     }
 
     #[test]

@@ -3554,6 +3554,7 @@ async fn serve_command(repository: ScenarioRepository, args: &[String]) -> anyho
 async fn console_command(repository: ScenarioRepository, args: &[String]) -> anyhow::Result<bool> {
     let mut port = 18_080_u16;
     let mut no_open = false;
+    let mut plan_root = None;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -3571,18 +3572,31 @@ async fn console_command(repository: ScenarioRepository, args: &[String]) -> any
                 }
                 index += 2;
             }
+            "--test-plan-root" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!("console --test-plan-root requires a directory")
+                })?;
+                plan_root = Some(PathBuf::from(value));
+                index += 2;
+            }
             value => {
-                anyhow::bail!("unknown console option: {value}; use --port <1-65535> or --no-open")
+                anyhow::bail!(
+                    "unknown console option: {value}; use --port <1-65535>, --no-open, or --test-plan-root <directory>"
+                )
             }
         }
     }
-    let server = LocalServer::spawn_on(repository, None, Some(port))
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "could not start the loopback console at 127.0.0.1:{port}: {error}. Choose a free local port with console --port <1-65535>."
-            )
-        })?;
+    let server = match plan_root {
+        Some(plan_root) => {
+            LocalServer::spawn_on_with_plan_root(repository, None, Some(port), plan_root).await
+        }
+        None => LocalServer::spawn_on(repository, None, Some(port)).await,
+    }
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "could not start the loopback console at 127.0.0.1:{port}: {error}. Choose a free local port with console --port <1-65535>."
+        )
+    })?;
     let url = format!("{}/console/", server.base_url());
     println!("FQDN Forge Console: {url}");
     println!("only 127.0.0.1 is bound; no public network, real DNS, or real credentials are used.");

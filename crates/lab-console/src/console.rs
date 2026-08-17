@@ -35,6 +35,10 @@ pub fn asset(path: &str) -> Option<ConsoleAsset> {
             content_type: "text/css; charset=utf-8",
             body: include_str!("../assets/style.css"),
         }),
+        "/console/favicon.svg" => Some(ConsoleAsset {
+            content_type: "image/svg+xml",
+            body: include_str!("../assets/favicon.svg"),
+        }),
         _ => None,
     }
 }
@@ -502,6 +506,7 @@ mod tests {
         let plans = asset("/console/plans.js")
             .expect("experiment plans script")
             .body;
+        let favicon = asset("/console/favicon.svg").expect("console favicon").body;
 
         assert!(html.contains("color-scheme\" content=\"light"));
         assert!(html.contains("/console/style.css"));
@@ -510,6 +515,8 @@ mod tests {
         assert!(!html.contains("http://"));
         assert!(!html.contains("cdn"));
         assert!(html.contains("/console/plans.js"));
+        assert!(html.contains("/console/favicon.svg"));
+        assert!(favicon.contains("FQDN Forge"));
 
         assert!(!css.contains("prefers-color-scheme"));
         assert!(!css.contains("data-theme"));
@@ -538,10 +545,19 @@ mod tests {
         assert!(plans.contains("new URL(path, location.origin)"));
         assert!(plans.contains("non-loopback UI request refused"));
         assert!(plans.contains("/api/plans/storage"));
-        assert!(plans.contains("/simulate"));
-        assert!(plans.contains("/runs"));
+        assert!(plans.contains("type === \"simulate\""));
+        assert!(plans.contains(": \"runs\""));
         assert!(plans.contains("plan-status-filter"));
-        assert!(plans.contains("confirm(t(\"confirmDelete\"))"));
-        assert!(plans.contains("state.busy"));
+        assert!(plans.contains("persistedPlan"));
+        assert!(plans.contains("draftPlan"));
+        assert!(plans.contains("editorMode"));
+        assert!(plans.contains("jsonDirty"));
+        assert!(plans.contains("if-match"));
+        assert!(plans.contains("x-fqdn-console-request"));
+        assert!(plans.contains("apply-json"));
+        assert!(plans.contains("add-fault"));
+        assert!(plans.contains("failure_status"));
+        assert!(plans.contains("PLAN_REVISION_CONFLICT"));
+        assert!(plans.contains("beforeunload"));
     }
 }
