@@ -1,3 +1,8 @@
+<p align="right">
+  <a href="./README.md"><kbd>English</kbd></a>
+  <a href="./README.zh-CN.md"><kbd>中文</kbd></a>
+</p>
+
 # FQDN Forge
 
 > A deterministic, loopback-only test platform for passive subdomain and FQDN collectors.
@@ -6,7 +11,9 @@
 
 The project is designed for legal local development. It binds only to `127.0.0.1` and uses synthetic fixtures. It never performs public-network requests, DNS resolution, active scanning, real API calls, or real credential handling.
 
-Current release: **v1.4.1**.
+Current release: **v1.4.1 with the GUI 1.0 analysis workspace**.
+
+For an implementation-oriented handoff, see the [Agent Integration Guide](docs/AGENT_INTEGRATION_GUIDE.md).
 
 ## What it tests
 
@@ -80,9 +87,36 @@ cargo run -p lab-cli -- console --no-open
 cargo run -p lab-cli -- console --port 18081 --no-open
 ```
 
-The console URL is printed as `http://127.0.0.1:<port>/console/`. It has Chinese and English views for six pages: Dashboard, Scenarios, Runs, Audit, Reports, and Settings. It can create an isolated external-integration run, show a redacted manifest, invoke the platform reference client through the existing local HTTP/proxy path, and present redacted audit/report read models.
+The console URL is printed as `http://127.0.0.1:<port>/console/`. It has Chinese and English views for Dashboard, Scenarios, Runs, Audit, Reports, Experiment Plans, Analysis Overview, Coverage, Replay Differences, Campaign, Soak, Evidence Graph, Timeline & Trends, and Settings. It can create an isolated external-integration run, show a redacted manifest, invoke the platform reference client through the existing local HTTP/proxy path, and present redacted audit/report read models.
 
 Capabilities and fake credentials remain in browser memory only. They are never written to local storage, URLs, browser-visible audit data, or the report read model. The complete usage and security contract is in [docs/CONSOLE.md](docs/CONSOLE.md).
+
+## GUI 1.0 analysis workspace
+
+GUI 1.0 is a read-only view of saved local test artifacts. It does not create internet traffic or make FQDN Forge a collector. The analysis workspace exposes the same server-generated data through the browser, local HTTP API, and CLI:
+
+| View | What it answers |
+|---|---|
+| Coverage | Which synthetic source, protocol, fault, lifecycle, and campaign combinations are covered, partial, missing, or excepted |
+| Replay differences | Whether strict replay matched and which configuration, fixture, provenance, request, timing, or verdict field changed |
+| Campaign / Soak | Mutation results, deterministic seeds, failure categories, concurrency, lifecycle stability, and resource summaries |
+| Evidence graph | The local relationship between a run, source, evidence, FQDN, and verdict |
+| Timeline & trends | Request/retry/429/cooldown ordering using virtual time, plus bounded historical summaries |
+
+Use the read-only CLI surfaces when automating analysis:
+
+```powershell
+cargo run -p lab-cli -- analysis overview --format json
+cargo run -p lab-cli -- analysis coverage --format markdown
+cargo run -p lab-cli -- analysis replay list --format json
+cargo run -p lab-cli -- analysis campaign list --format json
+cargo run -p lab-cli -- analysis soak list --format json
+cargo run -p lab-cli -- analysis evidence --run <run-id> --format json
+cargo run -p lab-cli -- analysis timeline --run <run-id> --format json
+cargo run -p lab-cli -- analysis trends --format json
+```
+
+Analysis results are server-generated, redacted, paginated or truncated when bounded limits apply, and never expose capabilities, fake keys, authorization headers, cookies, or external targets.
 
 ## Common commands
 
@@ -191,12 +225,12 @@ artifacts/soak/        # release soak action traces and resource invariants
 
 ```text
 crates/
-  lab-core/       scenario models, fixtures, judging, state, replay, coverage, campaigns
+  lab-core/       scenario models, fixtures, judging, state, replay, coverage, campaigns, analysis read models
   lab-server/     loopback HTTP control/source/proxy service
-  lab-console/    safe console DTOs, bilingual mappings, and bundled local web assets
+  lab-console/    safe console DTOs, bilingual mappings, and bundled local web assets/analysis views
   lab-cli/        command-line runner, conformance client, verification utilities
 scenarios/        synthetic test definitions and fixtures
-scripts/          release verification script
+scripts/          release and browser-regression verification scripts
 coverage-policy.yaml
 ```
 
@@ -206,10 +240,12 @@ Before treating a change as release-ready, run:
 
 ```powershell
 .\scripts\verify.ps1 -Repeat 20
+node .\scripts\gui_browser_regression.mjs
+node .\scripts\gui_100_browser_regression.mjs
 ```
 
-For v1.4.1, success means all 114 scenarios pass, 20 repeated rounds finish with zero failures, and the release soak completes at least 1,000 real loopback actions with at least eight concurrent lanes. The script also verifies network isolation and ensures generated output is outside Git scope.
+For v1.4.1, success means all 114 scenarios pass, 20 repeated rounds finish with zero failures, the release soak completes at least 1,000 real loopback actions with at least eight concurrent lanes, GUI 0.2.2 browser regression passes 17/17, and GUI 1.0 browser regression passes 18/18. The script also verifies network isolation and ensures generated output is outside Git scope.
 
 ## Status
 
-This is an evolving local development and test platform. The GUI 0.1 console is intentionally limited to local run/audit/report workflows; it does not turn FQDN Forge into a production collection tool.
+FQDN Forge is functionally complete as an offline test platform. Future changes should be limited to bug fixes, performance work, documentation, releases, and additional synthetic test fixtures. It remains intentionally separate from any production subdomain collector.
