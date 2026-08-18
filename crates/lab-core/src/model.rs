@@ -1019,6 +1019,15 @@ pub struct ManifestSource {
     pub pagination_parameter: Option<String>,
     #[serde(default)]
     pub next_page_field: Option<String>,
+    /// Optional public request body template for POST/PUT sources. This is
+    /// synthetic scenario input only; authentication and run capabilities
+    /// remain separate and are never embedded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_template: Option<Value>,
+    /// Content type the collector should use when sending the public body
+    /// template. Forge materializes request bodies through reqwest::json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_content_type: Option<String>,
     pub run_header_name: String,
     pub allow_retry: bool,
     pub allow_redirect: bool,

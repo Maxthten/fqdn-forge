@@ -11,6 +11,10 @@
 
 当前版本：**v1.4.1，包含 GUI 1.0 分析工作区。**
 
+仓库还包含 FQDN Lens 集成矩阵使用的公开 POST body 合同：manifest 可以声明
+`request_body_template` 和 `request_body_content_type`，用于模拟 custom REST
+场景。这些字段只描述本地合成测试流量，不会启用公网请求或真实凭据处理。
+
 > [!IMPORTANT]
 > 平台只绑定 `127.0.0.1`，不访问公网、不查询真实 DNS、不主动扫描、不连接真实代理，也不处理真实凭据。
 
@@ -140,6 +144,14 @@ node .\scripts\gui_100_browser_regression.mjs
 正式通过意味着：114 个场景通过；普通和压力重复验证均为 20 轮、0 失败；GUI 0.2.2 浏览器回归为 17/17；GUI 1.0 浏览器回归为 18/18；无公网访问、无真实 DNS、无敏感数据泄露。
 
 `target/`、`artifacts/`、`reports/` 都是本地产物，已经被 Git 忽略，绝不能提交。
+GUI 验证还会生成额外的 `target-*` 目录，这些目录也已被 `.gitignore` 覆盖。
+
+## Git 与本地开发
+
+FQDN Forge 是独立维护的 Git repository，默认 branch 是 `main`。项目不会
+自动 commit 或 push 本地修改。生成的 report、build 目录、log、`.env` 和
+临时本地输出不应进入 source control；synthetic scenario、Rust 源码、文档、
+脚本、coverage policy 和 `Cargo.lock` 应保持可追踪。
 
 ## 项目状态
 

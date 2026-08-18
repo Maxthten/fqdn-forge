@@ -13,6 +13,12 @@ The project is designed for legal local development. It binds only to `127.0.0.1
 
 Current release: **v1.4.1 with the GUI 1.0 analysis workspace**.
 
+The repository also contains the public POST body contract used by the FQDN
+Lens integration matrix: manifests may declare `request_body_template` and
+`request_body_content_type` for custom REST scenarios. These fields describe
+synthetic local test traffic only; they do not enable public-network requests
+or real credential handling.
+
 For an implementation-oriented handoff, see the [Agent Integration Guide](docs/AGENT_INTEGRATION_GUIDE.md).
 
 ## What it tests
@@ -219,7 +225,11 @@ artifacts/baselines/   # deterministic logical baseline data
 artifacts/soak/        # release soak action traces and resource invariants
 ```
 
-`target/`, `artifacts/`, and `reports/` are generated local files. They are not part of source control and must not be committed.
+`target/`, `artifacts/`, and `reports/` are generated local files. They are not part of source control and must not be committed. GUI validation output uses additional `target-*` directories, which are covered by `.gitignore` as well.
+
+## Git and local development
+
+FQDN Forge is maintained as an independent Git repository. The default branch is `main` and the project does not automatically commit or push local changes. Keep generated reports, build directories, logs, `.env` files, and temporary local output outside source control. Synthetic scenarios, Rust source, documentation, scripts, coverage policy, and `Cargo.lock` remain trackable.
 
 ## Repository structure
 

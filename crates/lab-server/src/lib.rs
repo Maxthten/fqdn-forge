@@ -2510,6 +2510,11 @@ fn manifest_for_run(
                 next_page_field: (endpoint.pagination.mode != PaginationMode::None)
                     .then_some(endpoint.pagination.next_cursor_field.clone())
                     .flatten(),
+                request_body_template: endpoint.request_body.clone(),
+                request_body_content_type: endpoint
+                    .request_body
+                    .as_ref()
+                    .map(|_| "application/json".to_owned()),
                 run_header_name: "x-lab-run-id".to_owned(),
                 allow_retry: endpoint.allow_retry,
                 allow_redirect: false,
@@ -5261,6 +5266,51 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
             .await
             .expect("body");
         assert!(response.contains("020-cancellation-and-egress-guard"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_manifest_advertises_post_body_contract() {
+        let server = LocalServer::spawn(repository(), Some("036-custom-rest-post"))
+            .await
+            .expect("start server");
+        let client = Client::new();
+        let base_url = server.base_url();
+        let created: serde_json::Value = client
+            .post(format!("{base_url}/api/runs"))
+            .json(&serde_json::json!({"scenario_id":"036-custom-rest-post"}))
+            .send()
+            .await
+            .expect("create run")
+            .error_for_status()
+            .expect("create run status")
+            .json()
+            .await
+            .expect("create run JSON");
+        let run_id = created["run_id"].as_str().expect("run ID");
+        let access_token = created["run_access_token"].as_str().expect("access token");
+        let manifest: serde_json::Value = client
+            .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+            .header("x-lab-run-access-token", access_token)
+            .send()
+            .await
+            .expect("manifest")
+            .error_for_status()
+            .expect("manifest status")
+            .json()
+            .await
+            .expect("manifest JSON");
+        let source = &manifest["sources"][0];
+        assert_eq!(
+            source["request_body_template"],
+            json!({"query":"subdomains","mode":"strict"})
+        );
+        assert_eq!(source["request_body_content_type"], "application/json");
+        assert!(
+            source["authentication"]["x-lab-source-capability"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
         server.shutdown().await;
     }
 
