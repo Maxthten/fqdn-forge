@@ -951,6 +951,12 @@ pub struct RunManifest {
     pub scenario_id: String,
     pub seed: u64,
     pub target_domain: String,
+    /// Optional, non-secret Lab execution control. When present, a conforming
+    /// collector stops scheduling new source/page requests once the declared
+    /// number of request attempts has completed. It is a test contract only,
+    /// never a production collection instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_after_requests: Option<usize>,
     pub network: ManifestNetwork,
     pub network_profile: ManifestNetworkProfile,
     #[serde(default)]

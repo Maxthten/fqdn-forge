@@ -2580,6 +2580,7 @@ fn manifest_for_run(
         scenario_id: run.scenario_id,
         seed: run.seed,
         target_domain: loaded.scenario.root_domain,
+        cancel_after_requests: loaded.scenario.runner.cancel_after_requests,
         network: ManifestNetwork {
             allowed_hosts: vec!["127.0.0.1".to_owned()],
             external_network_allowed: false,
@@ -5311,6 +5312,29 @@ request_sequence: [{ endpoint: redirect-source, response_index: 0 }]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_manifest_advertises_cancellation_contract() {
+        let server = LocalServer::spawn(repository(), Some("020-cancellation-and-egress-guard"))
+            .await
+            .expect("start server");
+        let client = Client::new();
+        let base_url = server.base_url();
+        let run_id = create_run(&client, &base_url, "020-cancellation-and-egress-guard").await;
+        let manifest: serde_json::Value = client
+            .get(format!("{base_url}/api/runs/{run_id}/manifest"))
+            .header("x-lab-run-access-token", run_access_token(&server, run_id))
+            .send()
+            .await
+            .expect("manifest")
+            .error_for_status()
+            .expect("manifest status")
+            .json()
+            .await
+            .expect("manifest JSON");
+        assert_eq!(manifest["cancel_after_requests"], 1);
         server.shutdown().await;
     }
 

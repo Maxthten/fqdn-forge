@@ -15,6 +15,11 @@
 `request_body_template` 和 `request_body_content_type`，用于模拟 custom REST
 场景。这些字段只描述本地合成测试流量，不会启用公网请求或真实凭据处理。
 
+manifest 还可以声明可选、非秘密的 `cancel_after_requests` Lab execution
+control。它要求符合合同的外部 collector 在完成指定数量的 request attempt 后，停止
+调度新的 source/page request。该字段仅用于确定性的本地 cancellation scenario，绝不
+是 production collection instruction。
+
 > [!IMPORTANT]
 > 平台只绑定 `127.0.0.1`，不访问公网、不查询真实 DNS、不主动扫描、不连接真实代理，也不处理真实凭据。
 

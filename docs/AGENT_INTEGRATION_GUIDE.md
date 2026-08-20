@@ -54,9 +54,11 @@ artifacts/
 建议先阅读：
 
 - [README](../README.md) / [中文 README](../README.zh-CN.md)
-- [Architecture](ARCHITECTURE.md)
-- [Console contract](CONSOLE.md)
 - 根目录外的 GUI/版本需求文档（仅作实现参考，不能提交进仓库）
+
+README 是当前架构、local console、public manifest contract 与安全边界的
+权威入口；不要依赖已删除的历史 `ARCHITECTURE.md`、`CONSOLE.md` 或
+`CONSOLE_DEMO.md`。
 
 ## 4. 三种正确的使用方式
 
@@ -88,6 +90,9 @@ cargo run -p lab-cli -- serve --port 18080
 ```
 
 外部收集器只能依赖公开 HTTP 合同；不能读取 `scenarios/`、truth 或 fixture。
+若 manifest 声明非秘密的 `cancel_after_requests`，collector 在完成指定数量的
+request attempt 后必须停止调度新的 source/page request；该 Lab-only control 不得
+被当作 production collection instruction。
 
 ### 4.3 读取分析结果
 

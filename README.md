@@ -19,6 +19,12 @@ Lens integration matrix: manifests may declare `request_body_template` and
 synthetic local test traffic only; they do not enable public-network requests
 or real credential handling.
 
+Manifests may also declare the optional, non-secret
+`cancel_after_requests` Lab execution control. It tells a conforming external
+collector to stop scheduling new source/page requests after the declared
+number of completed request attempts. It exists solely for deterministic
+local cancellation scenarios; it is never a production collection instruction.
+
 For an implementation-oriented handoff, see the [Agent Integration Guide](docs/AGENT_INTEGRATION_GUIDE.md).
 
 ## What it tests
@@ -95,7 +101,7 @@ cargo run -p lab-cli -- console --port 18081 --no-open
 
 The console URL is printed as `http://127.0.0.1:<port>/console/`. It has Chinese and English views for Dashboard, Scenarios, Runs, Audit, Reports, Experiment Plans, Analysis Overview, Coverage, Replay Differences, Campaign, Soak, Evidence Graph, Timeline & Trends, and Settings. It can create an isolated external-integration run, show a redacted manifest, invoke the platform reference client through the existing local HTTP/proxy path, and present redacted audit/report read models.
 
-Capabilities and fake credentials remain in browser memory only. They are never written to local storage, URLs, browser-visible audit data, or the report read model. The complete usage and security contract is in [docs/CONSOLE.md](docs/CONSOLE.md).
+Capabilities and fake credentials remain in browser memory only. They are never written to local storage, URLs, browser-visible audit data, or the report read model. The local-console scope and safety contract are summarized in this README and the [Agent Integration Guide](docs/AGENT_INTEGRATION_GUIDE.md).
 
 ## GUI 1.0 analysis workspace
 
